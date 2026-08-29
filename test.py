@@ -1,13 +1,15 @@
-import asyncio, asyncpg, sys
+import asyncio
+from app.trending.services import get_trending_week
+from app.core.config import settings
+import httpx
 
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+print(f"API KEY: {settings.TMDB_API_KEY[:10]}...")
 
 async def test():
     try:
-        conn = await asyncpg.connect('postgresql://postgres:postgres@127.0.0.1:5432/postgres')
-        print("Connected to postgres database via 127.0.0.1")
+        data = await get_trending_week()
+        print("SUCCESS:", data.keys())
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"EXCEPTION: {repr(e)}")
 
 asyncio.run(test())
