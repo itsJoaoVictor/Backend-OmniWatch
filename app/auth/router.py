@@ -40,15 +40,12 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
     await db.commit()
     
     from app.core.config import settings
-    cookie_secure = not settings.DEBUG
-    cookie_samesite = "lax" if settings.DEBUG else "none" if not settings.DEBUG else "strict"
-    # Actually just simple:
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
         secure=not settings.DEBUG,
-        samesite="lax" if settings.DEBUG else "strict",
+        samesite="lax" if settings.DEBUG else "none",
         max_age=900,
         path="/"
     )
@@ -57,7 +54,7 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
         value=refresh_token,
         httponly=True,
         secure=not settings.DEBUG,
-        samesite="lax" if settings.DEBUG else "strict",
+        samesite="lax" if settings.DEBUG else "none",
         max_age=604800,
         path="/api/auth/refresh"
     )
@@ -116,7 +113,7 @@ async def refresh_token(request: Request, response: Response, db: AsyncSession =
         value=new_access_token,
         httponly=True,
         secure=not settings.DEBUG,
-        samesite="lax" if settings.DEBUG else "strict",
+        samesite="lax" if settings.DEBUG else "none",
         max_age=900,
         path="/"
     )
@@ -125,7 +122,7 @@ async def refresh_token(request: Request, response: Response, db: AsyncSession =
         value=new_refresh_token,
         httponly=True,
         secure=not settings.DEBUG,
-        samesite="lax" if settings.DEBUG else "strict",
+        samesite="lax" if settings.DEBUG else "none",
         max_age=604800,
         path="/api/auth/refresh"
     )
@@ -142,7 +139,14 @@ async def logout(request: Request, response: Response, db: AsyncSession = Depend
             rt_db.revoked = True
             await db.commit()
             
-    response.set_cookie(key="access_token", value="", max_age=0, path="/")
-    response.set_cookie(key="refresh_token", value="", max_age=0, path="/api/auth/refresh")
+    from app.core.config import settings
+    response.set_cookie(
+        key="access_token", value="", max_age=0, path="/",
+        secure=not settings.DEBUG, samesite="lax" if settings.DEBUG else "none"
+    )
+    response.set_cookie(
+        key="refresh_token", value="", max_age=0, path="/api/auth/refresh",
+        secure=not settings.DEBUG, samesite="lax" if settings.DEBUG else "none"
+    )
     
     return {"message": "Logout realizado com sucesso"}
