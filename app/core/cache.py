@@ -1,9 +1,10 @@
 import time
 from typing import Any, Dict, Tuple
+from app.core.config import settings
 
 class SimpleTTLCache:
     def __init__(self, ttl_seconds: int = 86400): # 24 horas por padrão
-        self.ttl = ttl_seconds
+        self.ttl = 0 if settings.DEBUG else ttl_seconds
         self._cache: Dict[str, dict] = {}
         
     def get_with_status(self, key: str) -> Tuple[Any | None, bool]:
@@ -23,5 +24,16 @@ class SimpleTTLCache:
             "timestamp": time.time()
         }
 
+    def invalidate_prefix(self, prefix: str) -> None:
+        """
+        Marca as chaves que começam com o prefixo como expiradas (stale).
+        Mantém os dados para o SWR (Stale-While-Revalidate) funcionar.
+        """
+        for k in self._cache:
+            if k.startswith(prefix):
+                self._cache[k]["timestamp"] = 0
+
 # Global cache instance for trending items
-trending_cache = SimpleTTLCache(ttl_seconds=86400) # 24 hours
+trending_cache = SimpleTTLCache(ttl_seconds=3600) # 1 hour
+search_cache = SimpleTTLCache(ttl_seconds=1800) # 30 minutes
+details_cache = SimpleTTLCache(ttl_seconds=3600) # 1 hour

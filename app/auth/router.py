@@ -4,52 +4,51 @@ from sqlalchemy.future import select
 from datetime import datetime, timedelta, timezone
 from app.core.database import get_db
 from app.users.models import User, RefreshToken
-from app.core.security import verify_password, create_access_token, create_refresh_token, decode_token
+from app.core.security import verify_password, create_access_token, create_refresh_token, decode_token, hash_token
 from app.auth.schemas import LoginRequest, TokenResponse
+from app.core.rate_limit import limiter
 import uuid
+import asyncio
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login", response_model=TokenResponse)
-async def login(response: Response, login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("10/minute")
+async def login(request: Request, response: Response, login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
     email = login_data.email.lower().strip()
     
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalars().first()
     
     if not user:
+        await asyncio.sleep(1)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciais inválidas")
-        
-    if user.locked_until and user.locked_until.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Conta temporariamente bloqueada")
         
     if not verify_password(login_data.password, user.password_hash):
-        user.failed_login_attempts += 1
-        if user.failed_login_attempts >= 5:
-            user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=15)
-        await db.commit()
+        await asyncio.sleep(1)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciais inválidas")
-        
-    user.failed_login_attempts = 0
-    user.locked_until = None
     
     access_token = create_access_token(data={"sub": str(user.id), "role": user.role})
     refresh_token = create_refresh_token(data={"sub": str(user.id)})
     
     rt_db = RefreshToken(
         user_id=user.id,
-        token_hash=refresh_token,
+        token_hash=hash_token(refresh_token),
         expires_at=datetime.now(timezone.utc) + timedelta(days=7)
     )
     db.add(rt_db)
     await db.commit()
     
+    from app.core.config import settings
+    cookie_secure = not settings.DEBUG
+    cookie_samesite = "lax" if settings.DEBUG else "none" if not settings.DEBUG else "strict"
+    # Actually just simple:
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
-        secure=True,
-        samesite="strict",
+        secure=not settings.DEBUG,
+        samesite="lax" if settings.DEBUG else "strict",
         max_age=900,
         path="/"
     )
@@ -57,8 +56,8 @@ async def login(response: Response, login_data: LoginRequest, db: AsyncSession =
         key="refresh_token",
         value=refresh_token,
         httponly=True,
-        secure=True,
-        samesite="strict",
+        secure=not settings.DEBUG,
+        samesite="lax" if settings.DEBUG else "strict",
         max_age=604800,
         path="/api/auth/refresh"
     )
@@ -75,10 +74,10 @@ async def refresh_token(request: Request, response: Response, db: AsyncSession =
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token ausente")
         
     payload = decode_token(old_refresh_token)
-    if not payload:
+    if not payload or payload.get("type") != "refresh":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
         
-    result = await db.execute(select(RefreshToken).where(RefreshToken.token_hash == old_refresh_token))
+    result = await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_token(old_refresh_token)))
     rt_db = result.scalars().first()
     
     if not rt_db:
@@ -105,18 +104,19 @@ async def refresh_token(request: Request, response: Response, db: AsyncSession =
     
     new_rt_db = RefreshToken(
         user_id=user.id,
-        token_hash=new_refresh_token,
+        token_hash=hash_token(new_refresh_token),
         expires_at=datetime.now(timezone.utc) + timedelta(days=7)
     )
     db.add(new_rt_db)
     await db.commit()
     
+    from app.core.config import settings
     response.set_cookie(
         key="access_token",
         value=new_access_token,
         httponly=True,
-        secure=True,
-        samesite="strict",
+        secure=not settings.DEBUG,
+        samesite="lax" if settings.DEBUG else "strict",
         max_age=900,
         path="/"
     )
@@ -124,8 +124,8 @@ async def refresh_token(request: Request, response: Response, db: AsyncSession =
         key="refresh_token",
         value=new_refresh_token,
         httponly=True,
-        secure=True,
-        samesite="strict",
+        secure=not settings.DEBUG,
+        samesite="lax" if settings.DEBUG else "strict",
         max_age=604800,
         path="/api/auth/refresh"
     )
@@ -136,7 +136,7 @@ async def refresh_token(request: Request, response: Response, db: AsyncSession =
 async def logout(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     old_refresh_token = request.cookies.get("refresh_token")
     if old_refresh_token:
-        result = await db.execute(select(RefreshToken).where(RefreshToken.token_hash == old_refresh_token))
+        result = await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_token(old_refresh_token)))
         rt_db = result.scalars().first()
         if rt_db and not rt_db.revoked:
             rt_db.revoked = True
