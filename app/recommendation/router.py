@@ -26,7 +26,14 @@ async def get_explore_recommendations(
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    cache_key = f"explore:{current_user_id}:{limit}:{persona_id}"
+    from sqlalchemy.future import select
+    from app.users.models import User
+    
+    user_result = await db.execute(select(User.updated_at).where(User.id == current_user_id))
+    updated_at = user_result.scalars().first()
+    ts = updated_at.timestamp() if updated_at else 0
+    
+    cache_key = f"explore:{current_user_id}:{limit}:{persona_id}:v{ts}"
     cached_data, is_stale = recs_cache.get_with_status(cache_key)
 
     async def fetch_and_cache():
@@ -40,7 +47,7 @@ async def get_explore_recommendations(
         except Exception as e:
             print(f"Erro no SWR de explore: {e}")
 
-    if cached_data:
+    if cached_data is not None:
         if is_stale:
             recs_cache.set(cache_key, cached_data) # Impede dezenas de tasks de SWR concorrentes
             background_tasks.add_task(fetch_and_cache)
@@ -63,7 +70,14 @@ async def get_user_personas(
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    cache_key = f"personas:{current_user_id}:{top_k}"
+    from sqlalchemy.future import select
+    from app.users.models import User
+    
+    user_result = await db.execute(select(User.updated_at).where(User.id == current_user_id))
+    updated_at = user_result.scalars().first()
+    ts = updated_at.timestamp() if updated_at else 0
+    
+    cache_key = f"personas:{current_user_id}:{top_k}:v{ts}"
     cached_data, is_stale = personas_cache.get_with_status(cache_key)
 
     async def fetch_and_cache_personas():
@@ -76,7 +90,7 @@ async def get_user_personas(
         except Exception as e:
             print(f"Erro no SWR de personas: {e}")
 
-    if cached_data:
+    if cached_data is not None:
         if is_stale:
             personas_cache.set(cache_key, cached_data)
             background_tasks.add_task(fetch_and_cache_personas)
