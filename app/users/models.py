@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Integer, Boolean, ForeignKey, func
+from sqlalchemy import Column, String, DateTime, Integer, Boolean, ForeignKey, func, JSON
 from sqlalchemy.dialects.postgresql import UUID
 from app.core.database import Base
 import uuid
@@ -13,6 +13,11 @@ class User(Base):
     role = Column(String, nullable=False, default="user")
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime(timezone=True), nullable=True)
+    feature_vector = Column(JSON, nullable=True, default=dict)
+    # Fase 6: Embedding semântico denso médio do usuário (lista de floats)
+    embedding = Column(JSON, nullable=True)
+    # V2: Personas / Multi-clusters de gosto do usuário
+    taste_clusters = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

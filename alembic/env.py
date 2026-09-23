@@ -24,7 +24,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app.core.database import Base, DATABASE_URL
-from app.users import models  # Ensure models are loaded
+from app.users import models as users_models
+from app.media import models as media_models
+from app.tracking import models as tracking_models
+from app.notifications import models as notifications_models
+from app.media_collections import models as media_collections_models
 
 target_metadata = Base.metadata
 config.set_main_option("sqlalchemy.url", DATABASE_URL)
@@ -82,6 +86,9 @@ async def run_async_migrations() -> None:
         conn = await asyncpg.connect(sys_url)
         exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", DB_NAME)
         if not exists:
+            import re
+            if not re.match(r"^[a-zA-Z0-9_]+$", DB_NAME):
+                raise ValueError(f"Invalid database name: {DB_NAME}")
             await conn.execute(f'CREATE DATABASE "{DB_NAME}"')
             print(f"Banco de dados '{DB_NAME}' criado com sucesso!")
         await conn.close()
