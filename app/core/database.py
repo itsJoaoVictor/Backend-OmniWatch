@@ -13,8 +13,10 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "omniwatch")
 
 encoded_password = urllib.parse.quote_plus(DB_PASSWORD)
-DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-BASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/postgres"
+DB_DRIVER = os.getenv("DB_DRIVER", "asyncpg")
+
+DATABASE_URL = f"postgresql+{DB_DRIVER}://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+BASE_URL = f"postgresql+{DB_DRIVER}://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/postgres"
 
 
 engine = create_async_engine(
