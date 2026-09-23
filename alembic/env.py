@@ -77,21 +77,34 @@ async def run_async_migrations() -> None:
     """
     
     # --- AUTO CREATE DB START ---
-    import asyncpg
-    from app.core.database import DB_USER, encoded_password, DB_HOST, DB_PORT, DB_NAME
+    from app.core.database import DB_USER, encoded_password, DB_HOST, DB_PORT, DB_NAME, DB_DRIVER
     
     sys_url = f"postgresql://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/postgres"
     
     try:
-        conn = await asyncpg.connect(sys_url)
-        exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", DB_NAME)
-        if not exists:
-            import re
-            if not re.match(r"^[a-zA-Z0-9_]+$", DB_NAME):
-                raise ValueError(f"Invalid database name: {DB_NAME}")
-            await conn.execute(f'CREATE DATABASE "{DB_NAME}"')
-            print(f"Banco de dados '{DB_NAME}' criado com sucesso!")
-        await conn.close()
+        import re
+        if DB_DRIVER == "asyncpg":
+            import asyncpg
+            conn = await asyncpg.connect(sys_url)
+            exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", DB_NAME)
+            if not exists:
+                if not re.match(r"^[a-zA-Z0-9_]+$", DB_NAME):
+                    raise ValueError(f"Invalid database name: {DB_NAME}")
+                await conn.execute(f'CREATE DATABASE "{DB_NAME}"')
+                print(f"Banco de dados '{DB_NAME}' criado com sucesso!")
+            await conn.close()
+        elif DB_DRIVER in ("psycopg", "psycopg3"):
+            import psycopg
+            conn = await psycopg.AsyncConnection.connect(sys_url, autocommit=True)
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (DB_NAME,))
+                exists = await cur.fetchone()
+                if not exists:
+                    if not re.match(r"^[a-zA-Z0-9_]+$", DB_NAME):
+                        raise ValueError(f"Invalid database name: {DB_NAME}")
+                    await cur.execute(f'CREATE DATABASE "{DB_NAME}"')
+                    print(f"Banco de dados '{DB_NAME}' criado com sucesso!")
+            await conn.close()
     except Exception as e:
         print(f"Aviso: Não foi possível checar/criar o banco de dados automaticamente. Detalhe: {e}")
     # --- AUTO CREATE DB END ---
