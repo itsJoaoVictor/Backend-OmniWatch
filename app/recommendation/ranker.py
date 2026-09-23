@@ -14,16 +14,32 @@ from app.recommendation.orchestrator import build_candidate_vector
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "lgbm_ranker.pkl")
 
 class LightGBMRanker:
+    _cached_model = None
+    _cached_mtime = 0
+
     def __init__(self):
         self.model = None
         self._load_model()
 
     def _load_model(self):
-        if os.path.exists(MODEL_PATH):
-            try:
-                self.model = joblib.load(MODEL_PATH)
-            except Exception as e:
-                print(f"Failed to load LightGBM model: {e}")
+        if not os.path.exists(MODEL_PATH):
+            if LightGBMRanker._cached_mtime == 0:
+                print("⚠️ [LightGBM] Arquivo de modelo não encontrado. Usando pesos manuais (fallback).")
+                LightGBMRanker._cached_mtime = -1
+            return
+
+        current_mtime = os.path.getmtime(MODEL_PATH)
+        if LightGBMRanker._cached_mtime == current_mtime:
+            self.model = LightGBMRanker._cached_model
+            return
+
+        try:
+            self.model = joblib.load(MODEL_PATH)
+            LightGBMRanker._cached_model = self.model
+            LightGBMRanker._cached_mtime = current_mtime
+            print("🧠 [LightGBM] Modelo carregado e pronto para rankeamento!")
+        except Exception as e:
+            print(f"❌ [LightGBM] Failed to load LightGBM model: {e}")
 
     def is_ready(self) -> bool:
         return self.model is not None
@@ -165,8 +181,15 @@ async def train_ranker_model(db: AsyncSession):
     print(f"Treinando com {len(X_train)} amostras (Positivos/Negativos)...")
     
     # 2. Treinar o modelo
-    model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, max_depth=5)
-    model.fit(np.array(X_train), np.array(y_train))
+    model = lgb.LGBMClassifier(
+        n_estimators=100,
+        learning_rate=0.1,
+        max_depth=5,
+        num_leaves=15,
+        min_child_samples=5,
+        verbose=-1
+    )
+    model.fit(np.array(X_train, dtype=np.float32), np.array(y_train, dtype=np.int32))
     
     # 3. Salvar
     joblib.dump(model, MODEL_PATH)

@@ -20,6 +20,7 @@ from app.recommendation.ranker import run_ranker_training_loop
 from app.notifications.router import router as notifications_router
 from app.media_collections.router import router as collections_router
 from app.media_collections.services import run_collection_sync_loop
+from app.calendar.sync import run_calendar_sync_loop
 from app.images.router import router as images_router
 
 from app.core.rate_limit import limiter
@@ -29,11 +30,13 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     sync_task = asyncio.create_task(run_collection_sync_loop(interval_hours=24))
     ranker_task = asyncio.create_task(run_ranker_training_loop(interval_hours=24))
+    cal_sync_task = asyncio.create_task(run_calendar_sync_loop(interval_hours=24))
     yield
     sync_task.cancel()
     ranker_task.cancel()
+    cal_sync_task.cancel()
     try:
-        await asyncio.gather(sync_task, ranker_task, return_exceptions=True)
+        await asyncio.gather(sync_task, ranker_task, cal_sync_task, return_exceptions=True)
     except Exception:
         pass
 

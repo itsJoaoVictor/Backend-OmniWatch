@@ -34,13 +34,13 @@ async def add_item_to_list(
     new_item = await add_to_list(db, user_id, item)
     
     # Trigger background sync for this media
-    from app.calendar.sync import sync_media_releases
+    from app.calendar.sync import sync_single_media_release
     # AsyncSession doesn't work well across background tasks, so we do a quick hack
     from app.core.database import AsyncSessionLocal
 
     async def run_sync():
         async with AsyncSessionLocal() as session:
-            await sync_media_releases(session)
+            await sync_single_media_release(session, new_item.media_id)
             
     background_tasks.add_task(run_sync)
     
