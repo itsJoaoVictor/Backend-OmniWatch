@@ -47,6 +47,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://front-end-omni-watch-livid.vercel.app",
 ]
 
 app.add_middleware(
