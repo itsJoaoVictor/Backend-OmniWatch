@@ -34,7 +34,7 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
     rt_db = RefreshToken(
         user_id=user.id,
         token_hash=hash_token(refresh_token),
-        expires_at=datetime.now(timezone.utc) + timedelta(days=7)
+        expires_at=datetime.now(timezone.utc) + timedelta(days=365)
     )
     db.add(rt_db)
     await db.commit()
@@ -55,7 +55,7 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
         httponly=True,
         secure=not settings.DEBUG,
         samesite="lax" if settings.DEBUG else "none",
-        max_age=604800,
+        max_age=31536000,
         path="/api/auth/refresh"
     )
     
@@ -102,7 +102,7 @@ async def refresh_token(request: Request, response: Response, db: AsyncSession =
     new_rt_db = RefreshToken(
         user_id=user.id,
         token_hash=hash_token(new_refresh_token),
-        expires_at=datetime.now(timezone.utc) + timedelta(days=7)
+        expires_at=datetime.now(timezone.utc) + timedelta(days=365)
     )
     db.add(new_rt_db)
     await db.commit()
@@ -123,7 +123,7 @@ async def refresh_token(request: Request, response: Response, db: AsyncSession =
         httponly=True,
         secure=not settings.DEBUG,
         samesite="lax" if settings.DEBUG else "none",
-        max_age=604800,
+        max_age=31536000,
         path="/api/auth/refresh"
     )
     
