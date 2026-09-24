@@ -143,6 +143,17 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
             except Exception:
                 pass
 
+    # Bloqueio de filmes não lançados como 'completed'
+    if item.status == "completed" and item.media_type == "movie":
+        from app.core.utils import is_date_released
+        from fastapi import HTTPException
+        rel_date = media.release_date or item.release_date
+        if not is_date_released(rel_date):
+            raise HTTPException(
+                status_code=400,
+                detail="Filmes que ainda não estrearam só podem ser adicionados à lista 'Quero Ver'."
+            )
+
     # Check if already in list
     result = await db.execute(
         select(UserListItem)
@@ -201,42 +212,98 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
         return None
 
     if update_data.status is not None:
-        if update_data.status == "completed" and item.status != "completed" and item.media.media_type == "tv":
-            from app.details.services import fetch_tv_details
-            from sqlalchemy import delete
-            try:
-                tv_data = await fetch_tv_details(item.media.tmdb_id)
-                await db.execute(delete(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item.id))
-                
+        if update_data.status == "completed":
+            if item.media.media_type == "movie":
+                from app.core.utils import is_date_released
+                from fastapi import HTTPException
+                rel_date = item.media.release_date
+                if not rel_date:
+                    from app.details.services import fetch_movie_details
+                    try:
+                        tmdb_data = await fetch_movie_details(item.media.tmdb_id)
+                        rel_date = tmdb_data.release_date
+                        if rel_date:
+                            item.media.release_date = rel_date
+                    except Exception:
+                        pass
+                if not is_date_released(rel_date):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Filmes que ainda não estrearam não podem ser marcados como assistidos."
+                    )
+                item.status = "completed"
+            elif item.media.media_type == "tv":
+                from app.details.services import fetch_tv_details, fetch_season_details
+                from app.core.utils import is_date_released
+                from sqlalchemy import delete
+                has_unreleased_episodes = False
                 new_progresses = []
-                for season in tv_data.seasons:
-                    if season.season_number > 0:
-                        for ep_num in range(1, season.episode_count + 1):
-                            new_progresses.append(
-                                UserEpisodeProgress(
-                                    user_list_item_id=item.id,
-                                    season_number=season.season_number,
-                                    episode_number=ep_num
-                                )
-                            )
-                if new_progresses:
-                    db.add_all(new_progresses)
-            except Exception as e:
-                print(f"Failed to auto-mark episodes: {e}")
-        item.status = update_data.status
+                try:
+                    tv_data = await fetch_tv_details(item.media.tmdb_id)
+                    await db.execute(delete(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item.id))
+                    
+                    for season in tv_data.seasons:
+                        if season.season_number > 0:
+                            try:
+                                season_details = await fetch_season_details(item.media.tmdb_id, season.season_number)
+                                for ep in season_details.episodes:
+                                    if is_date_released(ep.air_date):
+                                        new_progresses.append(
+                                            UserEpisodeProgress(
+                                                user_list_item_id=item.id,
+                                                season_number=season.season_number,
+                                                episode_number=ep.episode_number
+                                            )
+                                        )
+                                    else:
+                                        has_unreleased_episodes = True
+                            except Exception as e:
+                                print(f"Failed to fetch season {season.season_number} details: {e}")
+                                if season.air_date and not is_date_released(season.air_date):
+                                    has_unreleased_episodes = True
+                                else:
+                                    for ep_num in range(1, season.episode_count + 1):
+                                        new_progresses.append(
+                                            UserEpisodeProgress(
+                                                user_list_item_id=item.id,
+                                                season_number=season.season_number,
+                                                episode_number=ep_num
+                                            )
+                                        )
+                    if new_progresses:
+                        db.add_all(new_progresses)
+                    
+                    is_series_ended = tv_data.status in ("Ended", "Canceled")
+                    if is_series_ended and not has_unreleased_episodes:
+                        item.status = "completed"
+                    else:
+                        item.status = "watching"
+                except Exception as e:
+                    print(f"Failed to auto-mark episodes: {e}")
+                    item.status = "watching"
+        else:
+            item.status = update_data.status
     
     if update_data.rating is not None:
         item.rating = update_data.rating
     if update_data.rewatch_count is not None:
         item.rewatch_count = update_data.rewatch_count
 
+    media_ref = item.media
     await db.commit()
     await db.refresh(item)
     
     # Trigger Profile Update (rating or watch status might have changed)
     from app.recommendation.profile_manager import update_user_profile
-    await update_user_profile(db, user_id, item, item.media)
+    if media_ref:
+        await update_user_profile(db, user_id, item, media_ref)
     
+    reloaded = await db.execute(
+        select(UserListItem)
+        .where(UserListItem.id == item.id)
+        .options(selectinload(UserListItem.media))
+    )
+    item = reloaded.scalars().first() or item
     return item
 
 async def remove_from_list(db: AsyncSession, user_id: str, item_id: str):
@@ -279,6 +346,23 @@ async def add_episode_progress(db: AsyncSession, user_id: str, item_id: str, pro
     item = result.scalars().first()
     if not item:
         return None
+
+    # Validação de data de lançamento do episódio
+    if item.media and item.media.media_type == "tv":
+        from app.details.services import fetch_episode_details
+        from app.core.utils import is_date_released
+        from fastapi import HTTPException
+        try:
+            ep_data = await fetch_episode_details(item.media.tmdb_id, progress.season_number, progress.episode_number)
+            if not is_date_released(ep_data.air_date):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"O episódio S{progress.season_number} E{progress.episode_number} ainda não foi lançado (estreia prevista: {ep_data.air_date or 'Indefinida'})."
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"Error checking episode release date: {e}")
 
     # Check if episode already marked
     prog_result = await db.execute(
@@ -402,6 +486,23 @@ async def update_episode_rating(
     if not item:
         return None
 
+    # Valida se o episódio já foi lançado caso uma avaliação seja enviada
+    if rating is not None and item.media and item.media.media_type == "tv":
+        from app.details.services import fetch_episode_details
+        from app.core.utils import is_date_released
+        from fastapi import HTTPException
+        try:
+            ep_data = await fetch_episode_details(item.media.tmdb_id, season_number, episode_number)
+            if not is_date_released(ep_data.air_date):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"O episódio S{season_number} E{episode_number} ainda não foi lançado (estreia prevista: {ep_data.air_date or 'Indefinida'})."
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"Error checking episode release date: {e}")
+
     # Busca ou cria o registro de progresso do episódio
     prog_result = await db.execute(
         select(UserEpisodeProgress)
@@ -507,7 +608,8 @@ async def bulk_mark_episodes(db: AsyncSession, user_id: str, item_id: str, targe
     if not item or item.media.media_type != "tv":
         return None
 
-    from app.details.services import fetch_tv_details
+    from app.details.services import fetch_tv_details, fetch_season_details
+    from app.core.utils import is_date_released
     try:
         tv_data = await fetch_tv_details(item.media.tmdb_id)
     except Exception:
@@ -517,16 +619,33 @@ async def bulk_mark_episodes(db: AsyncSession, user_id: str, item_id: str, targe
     existing_map = {(p.season_number, p.episode_number): p for p in prog_res.scalars().all()}
 
     new_progresses = []
+    has_unreleased = False
     for season in tv_data.seasons:
         if season.season_number > 0 and season.season_number <= target.season_number:
             max_ep = target.episode_number if season.season_number == target.season_number else season.episode_count
-            for ep_num in range(1, max_ep + 1):
-                if (season.season_number, ep_num) not in existing_map:
-                    new_progresses.append(UserEpisodeProgress(
-                        user_list_item_id=item.id,
-                        season_number=season.season_number,
-                        episode_number=ep_num
-                    ))
+            try:
+                season_details = await fetch_season_details(item.media.tmdb_id, season.season_number)
+                for ep in season_details.episodes:
+                    if ep.episode_number <= max_ep:
+                        if is_date_released(ep.air_date):
+                            if (season.season_number, ep.episode_number) not in existing_map:
+                                new_progresses.append(UserEpisodeProgress(
+                                    user_list_item_id=item.id,
+                                    season_number=season.season_number,
+                                    episode_number=ep.episode_number
+                                ))
+                        else:
+                            has_unreleased = True
+            except Exception as e:
+                print(f"Failed to fetch season {season.season_number} details in bulk_mark: {e}")
+                if not (season.air_date and not is_date_released(season.air_date)):
+                    for ep_num in range(1, max_ep + 1):
+                        if (season.season_number, ep_num) not in existing_map:
+                            new_progresses.append(UserEpisodeProgress(
+                                user_list_item_id=item.id,
+                                season_number=season.season_number,
+                                episode_number=ep_num
+                            ))
     
     if new_progresses:
         db.add_all(new_progresses)
@@ -536,19 +655,21 @@ async def bulk_mark_episodes(db: AsyncSession, user_id: str, item_id: str, targe
         total_episodes_now = len(existing_map) + len(new_progresses)
         
         is_completed = False
-        if is_ended and total_episodes_now >= tv_data.number_of_episodes:
+        if is_ended and not has_unreleased and total_episodes_now >= tv_data.number_of_episodes:
             item.status = "completed"
             is_completed = True
         elif item.status == "plan_to_watch":
             item.status = "watching"
             
+        media_ref = item.media
         await db.commit()
         await db.refresh(item)
         
         # Trigger Profile Update with completion boost
         from app.recommendation.profile_manager import update_user_profile
         completion_boost = 1.5 if is_completed else None
-        await update_user_profile(db, user_id, item, item.media, explicit_scale=completion_boost)
+        if media_ref:
+            await update_user_profile(db, user_id, item, media_ref, explicit_scale=completion_boost)
     return True
 
 
