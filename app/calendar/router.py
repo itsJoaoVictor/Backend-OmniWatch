@@ -57,10 +57,10 @@ async def get_my_releases(
             from fastapi import HTTPException
             raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM.")
 
-    # Get user's tracked media IDs (plan_to_watch, watching, completed)
+    # Get user's tracked media IDs (plan_to_watch, watching, completed, upcoming)
     stmt_tracked = select(UserListItem.media_id).where(
         UserListItem.user_id == user_id,
-        UserListItem.status.in_(["plan_to_watch", "completed", "watching"])
+        UserListItem.status.in_(["plan_to_watch", "completed", "watching", "upcoming"])
     )
     res_tracked = await db.execute(stmt_tracked)
     tracked_media_ids = res_tracked.scalars().all()

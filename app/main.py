@@ -20,13 +20,16 @@ from app.recommendation.ranker import run_ranker_training_loop
 from app.notifications.router import router as notifications_router
 from app.media_collections.router import router as collections_router
 from app.media_collections.services import run_collection_sync_loop
-from app.calendar.sync import run_calendar_sync_loop
+from app.calendar.sync import run_calendar_sync_loop, migrate_existing_future_media
 from app.images.router import router as images_router
 
 from app.core.rate_limit import limiter
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Sincroniza e migra títulos futuros para 'upcoming' automaticamente no startup
+    await migrate_existing_future_media()
+
     # Start background tasks
     sync_task = asyncio.create_task(run_collection_sync_loop(interval_hours=24))
     ranker_task = asyncio.create_task(run_ranker_training_loop(interval_hours=24))

@@ -143,16 +143,24 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
             except Exception:
                 pass
 
-    # Bloqueio de filmes não lançados como 'completed'
-    if item.status == "completed" and item.media_type == "movie":
-        from app.core.utils import is_date_released
-        from fastapi import HTTPException
-        rel_date = media.release_date or item.release_date
-        if not is_date_released(rel_date):
+    # Determinação e validação de status para títulos não lançados
+    from app.core.utils import is_date_released
+    from fastapi import HTTPException
+    
+    rel_date = media.release_date or item.release_date
+    is_released = is_date_released(rel_date)
+    
+    final_status = item.status or "plan_to_watch"
+    if not is_released:
+        if final_status in ["completed", "watching"]:
             raise HTTPException(
                 status_code=400,
-                detail="Filmes que ainda não estrearam só podem ser adicionados à lista 'Quero Ver'."
+                detail="Títulos que ainda não estrearam só podem ser adicionados com status 'Aguardando Estreia'."
             )
+        final_status = "upcoming"
+    elif final_status == "upcoming":
+        # Se já foi lançado, regulariza para plan_to_watch
+        final_status = "plan_to_watch"
 
     # Check if already in list
     result = await db.execute(
@@ -167,7 +175,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
     new_item = UserListItem(
         user_id=uuid.UUID(user_id),
         media_id=media.id,
-        status=item.status,
+        status=final_status,
         rating=item.rating,
         rewatch_count=item.rewatch_count
     )
@@ -280,7 +288,16 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
                         item.status = "watching"
                 except Exception as e:
                     print(f"Failed to auto-mark episodes: {e}")
-                    item.status = "watching"
+        elif update_data.status == "watching" and item.media.media_type == "movie":
+            from app.core.utils import is_date_released
+            from fastapi import HTTPException
+            rel_date = item.media.release_date
+            if not is_date_released(rel_date):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Filmes que ainda não estrearam não podem ser marcados como em andamento."
+                )
+            item.status = "watching"
         else:
             item.status = update_data.status
     
