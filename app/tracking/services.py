@@ -393,8 +393,12 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
             item.status = "watching"
         else:
             item.status = update_data.status
+
+        # Regra de negócio: itens em 'plan_to_watch' ou 'upcoming' não possuem nota
+        if item.status in ["plan_to_watch", "upcoming"]:
+            item.rating = None
     
-    if update_data.rating is not None:
+    if update_data.rating is not None and item.status not in ["plan_to_watch", "upcoming"]:
         item.rating = update_data.rating
     if update_data.rewatch_count is not None:
         item.rewatch_count = update_data.rewatch_count
