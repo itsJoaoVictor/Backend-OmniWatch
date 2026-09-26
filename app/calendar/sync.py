@@ -193,35 +193,67 @@ async def promote_upcoming_media(db: AsyncSession):
 async def migrate_existing_future_media():
     """
     Executado no startup da aplicação:
-    Migra mídias já cadastradas com status 'plan_to_watch' que não foram lançadas (sem data ou com data futura) para 'upcoming'.
+    Garante a integridade absoluta dos status 'upcoming' e 'plan_to_watch'.
+    Para cada mídia sem release_date no banco, consulta o TMDB para preencher a data real.
+    - Se a data real for passada (<= hoje, ex: Corações de Ferro, Parasita, Better Call Saul), garante status 'plan_to_watch'.
+    - Se a data real for futura ou se o título estiver em produção/sem data (ex: Terrifier 4), garante status 'upcoming'.
     """
     from sqlalchemy.orm import selectinload
     from app.core.utils import is_date_released
+    from app.details.services import fetch_movie_details, fetch_tv_details
+
     try:
         async with AsyncSessionLocal() as db:
             stmt = (
                 select(UserListItem)
                 .join(Media, UserListItem.media_id == Media.id)
-                .where(UserListItem.status == "plan_to_watch")
+                .where(UserListItem.status.in_(["upcoming", "plan_to_watch"]))
                 .options(selectinload(UserListItem.media))
             )
             res = await db.execute(stmt)
             items = res.scalars().all()
-            migrated_count = 0
+            
+            reverted_to_plan_count = 0
+            moved_to_upcoming_count = 0
+            
             for item in items:
-                rel_date = item.media.release_date if item.media else None
-                # Se não tem data ou a data ainda não ocorreu, é título não lançado -> upcoming
-                if not is_date_released(rel_date):
-                    item.status = "upcoming"
-                    migrated_count += 1
+                media = item.media
+                if not media:
+                    continue
 
-            if migrated_count > 0:
+                # 1. Se a mídia não tem release_date salva no nosso banco, busca no TMDB
+                if not media.release_date:
+                    try:
+                        if media.media_type == "movie":
+                            tmdb_data = await fetch_movie_details(media.tmdb_id)
+                            media.release_date = tmdb_data.release_date
+                        else:
+                            tmdb_data = await fetch_tv_details(media.tmdb_id)
+                            media.release_date = tmdb_data.first_air_date
+                    except Exception as e:
+                        print(f"Erro ao buscar data TMDB para {media.title}: {e}")
+
+                # 2. Agora com a data real verificada
+                has_released = is_date_released(media.release_date)
+
+                if has_released:
+                    # Se já lançou, DEVE ser plan_to_watch!
+                    if item.status == "upcoming":
+                        item.status = "plan_to_watch"
+                        reverted_to_plan_count += 1
+                else:
+                    # Se NÃO lançou (sem data ou futura), DEVE ser upcoming!
+                    if item.status == "plan_to_watch":
+                        item.status = "upcoming"
+                        moved_to_upcoming_count += 1
+
+            if reverted_to_plan_count > 0 or moved_to_upcoming_count > 0:
                 await db.commit()
-                print(f"[OmniWatch Startup] Migrados {migrated_count} títulos não lançados/sem data de 'plan_to_watch' para 'upcoming'.")
+                print(f"[OmniWatch Startup] Sincronização concluída: {reverted_to_plan_count} títulos lançados restaurados para 'plan_to_watch' e {moved_to_upcoming_count} títulos futuros confirmados em 'upcoming'.")
             else:
-                print("[OmniWatch Startup] Nenhum título futuro pendente de migração.")
+                print("[OmniWatch Startup] Todas as mídias já estão com os status corretos.")
     except Exception as e:
-        print(f"[OmniWatch Startup] Aviso: Falha ao verificar migração de títulos futuros: {e}")
+        print(f"[OmniWatch Startup] Falha na sincronização de status de títulos: {e}")
 
 async def run_calendar_sync_loop(interval_hours: int = 24):
     """Background task to sync calendar data using the TMDB Changes API."""

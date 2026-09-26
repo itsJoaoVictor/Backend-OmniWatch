@@ -16,7 +16,42 @@ async def get_user_list(db: AsyncSession, user_id: str):
         .where(UserListItem.user_id == target_uuid)
         .options(selectinload(UserListItem.media))
     )
-    return result.scalars().all()
+    items = result.scalars().all()
+
+    # Autocorreção transparente e em tempo real dos status upcoming / plan_to_watch
+    from app.core.utils import is_date_released
+    needs_commit = False
+    for item in items:
+        media = item.media
+        if not media:
+            continue
+        
+        if item.status in ["upcoming", "plan_to_watch"]:
+            if not media.release_date:
+                from app.details.services import fetch_movie_details, fetch_tv_details
+                try:
+                    if media.media_type == "movie":
+                        tmdb_data = await fetch_movie_details(media.tmdb_id)
+                        media.release_date = tmdb_data.release_date
+                    else:
+                        tmdb_data = await fetch_tv_details(media.tmdb_id)
+                        media.release_date = tmdb_data.first_air_date
+                    needs_commit = True
+                except Exception:
+                    pass
+
+            is_released = is_date_released(media.release_date)
+            if is_released and item.status == "upcoming":
+                item.status = "plan_to_watch"
+                needs_commit = True
+            elif not is_released and item.status == "plan_to_watch":
+                item.status = "upcoming"
+                needs_commit = True
+
+    if needs_commit:
+        await db.commit()
+
+    return items
 
 async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
     media = await get_media_by_tmdb_id(db, item.tmdb_id)
@@ -37,7 +72,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
         cast_ids = []
         crew_ids = []
         
-        if not title or not runtime or not genres or not directors or not main_cast:
+        if not title or not runtime or not genres or not directors or not main_cast or not release_date:
             from app.details.services import fetch_movie_details, fetch_tv_details
             try:
                 if item.media_type == "movie":
@@ -47,6 +82,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
                     backdrop_path = backdrop_path or tmdb_data.backdrop_path
                     runtime = tmdb_data.runtime or 0
                     original_language = tmdb_data.original_language or None
+                    release_date = release_date or tmdb_data.release_date
                     if not genres and tmdb_data.genres:
                         genres = [{"id": g.id, "name": g.name} for g in tmdb_data.genres]
                     if not directors and tmdb_data.credits and tmdb_data.credits.crew:
@@ -64,6 +100,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
                     poster_path = poster_path or tmdb_data.poster_path
                     backdrop_path = backdrop_path or tmdb_data.backdrop_path
                     original_language = tmdb_data.original_language or None
+                    release_date = release_date or tmdb_data.first_air_date
                     
                     if tmdb_data.episode_run_time and len(tmdb_data.episode_run_time) > 0:
                         runtime = tmdb_data.episode_run_time[0]
@@ -143,6 +180,21 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
             except Exception:
                 pass
 
+        if not media.release_date:
+            from app.details.services import fetch_movie_details, fetch_tv_details
+            try:
+                if media.media_type == "movie":
+                    tmdb_data = await fetch_movie_details(media.tmdb_id)
+                    media.release_date = tmdb_data.release_date
+                else:
+                    tmdb_data = await fetch_tv_details(media.tmdb_id)
+                    media.release_date = tmdb_data.first_air_date
+                if media.release_date:
+                    await db.commit()
+                    await db.refresh(media)
+            except Exception:
+                pass
+
     # Determinação e validação de status para títulos não lançados
     from app.core.utils import is_date_released
     from fastapi import HTTPException
@@ -170,6 +222,14 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
     )
     existing_item = result.scalars().first()
     if existing_item:
+        if existing_item.status != final_status:
+            existing_item.status = final_status
+            if item.rating is not None:
+                existing_item.rating = item.rating
+            await db.commit()
+            await db.refresh(existing_item)
+            from app.recommendation.profile_manager import update_user_profile
+            await update_user_profile(db, user_id, existing_item, existing_item.media)
         return existing_item
 
     new_item = UserListItem(
