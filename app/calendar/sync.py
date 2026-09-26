@@ -3,11 +3,11 @@ from datetime import datetime, timezone, timedelta
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import delete
+from sqlalchemy import delete, exists, not_
 from typing import List
 
 from app.media.models import Media, MediaRelease
-from app.tracking.models import UserListItem
+from app.tracking.models import UserListItem, UserEpisodeProgress
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 
@@ -79,11 +79,31 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
     await db.commit()
 
 async def revert_completed_shows(db: AsyncSession):
-    """Auto-revert completed TV shows to watching if a new episode has aired."""
+    """Auto-revert completed TV shows to watching if a new episode has aired and is not watched."""
     now_utc = datetime.now(timezone.utc)
-    stmt_revert = select(UserListItem).join(MediaRelease, UserListItem.media_id == MediaRelease.media_id).where(
-        UserListItem.status == "completed",
-        MediaRelease.release_date <= now_utc
+
+    # Subquery para verificar se o episódio lançado já foi assistido pelo usuário
+    watched_episode_exists = exists(
+        select(UserEpisodeProgress.id).where(
+            UserEpisodeProgress.user_list_item_id == UserListItem.id,
+            UserEpisodeProgress.season_number == MediaRelease.season_number,
+            UserEpisodeProgress.episode_number == MediaRelease.episode_number
+        )
+    )
+
+    stmt_revert = (
+        select(UserListItem)
+        .join(Media, UserListItem.media_id == Media.id)
+        .join(MediaRelease, UserListItem.media_id == MediaRelease.media_id)
+        .where(
+            Media.media_type == "tv",
+            UserListItem.status == "completed",
+            MediaRelease.release_date <= now_utc,
+            MediaRelease.season_number.isnot(None),
+            MediaRelease.episode_number.isnot(None),
+            not_(watched_episode_exists)
+        )
+        .distinct()
     )
     result_revert = await db.execute(stmt_revert)
     items_to_revert = result_revert.scalars().all()
@@ -132,6 +152,75 @@ async def fetch_changed_tmdb_ids(media_type: str, start_date: str, end_date: str
                 
     return list(changed_ids)
 
+async def promote_upcoming_media(db: AsyncSession):
+    """
+    Promove mídias com status 'upcoming' para 'plan_to_watch' quando a data de lançamento for atingida (release_date <= hoje),
+    e gera uma notificação amigável na central de notificações do usuário.
+    """
+    from app.core.utils import is_date_released
+    from app.notifications.models import Notification
+    from sqlalchemy.orm import selectinload
+    
+    stmt = (
+        select(UserListItem)
+        .join(Media, UserListItem.media_id == Media.id)
+        .where(UserListItem.status == "upcoming")
+        .options(selectinload(UserListItem.media))
+    )
+    result = await db.execute(stmt)
+    upcoming_items = result.scalars().all()
+    
+    promoted_count = 0
+    for item in upcoming_items:
+        if item.media and item.media.release_date and is_date_released(item.media.release_date):
+            item.status = "plan_to_watch"
+            promoted_count += 1
+            
+            # Notifica o usuário
+            media_tipo = "O filme" if item.media.media_type == "movie" else "A série"
+            new_notif = Notification(
+                user_id=item.user_id,
+                media_id=item.media.id,
+                title=f"Estreia: {item.media.title}!",
+                message=f"{media_tipo} '{item.media.title}' estreou hoje e agora está disponível na sua lista Quero Ver!"
+            )
+            db.add(new_notif)
+            
+    if promoted_count > 0:
+        await db.commit()
+        print(f"Promoted {promoted_count} items from 'upcoming' to 'plan_to_watch'.")
+
+async def migrate_existing_future_media():
+    """
+    Executado no startup da aplicação:
+    Migra mídias já cadastradas com status 'plan_to_watch' que possuem release_date futura para 'upcoming'.
+    """
+    from sqlalchemy.orm import selectinload
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        async with AsyncSessionLocal() as db:
+            stmt = (
+                select(UserListItem)
+                .join(Media, UserListItem.media_id == Media.id)
+                .where(
+                    UserListItem.status == "plan_to_watch",
+                    Media.release_date.isnot(None),
+                    Media.release_date > today_str
+                )
+                .options(selectinload(UserListItem.media))
+            )
+            res = await db.execute(stmt)
+            items = res.scalars().all()
+            if items:
+                for item in items:
+                    item.status = "upcoming"
+                await db.commit()
+                print(f"[OmniWatch Startup] Migrados {len(items)} títulos futuros de 'plan_to_watch' para 'upcoming'.")
+            else:
+                print("[OmniWatch Startup] Nenhum título futuro pendente de migração.")
+    except Exception as e:
+        print(f"[OmniWatch Startup] Aviso: Falha ao verificar migração de títulos futuros: {e}")
+
 async def run_calendar_sync_loop(interval_hours: int = 24):
     """Background task to sync calendar data using the TMDB Changes API."""
     print("Calendar sync loop started.")
@@ -148,11 +237,11 @@ async def run_calendar_sync_loop(interval_hours: int = 24):
             
             all_changed_tmdb_ids = set(changed_movies + changed_tv)
             
-            if all_changed_tmdb_ids:
-                async with AsyncSessionLocal() as db:
+            async with AsyncSessionLocal() as db:
+                if all_changed_tmdb_ids:
                     # 2. Find tracked media in our DB that overlap with the changed IDs
                     stmt_tracked_ids = select(UserListItem.media_id).where(
-                        UserListItem.status.in_(["plan_to_watch", "completed", "watching"])
+                        UserListItem.status.in_(["plan_to_watch", "completed", "watching", "upcoming"])
                     ).distinct()
                     res_tracked = await db.execute(stmt_tracked_ids)
                     tracked_media_ids = res_tracked.scalars().all()
@@ -172,6 +261,9 @@ async def run_calendar_sync_loop(interval_hours: int = 24):
                     
                     # 4. Revert completed shows if new episodes aired
                     await revert_completed_shows(db)
+
+                # 5. Promove itens 'upcoming' que estrearam e notifica os usuários
+                await promote_upcoming_media(db)
                     
             print("Calendar sync complete.")
         except Exception as e:
