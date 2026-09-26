@@ -220,6 +220,39 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
         return None
 
     if update_data.status is not None:
+        from app.core.utils import is_date_released
+        from fastapi import HTTPException
+
+        rel_date = item.media.release_date if item.media else None
+        if not rel_date and item.media:
+            from app.details.services import fetch_movie_details, fetch_tv_details
+            try:
+                if item.media.media_type == "movie":
+                    tmdb_data = await fetch_movie_details(item.media.tmdb_id)
+                else:
+                    tmdb_data = await fetch_tv_details(item.media.tmdb_id)
+                rel_date = tmdb_data.release_date if hasattr(tmdb_data, 'release_date') else getattr(tmdb_data, 'first_air_date', None)
+                if rel_date:
+                    item.media.release_date = rel_date
+            except Exception:
+                pass
+
+        is_released = is_date_released(rel_date)
+
+        # Regra de Negócio: 'upcoming' é 100% automático gerenciado pelo sistema
+        if update_data.status == "upcoming" and is_released:
+            raise HTTPException(
+                status_code=400,
+                detail="O status 'Aguardando Estreia' é gerenciado automaticamente pelo sistema."
+            )
+
+        # Títulos não lançados só podem ter status 'upcoming' ou 'dropped'
+        if not is_released and update_data.status in ["plan_to_watch", "watching", "completed"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Títulos que ainda não estrearam permanecem automaticamente em 'Aguardando Estreia' até o lançamento."
+            )
+
         if update_data.status == "completed":
             if item.media.media_type == "movie":
                 from app.core.utils import is_date_released

@@ -193,29 +193,31 @@ async def promote_upcoming_media(db: AsyncSession):
 async def migrate_existing_future_media():
     """
     Executado no startup da aplicação:
-    Migra mídias já cadastradas com status 'plan_to_watch' que possuem release_date futura para 'upcoming'.
+    Migra mídias já cadastradas com status 'plan_to_watch' que não foram lançadas (sem data ou com data futura) para 'upcoming'.
     """
     from sqlalchemy.orm import selectinload
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    from app.core.utils import is_date_released
     try:
         async with AsyncSessionLocal() as db:
             stmt = (
                 select(UserListItem)
                 .join(Media, UserListItem.media_id == Media.id)
-                .where(
-                    UserListItem.status == "plan_to_watch",
-                    Media.release_date.isnot(None),
-                    Media.release_date > today_str
-                )
+                .where(UserListItem.status == "plan_to_watch")
                 .options(selectinload(UserListItem.media))
             )
             res = await db.execute(stmt)
             items = res.scalars().all()
-            if items:
-                for item in items:
+            migrated_count = 0
+            for item in items:
+                rel_date = item.media.release_date if item.media else None
+                # Se não tem data ou a data ainda não ocorreu, é título não lançado -> upcoming
+                if not is_date_released(rel_date):
                     item.status = "upcoming"
+                    migrated_count += 1
+
+            if migrated_count > 0:
                 await db.commit()
-                print(f"[OmniWatch Startup] Migrados {len(items)} títulos futuros de 'plan_to_watch' para 'upcoming'.")
+                print(f"[OmniWatch Startup] Migrados {migrated_count} títulos não lançados/sem data de 'plan_to_watch' para 'upcoming'.")
             else:
                 print("[OmniWatch Startup] Nenhum título futuro pendente de migração.")
     except Exception as e:
