@@ -7,7 +7,7 @@ from app.core.database import get_db
 from app.core.cache import SimpleTTLCache
 from app.auth.dependencies import get_current_user_id
 from app.users.models import User
-from app.recommendation.orchestrator import get_personalized_recommendations
+from app.recommendation.orchestrator import get_personalized_recommendations, get_upcoming_recommendations
 from app.recommendation.matcher import calculate_match_score
 from app.recommendation.vector_builder import WEIGHTS
 from app.details.services import fetch_movie_details, fetch_tv_details
@@ -17,6 +17,7 @@ router = APIRouter()
 visit_cache = SimpleTTLCache(ttl_seconds=3600)
 recs_cache = SimpleTTLCache(ttl_seconds=86400) # 24 horas TTL para recomendações (ou 604800 para 1 semana)
 personas_cache = SimpleTTLCache(ttl_seconds=86400) # 24 horas TTL para personas
+upcoming_cache = SimpleTTLCache(ttl_seconds=86400) # 24 horas TTL para lançamentos futuros
 
 @router.get("/explore", response_model=List[Any])
 async def get_explore_recommendations(
@@ -101,6 +102,50 @@ async def get_user_personas(
         personas = await get_persona_recommendations(db, current_user_id, top_k_per_persona=top_k)
         personas_cache.set(cache_key, personas)
         return personas
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
+
+@router.get("/upcoming", response_model=Dict[str, Any])
+async def get_upcoming_recommendations_endpoint(
+    background_tasks: BackgroundTasks,
+    limit: int = Query(20, ge=1, le=50),
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Retorna os próximos lançamentos (Filmes e Séries Inéditas) ranqueados
+    pelo perfil de afinidade (Match Score) do usuário.
+    """
+    from sqlalchemy.future import select
+    from app.users.models import User
+
+    user_result = await db.execute(select(User.updated_at).where(User.id == current_user_id))
+    updated_at = user_result.scalars().first()
+    ts = updated_at.timestamp() if updated_at else 0
+
+    cache_key = f"upcoming:{current_user_id}:{limit}:v{ts}"
+    cached_data, is_stale = upcoming_cache.get_with_status(cache_key)
+
+    async def fetch_and_cache_upcoming():
+        from app.core.database import AsyncSessionLocal
+        try:
+            async with AsyncSessionLocal() as bg_db:
+                new_upcoming = await get_upcoming_recommendations(bg_db, current_user_id, top_k_per_type=limit)
+                upcoming_cache.set(cache_key, new_upcoming)
+        except Exception as e:
+            logger.error(f"Erro no SWR de upcoming: {e}")
+
+    if cached_data is not None:
+        if is_stale:
+            upcoming_cache.set(cache_key, cached_data)
+            background_tasks.add_task(fetch_and_cache_upcoming)
+        return cached_data
+
+    try:
+        data = await get_upcoming_recommendations(db, current_user_id, top_k_per_type=limit)
+        upcoming_cache.set(cache_key, data)
+        return data
     except Exception as e:
         logger.exception(e)
         raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')

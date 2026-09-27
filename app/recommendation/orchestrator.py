@@ -737,3 +737,237 @@ async def get_persona_recommendations(
 
     return persona_carousels
 
+
+async def fetch_upcoming_candidates(user_vector: Dict[str, float], db=None, user_id: str = None) -> List[Dict[str, Any]]:
+    if not settings.TMDB_API_KEY:
+        return []
+
+    from datetime import datetime, timezone, timedelta
+    today_dt = datetime.now(timezone.utc)
+    today = today_dt.strftime("%Y-%m-%d")
+    max_date = (today_dt + timedelta(days=365)).strftime("%Y-%m-%d")
+
+    genre_features = [(k.replace("genre_", ""), v) for k, v in user_vector.items() if k.startswith("genre_")]
+    genre_features.sort(key=lambda x: x[1], reverse=True)
+
+    live_genre_name_to_id: Dict[str, int] = {}
+    if db and user_id:
+        try:
+            from app.tracking.services import get_user_list
+            user_items = await get_user_list(db, user_id)
+            for list_item in user_items:
+                media = list_item.media
+                if media and media.genres:
+                    for g in media.genres:
+                        if isinstance(g, dict):
+                            _name = str(g.get("name", "")).lower()
+                            _gid = g.get("id")
+                            if _name and _gid:
+                                live_genre_name_to_id[_name] = _gid
+        except Exception:
+            pass
+
+    primary_genres = [g for g, v in genre_features[:5] if v > 0]
+    secondary_genres = [g for g, v in genre_features[5:10] if v > 0]
+
+    prim_movie_ids = [str(live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g)) for g in primary_genres if (live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g))]
+    with_primary_movie_genres = "|".join(prim_movie_ids) if prim_movie_ids else None
+    sec_movie_ids = [str(live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g)) for g in secondary_genres if (live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g))]
+    with_sec_movie_genres = "|".join(sec_movie_ids) if sec_movie_ids else None
+
+    prim_tv_ids = [TV_GENRE_MAP.get(g, str(GENRE_MAP_REVERSE.get(g, ""))) for g in primary_genres]
+    prim_tv_ids = [x for x in prim_tv_ids if x]
+    with_primary_tv_genres = "|".join(prim_tv_ids) if prim_tv_ids else None
+    sec_tv_ids = [TV_GENRE_MAP.get(g, str(GENRE_MAP_REVERSE.get(g, ""))) for g in secondary_genres]
+    sec_tv_ids = [x for x in sec_tv_ids if x]
+    with_sec_tv_genres = "|".join(sec_tv_ids) if sec_tv_ids else None
+
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {settings.TMDB_API_KEY}"
+    }
+
+    async def fetch_endpoint(client: httpx.AsyncClient, endpoint: str, media_type: Optional[str], params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        url = f"{settings.TMDB_BASE_URL}{endpoint}"
+        default_params = {"language": "pt-BR", "page": 1}
+        default_params.update(params)
+        try:
+            response = await client.get(url, headers=headers, params=default_params, timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results", [])
+            for r in results:
+                if media_type:
+                    r["media_type"] = media_type
+                elif "media_type" not in r:
+                    r["media_type"] = "movie" if "title" in r else "tv"
+            return results
+        except Exception:
+            return []
+
+    tasks = []
+    async with httpx.AsyncClient() as client:
+        # === FILMES FUTUROS ===
+        # 1. Discover filmes com gêneros primários do usuário
+        if with_primary_movie_genres:
+            for p in [1, 2]:
+                tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
+                    "primary_release_date.gte": today,
+                    "primary_release_date.lte": max_date,
+                    "with_genres": with_primary_movie_genres,
+                    "sort_by": "popularity.desc",
+                    "page": p
+                }))
+        # 2. Discover filmes com gêneros secundários do usuário
+        if with_sec_movie_genres:
+            tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
+                "primary_release_date.gte": today,
+                "primary_release_date.lte": max_date,
+                "with_genres": with_sec_movie_genres,
+                "sort_by": "popularity.desc",
+                "page": 1
+            }))
+        # 3. Discover filmes mais populares globais a estrear
+        for p in [1, 2, 3]:
+            tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
+                "primary_release_date.gte": today,
+                "primary_release_date.lte": max_date,
+                "sort_by": "popularity.desc",
+                "page": p
+            }))
+        # 4. Upcoming oficial com region=BR
+        for p in [1, 2]:
+            tasks.append(fetch_endpoint(client, "/movie/upcoming", "movie", {
+                "region": "BR",
+                "page": p
+            }))
+
+        # === SÉRIES INÉDITAS FUTURAS ===
+        # 1. Discover TV com gêneros primários do usuário
+        if with_primary_tv_genres:
+            for p in [1, 2]:
+                tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
+                    "first_air_date.gte": today,
+                    "first_air_date.lte": max_date,
+                    "include_null_first_air_dates": "false",
+                    "with_genres": with_primary_tv_genres,
+                    "sort_by": "popularity.desc",
+                    "page": p
+                }))
+        # 2. Discover TV com gêneros secundários do usuário
+        if with_sec_tv_genres:
+            tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
+                "first_air_date.gte": today,
+                "first_air_date.lte": max_date,
+                "include_null_first_air_dates": "false",
+                "with_genres": with_sec_tv_genres,
+                "sort_by": "popularity.desc",
+                "page": 1
+            }))
+        # 3. Discover TV mais populares globais inéditas a estrear
+        for p in [1, 2, 3]:
+            tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
+                "first_air_date.gte": today,
+                "first_air_date.lte": max_date,
+                "include_null_first_air_dates": "false",
+                "sort_by": "popularity.desc",
+                "page": p
+            }))
+
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    candidates = []
+    seen_ids = set()
+    for batch in batch_results:
+        if isinstance(batch, list):
+            for c in batch:
+                cid = c.get("id")
+                if not cid or cid in seen_ids:
+                    continue
+
+                mtype = c.get("media_type")
+                r_date = c.get("release_date") if mtype == "movie" else c.get("first_air_date")
+                if r_date and r_date >= today:
+                    seen_ids.add(cid)
+                    candidates.append(c)
+
+    return candidates
+
+
+async def get_upcoming_recommendations(
+    db: AsyncSession,
+    user_id: str,
+    top_k_per_type: int = 20
+) -> Dict[str, List[Dict[str, Any]]]:
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalars().first()
+
+    user_vector = user.feature_vector if user else {}
+    user_embedding = user.embedding if user else None
+
+    # Candidatos futuros
+    upcoming_candidates = await fetch_upcoming_candidates(user_vector, db=db, user_id=user_id)
+
+    # Filtrar itens que o usuário já adicionou na lista (ex: já está em 'plan_to_watch')
+    from app.tracking.services import get_user_list
+    user_list = await get_user_list(db, user_id)
+    seen_tmdb_ids = {item.media.tmdb_id for item in user_list if item.media}
+
+    filtered_candidates = [c for c in upcoming_candidates if c.get("id") not in seen_tmdb_ids]
+
+    if not filtered_candidates:
+        return {"movies": [], "series": []}
+
+    # Enriquecimento com detalhes (diretores, elenco, palavras-chave)
+    enriched = await enrich_candidates_with_details(filtered_candidates, user_vector=user_vector)
+
+    active_personas = user.taste_clusters if (user and user.taste_clusters and len(user.taste_clusters) > 1) else None
+
+    scored_movies = []
+    scored_tv = []
+
+    for c in enriched:
+        candidate_vector = build_candidate_vector(c)
+        c["_candidate_vector"] = candidate_vector
+
+        if active_personas:
+            best_final_score = -1.0
+            best_tags = []
+            for p in active_personas:
+                p_vec = p.get("feature_vector") or user_vector
+                aff_score, tags = calculate_match_score(p_vec, candidate_vector)
+                if aff_score > best_final_score:
+                    best_final_score = aff_score
+                    best_tags = tags
+            final_score = best_final_score
+            top_tags = best_tags
+        elif user_vector:
+            affinity_score, top_tags = calculate_match_score(user_vector, candidate_vector)
+            final_score = affinity_score
+        else:
+            final_score = round(min(95.0, max(50.0, (c.get("popularity", 0) / 10.0))), 1)
+            top_tags = ["Estreia confirmada"]
+
+        c["match_score"] = final_score
+        c["match_tags"] = top_tags
+
+        if c.get("media_type") == "movie":
+            scored_movies.append(c)
+        elif c.get("media_type") == "tv":
+            scored_tv.append(c)
+
+    # Ordenação decrescente pelo Match Score (conforme alinhado no grill-me)
+    scored_movies.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+    scored_tv.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+
+    # Limpeza de campos internos
+    for item in scored_movies + scored_tv:
+        item.pop("_candidate_vector", None)
+        item.pop("_best_persona_id", None)
+        item.pop("_ml_score", None)
+
+    return {
+        "movies": scored_movies[:top_k_per_type],
+        "series": scored_tv[:top_k_per_type]
+    }
+
