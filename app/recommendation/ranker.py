@@ -1,5 +1,8 @@
 import os
+import logging
 import joblib
+
+logger = logging.getLogger(__name__)
 import numpy as np
 from typing import Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,9 +40,9 @@ class LightGBMRanker:
             self.model = joblib.load(MODEL_PATH)
             LightGBMRanker._cached_model = self.model
             LightGBMRanker._cached_mtime = current_mtime
-            print("🧠 [LightGBM] Modelo carregado e pronto para rankeamento!")
+            logger.info("[LightGBM] Modelo carregado e pronto para rankeamento!")
         except Exception as e:
-            print(f"❌ [LightGBM] Failed to load LightGBM model: {e}")
+            logger.error(f"[LightGBM] Failed to load LightGBM model: {e}")
 
     def is_ready(self) -> bool:
         return self.model is not None

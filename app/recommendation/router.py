@@ -14,10 +14,12 @@ from app.details.services import fetch_movie_details, fetch_tv_details
 
 router = APIRouter()
 
-visit_cache = SimpleTTLCache(ttl_seconds=3600)
-recs_cache = SimpleTTLCache(ttl_seconds=86400) # 24 horas TTL para recomendações (ou 604800 para 1 semana)
-personas_cache = SimpleTTLCache(ttl_seconds=86400) # 24 horas TTL para personas
-upcoming_cache = SimpleTTLCache(ttl_seconds=86400) # 24 horas TTL para lançamentos futuros
+from datetime import datetime, timezone
+from app.recommendation.service import (
+    get_user_recommendations_record,
+    compute_and_save_user_recommendations,
+    MAX_STALE_SECONDS,
+)
 
 @router.get("/explore", response_model=List[Any])
 async def get_explore_recommendations(
@@ -27,39 +29,31 @@ async def get_explore_recommendations(
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    from sqlalchemy.future import select
-    from app.users.models import User
-    
-    user_result = await db.execute(select(User.updated_at).where(User.id == current_user_id))
-    updated_at = user_result.scalars().first()
-    ts = updated_at.timestamp() if updated_at else 0
-    
-    cache_key = f"explore:{current_user_id}:{limit}:{persona_id}:v{ts}"
-    cached_data, is_stale = recs_cache.get_with_status(cache_key)
-
-    async def fetch_and_cache():
-        from app.core.database import AsyncSessionLocal
-        try:
-            async with AsyncSessionLocal() as bg_db:
-                new_recs = await get_personalized_recommendations(
-                    bg_db, current_user_id, top_k=limit, persona_id=persona_id
-                )
-                recs_cache.set(cache_key, new_recs)
-        except Exception as e:
-            print(f"Erro no SWR de explore: {e}")
-
-    if cached_data is not None:
-        if is_stale:
-            recs_cache.set(cache_key, cached_data) # Impede dezenas de tasks de SWR concorrentes
-            background_tasks.add_task(fetch_and_cache)
-        return cached_data
-
     try:
-        recommendations = await get_personalized_recommendations(
-            db, current_user_id, top_k=limit, persona_id=persona_id
-        )
-        recs_cache.set(cache_key, recommendations)
-        return recommendations
+        record = await get_user_recommendations_record(db, current_user_id)
+
+        # Cold start: se o registro não existe ou ainda não tem itens
+        if not record or not record.explore_items:
+            res = await compute_and_save_user_recommendations(current_user_id, force=True)
+            items = (res.get("explore_items") if res else [])
+        else:
+            items = record.explore_items
+            now = datetime.now(timezone.utc)
+            is_expired = (
+                record.last_generated_at is None
+                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
+            )
+            if record.is_stale or is_expired:
+                background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+
+        if persona_id:
+            personas = record.personas_items if record else []
+            target = next((p for p in personas if p.get("id") == persona_id), None)
+            if target and target.get("recommendations"):
+                return target["recommendations"][:limit]
+            return (await get_personalized_recommendations(db, current_user_id, top_k=limit, persona_id=persona_id))[:limit]
+
+        return items[:limit]
     except Exception as e:
         logger.exception(e)
         raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
@@ -71,37 +65,29 @@ async def get_user_personas(
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    from sqlalchemy.future import select
-    from app.users.models import User
-    
-    user_result = await db.execute(select(User.updated_at).where(User.id == current_user_id))
-    updated_at = user_result.scalars().first()
-    ts = updated_at.timestamp() if updated_at else 0
-    
-    cache_key = f"personas:{current_user_id}:{top_k}:v{ts}"
-    cached_data, is_stale = personas_cache.get_with_status(cache_key)
-
-    async def fetch_and_cache_personas():
-        from app.core.database import AsyncSessionLocal
-        from app.recommendation.orchestrator import get_persona_recommendations
-        try:
-            async with AsyncSessionLocal() as bg_db:
-                new_personas = await get_persona_recommendations(bg_db, current_user_id, top_k_per_persona=top_k)
-                personas_cache.set(cache_key, new_personas)
-        except Exception as e:
-            print(f"Erro no SWR de personas: {e}")
-
-    if cached_data is not None:
-        if is_stale:
-            personas_cache.set(cache_key, cached_data)
-            background_tasks.add_task(fetch_and_cache_personas)
-        return cached_data
-
     try:
-        from app.recommendation.orchestrator import get_persona_recommendations
-        personas = await get_persona_recommendations(db, current_user_id, top_k_per_persona=top_k)
-        personas_cache.set(cache_key, personas)
-        return personas
+        record = await get_user_recommendations_record(db, current_user_id)
+
+        if not record or not record.personas_items:
+            res = await compute_and_save_user_recommendations(current_user_id, force=True)
+            personas = (res.get("personas_items", []) if res else [])
+        else:
+            personas = record.personas_items
+            now = datetime.now(timezone.utc)
+            is_expired = (
+                record.last_generated_at is None
+                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
+            )
+            if record.is_stale or is_expired:
+                background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+
+        result = []
+        for p in personas:
+            p_copy = dict(p)
+            if "recommendations" in p_copy and isinstance(p_copy["recommendations"], list):
+                p_copy["recommendations"] = p_copy["recommendations"][:top_k]
+            result.append(p_copy)
+        return result
     except Exception as e:
         logger.exception(e)
         raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
@@ -117,38 +103,80 @@ async def get_upcoming_recommendations_endpoint(
     Retorna os próximos lançamentos (Filmes e Séries Inéditas) ranqueados
     pelo perfil de afinidade (Match Score) do usuário.
     """
-    from sqlalchemy.future import select
-    from app.users.models import User
-
-    user_result = await db.execute(select(User.updated_at).where(User.id == current_user_id))
-    updated_at = user_result.scalars().first()
-    ts = updated_at.timestamp() if updated_at else 0
-
-    cache_key = f"upcoming:{current_user_id}:{limit}:v{ts}"
-    cached_data, is_stale = upcoming_cache.get_with_status(cache_key)
-
-    async def fetch_and_cache_upcoming():
-        from app.core.database import AsyncSessionLocal
-        try:
-            async with AsyncSessionLocal() as bg_db:
-                new_upcoming = await get_upcoming_recommendations(bg_db, current_user_id, top_k_per_type=limit)
-                upcoming_cache.set(cache_key, new_upcoming)
-        except Exception as e:
-            logger.error(f"Erro no SWR de upcoming: {e}")
-
-    if cached_data is not None:
-        if is_stale:
-            upcoming_cache.set(cache_key, cached_data)
-            background_tasks.add_task(fetch_and_cache_upcoming)
-        return cached_data
-
     try:
-        data = await get_upcoming_recommendations(db, current_user_id, top_k_per_type=limit)
-        upcoming_cache.set(cache_key, data)
-        return data
+        record = await get_user_recommendations_record(db, current_user_id)
+
+        if not record or not record.upcoming_items:
+            res = await compute_and_save_user_recommendations(current_user_id, force=True)
+            upcoming = (res.get("upcoming_items", {}) if res else {"movies": [], "tv": []})
+        else:
+            upcoming = record.upcoming_items
+            now = datetime.now(timezone.utc)
+            is_expired = (
+                record.last_generated_at is None
+                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
+            )
+            if record.is_stale or is_expired:
+                background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+
+        return {
+            "movies": (upcoming.get("movies") or [])[:limit],
+            "tv": (upcoming.get("tv") or [])[:limit]
+        }
     except Exception as e:
         logger.exception(e)
         raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
+
+@router.get("/feed", response_model=Dict[str, Any])
+async def get_explore_feed(
+    background_tasks: BackgroundTasks,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Retorna todo o payload de Explore (explore, upcoming e personas)
+    em uma única requisição ultrarrápida direta do banco de dados (< 20ms).
+    """
+    try:
+        record = await get_user_recommendations_record(db, current_user_id)
+        if not record or (not record.explore_items and not record.personas_items):
+            res = await compute_and_save_user_recommendations(current_user_id, force=True)
+            return {
+                "explore": res.get("explore_items", []) if res else [],
+                "upcoming": res.get("upcoming_items", {}) if res else {"movies": [], "tv": []},
+                "personas": res.get("personas_items", []) if res else [],
+                "is_stale": False,
+                "last_generated_at": datetime.now(timezone.utc).isoformat()
+            }
+
+        now = datetime.now(timezone.utc)
+        is_expired = (
+            record.last_generated_at is None
+            or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
+        )
+        if record.is_stale or is_expired:
+            background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+
+        return {
+            "explore": record.explore_items,
+            "upcoming": record.upcoming_items,
+            "personas": record.personas_items,
+            "is_stale": record.is_stale,
+            "last_generated_at": record.last_generated_at.isoformat() if record.last_generated_at else None
+        }
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
+
+@router.post("/recompute")
+async def force_recompute_recommendations(
+    background_tasks: BackgroundTasks,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    """Dispara um recálculo forçado de recomendações em segundo plano."""
+    background_tasks.add_task(compute_and_save_user_recommendations, current_user_id, force=True)
+    return {"message": "Recálculo forçado de recomendações iniciado em segundo plano."}
+
 
 @router.get("/score/{media_type}/{tmdb_id}")
 async def get_item_score(
@@ -254,67 +282,14 @@ async def get_item_score(
 @router.post("/visit/{media_type}/{tmdb_id}")
 async def record_visit(
     media_type: str = Path(...),
-    tmdb_id: int = Path(...),
-    current_user_id: str = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db)
+    tmdb_id: int = Path(...)
 ):
     """
-    Fase 3 - Feedback Implícito:
-    Registra visita à página de detalhes com peso leve (+0.2) no vetor do usuário.
-    Usa cache de 1 hora por usuário/mídia para evitar spam em F5.
+    Feedback implícito desativado por design:
+    Visitas a páginas de detalhes não alteram mais o perfil do usuário
+    nem invalidam o cache de recomendações. Mantido como no-op para compatibilidade.
     """
-    cache_key = f"visit:{current_user_id}:{media_type}:{tmdb_id}"
-    data, is_stale = visit_cache.get_with_status(cache_key)
-    if not is_stale and data:
-        return {"status": "ok", "recorded": False, "reason": "already_recorded_recently"}
-
-    try:
-        from app.media.services import get_media_by_tmdb_id
-        from app.recommendation.profile_manager import update_user_profile
-
-        media = await get_media_by_tmdb_id(db, tmdb_id)
-        if media:
-            await update_user_profile(db, current_user_id, None, media, explicit_scale=0.2)
-            visit_cache.set(cache_key, True)
-            return {"status": "ok", "recorded": True, "scale": 0.2}
-
-        # Se não existe no banco, busca TMDB para extrair vetor
-        if media_type == "movie":
-            tmdb_data = await fetch_movie_details(tmdb_id)
-        else:
-            tmdb_data = await fetch_tv_details(tmdb_id)
-
-        vector = {}
-        vector[f"type_{media_type}"] = WEIGHTS["media_type"]
-        if tmdb_data.genres:
-            for g in tmdb_data.genres:
-                vector[f"genre_{g.name.lower()}"] = WEIGHTS["genre"]
-        if tmdb_data.credits:
-            if tmdb_data.credits.crew:
-                for c in tmdb_data.credits.crew:
-                    if c.job in ("Director", "Creator"):
-                        vector[f"director_{c.name.lower()}"] = WEIGHTS["director"]
-            if tmdb_data.credits.cast:
-                for c in tmdb_data.credits.cast[:10]:
-                    vector[f"cast_{c.name.lower()}"] = WEIGHTS["cast"]
-        if hasattr(tmdb_data, "keywords") and tmdb_data.keywords:
-            for kw in tmdb_data.keywords:
-                vector[f"keyword_{kw.lower()}"] = WEIGHTS["keyword"]
-        if tmdb_data.original_language and tmdb_data.original_language.lower() != "en":
-            vector[f"lang_{tmdb_data.original_language.lower()}"] = WEIGHTS["language"]
-
-        await update_user_profile(
-            db,
-            current_user_id,
-            None,
-            media=None,
-            explicit_scale=0.2,
-            media_vector=vector
-        )
-        visit_cache.set(cache_key, True)
-        return {"status": "ok", "recorded": True, "scale": 0.2}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+    return {"status": "ok", "recorded": False}
 
 @router.get("/similar-users")
 async def get_similar_users(

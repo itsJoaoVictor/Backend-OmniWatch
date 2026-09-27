@@ -37,11 +37,11 @@ async def get_trending_week(language: str = "pt-BR", page: int = 1) -> dict:
             # MAGIA ACONTECE AQUI (Stale-If-Error):
             # Se a API do TMDB quebrou, mas temos um dado antigo salvo no cache, salvamos o dia!
             if cached_data is not None:
-                print(f"⚠️ [RESILIÊNCIA] TMDB falhou. Retornando cache antigo (Stale-If-Error) para {cache_key}. Erro: {e}")
+                print(f"[RESILIENCIA] TMDB falhou. Retornando cache antigo (Stale-If-Error) para {cache_key}. Erro: {e}")
                 return cached_data
             
             # Se não temos cache e o TMDB quebrou, aí sim o usuário vê o erro.
-            print(f"❌ TMDB HTTP Error: {e}")
+            print(f"[ERROR] TMDB HTTP Error: {e}")
             if hasattr(e, "response") and e.response is not None:
                 print(f"TMDB Response: {e.response.text}")
             raise HTTPException(

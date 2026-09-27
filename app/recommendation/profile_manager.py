@@ -1,6 +1,9 @@
+import logging
 from typing import Dict, Optional
 from datetime import datetime, timezone
 import math
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.users.models import User
@@ -171,10 +174,11 @@ async def update_user_profile(
     except Exception:
         pass
         
-    # Invalida o cache para esse usuário, ativando a revalidação em background na próxima visita
+    # Marca as recomendações como stale no DB e agenda atualização em background com cooldown
     try:
-        from app.recommendation.router import recs_cache, personas_cache
-        recs_cache.invalidate_prefix(f"explore:{user_id}")
-        personas_cache.invalidate_prefix(f"personas:{user_id}")
+        from app.recommendation.service import mark_user_recommendations_stale, schedule_recommendation_computation
+        await mark_user_recommendations_stale(db, user.id)
+        schedule_recommendation_computation(user.id, force=False, cooldown_seconds=1200)
     except Exception as e:
-        pass
+        logger.warning(f"Erro ao agendar atualização de recomendações para {user.id}: {e}")
+

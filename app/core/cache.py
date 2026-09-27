@@ -4,7 +4,7 @@ from app.core.config import settings
 
 class SimpleTTLCache:
     def __init__(self, ttl_seconds: int = 86400): # 24 horas por padrão
-        self.ttl = 0 if settings.DEBUG else ttl_seconds
+        self.ttl = ttl_seconds
         self._cache: Dict[str, dict] = {}
         
     def get_with_status(self, key: str) -> Tuple[Any | None, bool]:
