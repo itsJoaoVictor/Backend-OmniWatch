@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 def dot_product(v1: Dict[str, float], v2: Dict[str, float]) -> float:
     return sum(v1.get(k, 0) * v2.get(k, 0) for k in set(v1) & set(v2))
@@ -134,28 +134,192 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
         if k.startswith("genre_"):
             top_tags.append(f"🎬 {k.replace('genre_', '').title()}")
         elif k.startswith("cast_"):
-            top_tags.append(f"🧑‍🎤 {k.replace('cast_', '').title()}")
+            top_tags.append(f"🌟 Com {k.replace('cast_', '').title()}")
         elif k.startswith("director_"):
-            top_tags.append(f"🎬 {k.replace('director_', '').title()}")
+            top_tags.append(f"🎬 Dirigido por {k.replace('director_', '').title()}")
         elif k.startswith("type_"):
-            pass  # omite tipo puro das tags visuais
+            pass
         elif k.startswith("lang_"):
-            lang = k.replace("lang_", "")
-            lang_map = {
-                "ja": "Japonês", 
-                "ko": "Coreano", 
-                "es": "Espanhol", 
-                "fr": "Francês", 
-                "it": "Italiano", 
-                "de": "Alemão", 
-                "pt": "Português", 
-                "zh": "Chinês",
-                "hi": "Indiano"
-            }
-            friendly_lang = lang_map.get(lang, lang.upper())
-            top_tags.append(f"🗣️ Áudio {friendly_lang}")
+            lang = k.replace("lang_", "").lower()
+            if lang in NICHE_LANGUAGE_MAP:
+                top_tags.append(NICHE_LANGUAGE_MAP[lang])
         else:
-            clean_kw = k.replace("keyword_", "").title()
-            top_tags.append(f"🔥 {clean_kw}")
+            clean_kw = k.replace("keyword_", "").lower()
+            if clean_kw in CURATED_KEYWORDS_MAP:
+                top_tags.append(CURATED_KEYWORDS_MAP[clean_kw])
+            else:
+                top_tags.append(f"🏷️ {clean_kw.title()}")
 
     return score, top_tags
+
+CURATED_KEYWORDS_MAP: Dict[str, str] = {
+    "time travel": "⏳ Viagem no Tempo",
+    "space": "🌌 Exploração Espacial",
+    "space travel": "🌌 Exploração Espacial",
+    "dystopia": "🏙️ Distopia Futurista",
+    "post-apocalyptic": "🌋 Pós-Apocalíptico",
+    "artificial intelligence": "🤖 Inteligência Artificial",
+    "robot": "🤖 Robôs & Tecnologia",
+    "cyberpunk": "🌆 Universo Cyberpunk",
+    "superhero": "🦸 Super-Heróis",
+    "heist": "💰 Golpes & Estratégia",
+    "magic": "✨ Magia & Fantasia",
+    "witch": "🧙 Bruxaria & Misticismo",
+    "revenge": "⚔️ Trama de Vingança",
+    "psychological thriller": "🧠 Suspense Psicológico",
+    "psychological": "🧠 Suspense Psicológico",
+    "plot twist": "⚡ Reviravoltas no Enredo",
+    "twist ending": "⚡ Final Surpreendente",
+    "investigation": "🔍 Investigação Policial",
+    "detective": "🕵️ Caso de Detetive",
+    "serial killer": "🔪 Caçada a Assassino",
+    "murder": "🔍 Mistério & Crime",
+    "survival": "🏕️ Luta pela Sobrevivência",
+    "zombie": "🧟 Apocalipse Zumbi",
+    "vampire": "🧛 Universo Sobrenatural",
+    "alien": "👽 Invasão Extraterrestre",
+    "haunted house": "👻 Casa Mal-Assombrada",
+    "conspiracy": "🕵️ Conspiração & Segredos",
+    "espionage": "🕵️ Espionagem & Intriga",
+    "spy": "🕵️ Ação & Espionagem",
+    "courtroom": "⚖️ Drama de Tribunal",
+    "dark comedy": "🎭 Humor Ácido",
+    "satire": "🎭 Sátira Social",
+    "coming of age": "🌱 Juventude & Amadurecimento",
+    "based on novel": "📚 Baseado em Livro",
+    "based on true story": "📰 Baseado em Fatos Reais",
+    "biography": "📜 História Real",
+    "sports": "🏆 Superação no Esporte",
+}
+
+NICHE_LANGUAGE_MAP: Dict[str, str] = {
+    "ko": "🇰🇷 Dorama em Alta",
+    "ja": "🇯🇵 Produção Japonesa",
+    "pt": "🇧🇷 Cinema Nacional",
+    "fr": "🇫🇷 Cinema Francês",
+    "es": "🇪🇸 Produção Hispânica",
+    "it": "🇮🇹 Cinema Italiano",
+    "de": "🇩🇪 Cinema Alemão",
+}
+
+def build_rich_explanation_tags(
+    candidate: Dict[str, Any],
+    user_vector: Dict[str, float],
+    user_items: Optional[List[Any]] = None,
+    cand_emb: Optional[List[float]] = None,
+    target_persona: Optional[Dict[str, Any]] = None,
+    fallback_tags: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Gera tags de explicabilidade ricas, humanas e contextuais para a recomendação:
+    1. 'Porque você curtiu [Obra X]' (conexão semântica com itens avaliados com nota alta)
+    2. Talentos de destaque (Diretor ou Ator favorito)
+    3. Associação com Persona do usuário ('Para sua faceta Explorador Sci-Fi')
+    4. Microtemas / Vibe da obra (Viagem no tempo, Distopia, etc.)
+    5. Idioma de nicho (Coreano, Japonês, Nacional - NUNCA 'Áudio Inglês')
+    """
+    from app.recommendation.embeddings import calculate_cosine_similarity
+
+    rich_tags: List[str] = []
+
+    # 1. Conexão com obra que o usuário assistiu e amou (Item-to-Item Similarity)
+    if user_items and cand_emb:
+        best_sim = -1.0
+        best_item = None
+
+        for item in user_items:
+            media = getattr(item, "media", None)
+            if not media or not media.embedding or not media.title:
+                continue
+
+            # Prioriza obras com boa avaliação ou completadas
+            rating = getattr(item, "rating", None) or 0.0
+            status = getattr(item, "status", "")
+            if rating < 3.5 and status != "completed":
+                continue
+
+            sim = calculate_cosine_similarity(cand_emb, media.embedding)
+            if sim > best_sim:
+                best_sim = sim
+                best_item = item
+
+        # Se houver uma obra com afinidade semântica expressiva (>= 0.65)
+        if best_item and best_sim >= 0.65:
+            m_title = best_item.media.title
+            m_rating = getattr(best_item, "rating", None)
+            if m_rating and m_rating >= 4.5:
+                rich_tags.append(f'🍿 Porque você deu {m_rating:.0f}★ em "{m_title}"')
+            elif m_rating and m_rating >= 4.0:
+                rich_tags.append(f'🍿 Porque você curtiu "{m_title}"')
+            else:
+                rich_tags.append(f'🍿 Na mesma vibe de "{m_title}"')
+
+    # 2. Diretor ou Ator que o usuário acompanha com peso alto
+    directors = candidate.get("directors") or candidate.get("crew") or []
+    if not directors and isinstance(candidate.get("credits"), dict):
+        directors = [c.get("name") for c in candidate["credits"].get("crew", []) if c.get("job") in ("Director", "Creator")]
+
+    cast_members = candidate.get("cast") or []
+    if not cast_members and isinstance(candidate.get("credits"), dict):
+        cast_members = [c.get("name") for c in candidate["credits"].get("cast", [])]
+
+    found_talent = False
+    for d in directors[:4]:
+        name = d.get("name") if isinstance(d, dict) else str(d)
+        if name and user_vector.get(f"director_{name.lower()}", 0.0) >= 1.5:
+            rich_tags.append(f"🎬 Dirigido por {name}")
+            found_talent = True
+            break
+
+    if not found_talent:
+        for c in cast_members[:6]:
+            name = c.get("name") if isinstance(c, dict) else str(c)
+            if name and user_vector.get(f"cast_{name.lower()}", 0.0) >= 1.5:
+                rich_tags.append(f"🌟 Estrelado por {name}")
+                break
+
+    # 3. Associação à Persona / Faceta de Gosto
+    if target_persona:
+        p_name = target_persona.get("name")
+        p_emoji = target_persona.get("emoji", "✨")
+        if p_name:
+            rich_tags.append(f"{p_emoji} Para sua faceta {p_name}")
+
+    # 4. Microtemas / Vibe Narrativa a partir de keywords do candidato
+    keywords = candidate.get("keywords_list") or candidate.get("keywords") or []
+    for kw in keywords[:10]:
+        kw_str = (kw.get("name") if isinstance(kw, dict) else str(kw)).lower()
+        if kw_str in CURATED_KEYWORDS_MAP and len(rich_tags) < 3:
+            badge = CURATED_KEYWORDS_MAP[kw_str]
+            if badge not in rich_tags:
+                rich_tags.append(badge)
+
+    # 5. Idioma de Nicho Marcante (NUNCA Inglês)
+    orig_lang = (candidate.get("original_language") or "").lower()
+    if orig_lang in NICHE_LANGUAGE_MAP and len(rich_tags) < 3:
+        badge = NICHE_LANGUAGE_MAP[orig_lang]
+        if badge not in rich_tags:
+            rich_tags.append(badge)
+
+    # 6. Fallback com gênero elegante caso falte contexto
+    if len(rich_tags) < 2:
+        genres = candidate.get("genres") or []
+        genre_names = []
+        for g in genres:
+            g_name = (g.get("name") if isinstance(g, dict) else str(g)).title()
+            if g_name and g_name not in genre_names:
+                genre_names.append(g_name)
+
+        if len(genre_names) >= 2:
+            rich_tags.append(f"🎬 {genre_names[0]} & {genre_names[1]}")
+        elif len(genre_names) == 1:
+            rich_tags.append(f"🎬 {genre_names[0]}")
+
+    # 7. Fallback com tags originais se ainda estiver vazio
+    if not rich_tags and fallback_tags:
+        for t in fallback_tags:
+            if "Áudio" not in t and t not in rich_tags:
+                rich_tags.append(t)
+
+    return rich_tags[:3]
+

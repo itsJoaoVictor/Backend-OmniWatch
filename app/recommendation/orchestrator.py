@@ -645,7 +645,18 @@ async def get_personalized_recommendations(
                 final_score = max(0.0, round(final_score - penalty, 1))
 
         c["match_score"] = final_score
-        c["match_tags"] = top_tags
+
+        # Gera explicações ricas, persuasivas e humanas (Item-to-item, Talento, Persona, Microtemas)
+        from app.recommendation.matcher import build_rich_explanation_tags
+        matched_persona = next((p for p in active_personas if p.get("id") == c.get("_best_persona_id")), None) if active_personas else None
+        c["match_tags"] = build_rich_explanation_tags(
+            candidate=c,
+            user_vector=user_vector,
+            user_items=user_list,
+            cand_emb=cand_emb,
+            target_persona=matched_persona,
+            fallback_tags=top_tags,
+        )
         scored_candidates.append(c)
 
     # 5. Aplica Reranking Garantindo Divisão 50/50 Exata
@@ -966,7 +977,14 @@ async def get_upcoming_recommendations(
             top_tags = ["Estreia confirmada"]
 
         c["match_score"] = final_score
-        c["match_tags"] = top_tags
+
+        from app.recommendation.matcher import build_rich_explanation_tags
+        c["match_tags"] = build_rich_explanation_tags(
+            candidate=c,
+            user_vector=user_vector or {},
+            user_items=user_list,
+            fallback_tags=top_tags,
+        )
 
         if c.get("media_type") == "movie":
             scored_movies.append(c)

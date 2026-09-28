@@ -301,6 +301,7 @@ async def get_item_score(
         cand_emb = local_media_obj.embedding if local_media_obj else None
 
         active_personas = [p for p in user.taste_clusters if p.get("is_active", True)] if user.taste_clusters else []
+        best_persona = None
         
         from app.recommendation.embeddings import calculate_cosine_similarity
         
@@ -326,6 +327,7 @@ async def get_item_score(
                 if f_score > best_final_score:
                     best_final_score = f_score
                     best_tags = tags
+                    best_persona = p
                     
             score = best_final_score
             top_tags = best_tags
@@ -338,9 +340,38 @@ async def get_item_score(
                 if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in top_tags:
                     top_tags.append("✨ Sintonia Semântica")
         
+        # Enriquecer tags com explicabilidade humana (Porque curtiu X, Talentos, Persona, Microtemas)
+        user_list = []
+        try:
+            from app.user_list.service import get_user_list
+            user_list = await get_user_list(db, user.id)
+        except Exception:
+            pass
+
+        candidate_obj = {
+            "id": tmdb_id,
+            "title": getattr(tmdb_data, "title", None) or getattr(tmdb_data, "name", "Mídia"),
+            "name": getattr(tmdb_data, "name", None),
+            "media_type": media_type,
+            "genres": [g.name for g in tmdb_data.genres] if tmdb_data.genres else [],
+            "keywords": tmdb_data.keywords if hasattr(tmdb_data, "keywords") and tmdb_data.keywords else [],
+            "credits": tmdb_data.credits.dict() if tmdb_data.credits and hasattr(tmdb_data.credits, "dict") else None,
+            "original_language": getattr(tmdb_data, "original_language", None),
+        }
+
+        from app.recommendation.matcher import build_rich_explanation_tags
+        rich_tags = build_rich_explanation_tags(
+            candidate=candidate_obj,
+            user_vector=user.feature_vector,
+            user_items=user_list,
+            cand_emb=cand_emb,
+            target_persona=best_persona,
+            fallback_tags=top_tags
+        )
+        
         return {
             "match_score": score,
-            "match_tags": top_tags
+            "match_tags": rich_tags
         }
     except Exception as e:
         # Ignore errors if TMDB fetch fails
