@@ -21,6 +21,14 @@ from app.recommendation.service import (
     MAX_STALE_SECONDS,
 )
 
+async def _get_user_seen_tmdb_ids(db: AsyncSession, user_id: str) -> set:
+    try:
+        from app.tracking.services import get_user_list
+        user_list = await get_user_list(db, user_id)
+        return {item.media.tmdb_id for item in user_list if item.media}
+    except Exception:
+        return set()
+
 @router.get("/explore", response_model=List[Any])
 async def get_explore_recommendations(
     background_tasks: BackgroundTasks,
@@ -31,6 +39,7 @@ async def get_explore_recommendations(
 ):
     try:
         record = await get_user_recommendations_record(db, current_user_id)
+        seen_ids = await _get_user_seen_tmdb_ids(db, current_user_id)
 
         # Cold start: se o registro não existe ou ainda não tem itens
         if not record or not record.explore_items:
@@ -46,12 +55,22 @@ async def get_explore_recommendations(
             if record.is_stale or is_expired:
                 background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
 
+        # Filtragem dinâmica defensiva: garante que nenhuma obra na lista do usuário seja exibida
+        if seen_ids and items:
+            items = [it for it in items if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+
         if persona_id:
             personas = record.personas_items if record else []
             target = next((p for p in personas if p.get("id") == persona_id), None)
             if target and target.get("recommendations"):
-                return target["recommendations"][:limit]
-            return (await get_personalized_recommendations(db, current_user_id, top_k=limit, persona_id=persona_id))[:limit]
+                p_recs = target["recommendations"]
+                if seen_ids:
+                    p_recs = [it for it in p_recs if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+                return p_recs[:limit]
+            raw = await get_personalized_recommendations(db, current_user_id, top_k=limit, persona_id=persona_id)
+            if seen_ids:
+                raw = [it for it in raw if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+            return raw[:limit]
 
         return items[:limit]
     except Exception as e:
@@ -67,6 +86,7 @@ async def get_user_personas(
 ):
     try:
         record = await get_user_recommendations_record(db, current_user_id)
+        seen_ids = await _get_user_seen_tmdb_ids(db, current_user_id)
 
         if not record or not record.personas_items:
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
@@ -84,8 +104,11 @@ async def get_user_personas(
         result = []
         for p in personas:
             p_copy = dict(p)
-            if "recommendations" in p_copy and isinstance(p_copy["recommendations"], list):
-                p_copy["recommendations"] = p_copy["recommendations"][:top_k]
+            recs = p_copy.get("recommendations", [])
+            if isinstance(recs, list):
+                if seen_ids:
+                    recs = [it for it in recs if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+                p_copy["recommendations"] = recs[:top_k]
             result.append(p_copy)
         return result
     except Exception as e:
@@ -105,6 +128,7 @@ async def get_upcoming_recommendations_endpoint(
     """
     try:
         record = await get_user_recommendations_record(db, current_user_id)
+        seen_ids = await _get_user_seen_tmdb_ids(db, current_user_id)
 
         if not record or not record.upcoming_items:
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
@@ -119,9 +143,15 @@ async def get_upcoming_recommendations_endpoint(
             if record.is_stale or is_expired:
                 background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
 
+        movies = upcoming.get("movies") or []
+        tv = upcoming.get("tv") or []
+        if seen_ids:
+            movies = [it for it in movies if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+            tv = [it for it in tv if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+
         return {
-            "movies": (upcoming.get("movies") or [])[:limit],
-            "tv": (upcoming.get("tv") or [])[:limit]
+            "movies": movies[:limit],
+            "tv": tv[:limit]
         }
     except Exception as e:
         logger.exception(e)
@@ -139,30 +169,49 @@ async def get_explore_feed(
     """
     try:
         record = await get_user_recommendations_record(db, current_user_id)
+        seen_ids = await _get_user_seen_tmdb_ids(db, current_user_id)
+
         if not record or (not record.explore_items and not record.personas_items):
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
-            return {
-                "explore": res.get("explore_items", []) if res else [],
-                "upcoming": res.get("upcoming_items", {}) if res else {"movies": [], "tv": []},
-                "personas": res.get("personas_items", []) if res else [],
-                "is_stale": False,
-                "last_generated_at": datetime.now(timezone.utc).isoformat()
-            }
+            explore = res.get("explore_items", []) if res else []
+            upcoming = res.get("upcoming_items", {}) if res else {"movies": [], "tv": []}
+            personas = res.get("personas_items", []) if res else []
+            is_stale = False
+            last_gen = datetime.now(timezone.utc).isoformat()
+        else:
+            explore = record.explore_items
+            upcoming = record.upcoming_items
+            personas = record.personas_items
+            is_stale = record.is_stale
+            last_gen = record.last_generated_at.isoformat() if record.last_generated_at else None
 
-        now = datetime.now(timezone.utc)
-        is_expired = (
-            record.last_generated_at is None
-            or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
-        )
-        if record.is_stale or is_expired:
-            background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+            now = datetime.now(timezone.utc)
+            is_expired = (
+                record.last_generated_at is None
+                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
+            )
+            if is_stale or is_expired:
+                background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+
+        if seen_ids:
+            explore = [it for it in explore if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+            new_personas = []
+            for p in personas:
+                p_c = dict(p)
+                recs = p_c.get("recommendations", [])
+                p_c["recommendations"] = [it for it in recs if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+                new_personas.append(p_c)
+            personas = new_personas
+            up_movies = [it for it in (upcoming.get("movies") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+            up_tv = [it for it in (upcoming.get("tv") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+            upcoming = {"movies": up_movies, "tv": up_tv}
 
         return {
-            "explore": record.explore_items,
-            "upcoming": record.upcoming_items,
-            "personas": record.personas_items,
-            "is_stale": record.is_stale,
-            "last_generated_at": record.last_generated_at.isoformat() if record.last_generated_at else None
+            "explore": explore,
+            "upcoming": upcoming,
+            "personas": personas,
+            "is_stale": is_stale,
+            "last_generated_at": last_gen
         }
     except Exception as e:
         logger.exception(e)

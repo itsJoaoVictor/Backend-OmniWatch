@@ -174,11 +174,21 @@ async def update_user_profile(
     except Exception:
         pass
         
-    # Marca as recomendações como stale no DB e agenda atualização em background com cooldown
+    # Marca como stale, ejeta a mídia imediatamente das recomendações e aciona debounce inteligente
     try:
-        from app.recommendation.service import mark_user_recommendations_stale, schedule_recommendation_computation
-        await mark_user_recommendations_stale(db, user.id)
-        schedule_recommendation_computation(user.id, force=False, cooldown_seconds=1200)
+        from app.recommendation.service import (
+            mark_user_recommendations_stale,
+            eject_media_from_user_recommendations,
+            notify_user_media_action,
+            schedule_recommendation_computation,
+        )
+        if media and getattr(media, "tmdb_id", None):
+            await eject_media_from_user_recommendations(db, user.id, media.tmdb_id)
+            notify_user_media_action(user.id, media.tmdb_id, debounce_seconds=35)
+        else:
+            await mark_user_recommendations_stale(db, user.id)
+            schedule_recommendation_computation(user.id, force=False, cooldown_seconds=1200)
     except Exception as e:
         logger.warning(f"Erro ao agendar atualização de recomendações para {user.id}: {e}")
+
 
