@@ -280,9 +280,10 @@ def build_rich_explanation_tags(
 
     # 3. Associação à Persona / Faceta de Gosto
     if target_persona:
-        p_name = target_persona.get("name")
+        from app.recommendation.cluster_manager import is_valid_persona_name
+        p_name = (target_persona.get("name") or "").strip()
         p_emoji = target_persona.get("emoji", "✨")
-        if p_name:
+        if p_name and is_valid_persona_name(p_name):
             rich_tags.append(f"{p_emoji} Para sua faceta {p_name}")
 
     # 4. Microtemas / Vibe Narrativa a partir de keywords do candidato

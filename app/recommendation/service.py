@@ -180,6 +180,8 @@ def notify_user_media_action(
         # Apenas 1 obra alterada até agora: agenda com cooldown padrão longo
         schedule_recommendation_computation(user_id_str, force=False, cooldown_seconds=DEFAULT_COOLDOWN_SECONDS)
 
+_user_generation_events: Dict[str, asyncio.Event] = {}
+
 async def compute_and_save_user_recommendations(
     user_id: str,
     force: bool = False,
@@ -193,10 +195,26 @@ async def compute_and_save_user_recommendations(
     """
     user_id_str = str(user_id)
     if user_id_str in _active_generation_users:
-        logger.info(f"[RECS-SERVICE] Usuário {user_id_str} já possui recálculo em andamento. Ignorando concorrência.")
+        logger.info(f"[RECS-SERVICE] Usuário {user_id_str} já possui recálculo em andamento. Aguardando conclusão...")
+        event = _user_generation_events.get(user_id_str)
+        if event:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+        async with AsyncSessionLocal() as session:
+            record = await get_user_recommendations_record(session, user_id_str)
+            if record:
+                return {
+                    "explore_items": record.explore_items,
+                    "upcoming_items": record.upcoming_items,
+                    "personas_items": record.personas_items,
+                }
         return None
 
     _active_generation_users.add(user_id_str)
+    event = asyncio.Event()
+    _user_generation_events[user_id_str] = event
 
     try:
         async with AsyncSessionLocal() as session:
@@ -274,6 +292,9 @@ async def compute_and_save_user_recommendations(
         return None
     finally:
         _active_generation_users.discard(user_id_str)
+        evt = _user_generation_events.pop(user_id_str, None)
+        if evt:
+            evt.set()
 
 def schedule_recommendation_computation(
     user_id: str,

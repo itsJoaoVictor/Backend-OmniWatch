@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from app.recommendation.service import (
     get_user_recommendations_record,
     compute_and_save_user_recommendations,
+    schedule_recommendation_computation,
     dismiss_recommendation,
     undismiss_recommendation,
     get_user_dismissed_records,
@@ -39,12 +40,23 @@ class UndismissRecommendationRequest(BaseModel):
 
 async def _get_user_seen_tmdb_ids(db: AsyncSession, user_id: str) -> set:
     try:
-        from app.tracking.services import get_user_list
-        user_list = await get_user_list(db, user_id)
-        seen = {item.media.tmdb_id for item in user_list if item.media}
+        import uuid
+        target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+        from app.media.models import Media
+        from app.tracking.models import UserListItem
+        from sqlalchemy.future import select
+        
+        stmt = (
+            select(Media.tmdb_id)
+            .join(UserListItem, UserListItem.media_id == Media.id)
+            .where(UserListItem.user_id == target_uuid)
+        )
+        result = await db.execute(stmt)
+        seen = set(result.scalars().all())
         dismissed = await get_active_dismissed_tmdb_ids(db, user_id)
         return seen.union(dismissed)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Erro ao obter seen_tmdb_ids para {user_id}: {e}")
         return set()
 
 @router.get("/explore", response_model=List[Any])
@@ -71,7 +83,7 @@ async def get_explore_recommendations(
                 or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
             )
             if record.is_stale or is_expired:
-                background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+                schedule_recommendation_computation(current_user_id)
 
         # Filtragem dinâmica defensiva: garante que nenhuma obra na lista do usuário seja exibida
         if seen_ids and items:
@@ -117,7 +129,7 @@ async def get_user_personas(
                 or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
             )
             if record.is_stale or is_expired:
-                background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+                schedule_recommendation_computation(current_user_id)
 
         result = []
         for p in personas:
@@ -159,7 +171,7 @@ async def get_upcoming_recommendations_endpoint(
                 or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
             )
             if record.is_stale or is_expired:
-                background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+                schedule_recommendation_computation(current_user_id)
 
         movies = upcoming.get("movies") or []
         tv = upcoming.get("tv") or []
@@ -209,7 +221,7 @@ async def get_explore_feed(
                 or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
             )
             if is_stale or is_expired:
-                background_tasks.add_task(compute_and_save_user_recommendations, current_user_id)
+                schedule_recommendation_computation(current_user_id)
 
         if seen_ids:
             explore = [it for it in explore if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]

@@ -43,13 +43,35 @@ GENRE_EMOJIS = {
     "faroeste": "🤠"
 }
 
+def is_valid_persona_name(name: Optional[str]) -> bool:
+    """
+    Valida se o nome da persona é conciso, editorial e livre de vazamento de raciocínio (Chain-of-Thought) em inglês.
+    """
+    if not name or not isinstance(name, str):
+        return False
+    clean = name.strip()
+    if len(clean) < 3 or len(clean) > 42:
+        return False
+    if "\n" in clean or "\r" in clean:
+        return False
+    leak_tokens = [
+        "since", "differentiate", "distinct", "persona_", "clearly", "terms",
+        "need", "both", "because", "think", "let's", "instead", "here is",
+        "anime/animation", "action adventure", "family animation", "versus",
+        "focusing on", "would be", "should be", "in pt-br", "in english"
+    ]
+    name_lower = clean.lower()
+    if any(tok in name_lower for tok in leak_tokens):
+        return False
+    return True
+
 PROMPT_SYSTEM = """Você é um curador editorial de cinema e streaming de altíssimo nível (estilo Netflix, MUBI, Criterion e Spotify).
 Sua missão é dar um NOME CRIATIVO, INSPIRADOR e ELEGANTE para uma "Persona de Gosto" de um usuário, além de escolher 1 único emoji que melhor resuma essa vibe.
 
 Diretrizes:
-- O tom deve ser EDITORIAL, CINEMATOGRÁFICO e EVOCATIVO (ex: 'Aventura Cósmica & Heróis Improváveis', 'Noites Sombrias & Suspense Psicológico', 'Mundos Fantásticos & Shonen Épico', 'Pesadelos Reais & Terror Visceral').
-- Evite nomes secos e burocráticos como apenas 'Ação e Aventura' ou 'Ficção Científica'.
-- Dê também uma 'tagline' curta (uma frase de 5 a 10 palavras que define o sentimento desse grupo).
+- IDIOMA OBRIGATÓRIO: PORTUGUÊS DO BRASIL (pt-BR).
+- O nome DEVE ser em Português do Brasil com no máximo 3 a 5 palavras (ex: 'Aventura Cósmica & Heróis', 'Noites Sombrias & Mistério', 'Universo Shonen Épico').
+- Jamais inclua raciocínio, explicações ou texto em inglês.
 - Responda OBRIGATORIAMENTE em formato JSON válido com as seguintes chaves:
 {
   "name": "Título Editorial Criativo",
@@ -169,6 +191,12 @@ async def fetch_llm_persona_title(persona: Dict[str, Any], client: httpx.AsyncCl
 PROMPT_BATCH_SYSTEM = """Você é o Diretor Editorial de Recomendação do OmniWatch (estilo Netflix, Criterion e Spotify).
 Sua missão é dar NOMES CRIATIVOS, INSPIRADORES e EMOJIS para TODAS as Personas de Gosto de um usuário.
 
+REGRA ABSOLUTA DE IDIOMA E FORMATAÇÃO:
+- OBRIGATORIAMENTE EM PORTUGUÊS DO BRASIL (pt-BR).
+- TODOS os nomes ('name') e taglines ('tagline') DEVEM ser 100% em Português do Brasil! NUNCA use inglês.
+- O campo 'name' DEVE ter no máximo 3 a 5 palavras (até 35 caracteres), como: 'Universo Shonen Épico', 'Aventuras em Família', 'Suspense & Mistério Noir', 'Odisseia Cósmica'.
+- NUNCA inclua seu raciocínio, notas de diferenciação, reflexões internas, explicações ou metadados no campo 'name'. O campo 'name' deve conter ESTRITAMENTE o título público para o usuário final em Português do Brasil.
+
 REGRA DE OURO — CONTRASTE RADICAL & ZERO REPETIÇÃO:
 - As personas representam facetas DIFERENTES da mesma pessoa. Elas DEVEM ter vocabulários, estilos e focos temáticos COMPLETAMENTE DISTINTOS entre si.
 - É TERMINANTEMENTE PROIBIDO repetir palavras-chave (ex: se uma persona usar 'Aventura' ou 'Heróis', NENHUMA outra persona pode usar essas palavras!).
@@ -176,7 +204,7 @@ REGRA DE OURO — CONTRASTE RADICAL & ZERO REPETIÇÃO:
 - CLUSTER DE FICÇÃO CIENTÍFICA / HERÓIS: Use termos como 'Odisseia Cósmica', 'Ficção Especulativa', 'Heróis & Universos Paralelos'.
 - CLUSTER DE TERROR / SLASHER: Use termos como 'Pesadelos Sombrios', 'Horror Visceral', 'Tensão Psicológica'.
 
-Responda OBRIGATORIAMENTE em JSON como uma lista de objetos:
+Responda OBRIGATORIAMENTE em JSON puro como uma lista de objetos:
 [
   {
     "id": "persona_0",
@@ -190,12 +218,12 @@ Responda OBRIGATORIAMENTE em JSON como uma lista de objetos:
 async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
     """
     Envia todas as personas do usuário juntas em um único prompt para a LLM,
-    garantindo contraste semântico absoluto e zero repetição de títulos.
+    garantindo contraste semântico absoluto e zero repetição de títulos em Português do Brasil.
     """
     if not settings.OPENAI_API_KEY or not personas:
         return {}
 
-    prompt_parts = ["Aqui estão as Personas de gosto do usuário para você nomear com contraste máximo:\n"]
+    prompt_parts = ["Aqui estão as Personas de gosto do usuário para você nomear em Português do Brasil com contraste máximo:\n"]
     for p in personas:
         # Detecta sinal de Anime/Animação Oriental para avisar a LLM
         sample_str = " ".join(p.get("sample_titles", [])).lower()
@@ -209,7 +237,7 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
             f"- Total de obras: {p.get('item_count')}\n"
         )
 
-    prompt_user = "\n".join(prompt_parts) + "\nCrie o título editorial, emoji e tagline para cada Persona com contraste máximo em JSON."
+    prompt_user = "\n".join(prompt_parts) + "\nCrie o título editorial em Português do Brasil (pt-BR), emoji e tagline para cada Persona com contraste máximo em JSON."
 
     payload = {
         "model": settings.OPENAI_MODEL,
@@ -243,14 +271,13 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
         choice = data["choices"][0]
         msg = choice.get("message", {})
         raw_content = (msg.get("content") or "").strip()
-        reasoning_text = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
 
-        # Combina content e reasoning para garantir parsing mesmo se o modelo raciocinar muito
-        combined_text = raw_content if len(raw_content) > 10 else f"{raw_content}\n{reasoning_text}"
-        if not combined_text:
-            return {}
+        # Remove blocos de raciocínio <think>...</think> se o modelo retornado usar CoT inline
+        clean_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
+        if not clean_content:
+            clean_content = raw_content
 
-        clean_content = combined_text.replace('“', '"').replace('”', '"').strip()
+        clean_content = clean_content.replace('“', '"').replace('”', '"').strip()
         results_by_id = {}
 
         # 1. Busca por lista JSON [...]
@@ -263,11 +290,13 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
                 if isinstance(parsed_list, list):
                     for item in parsed_list:
                         if isinstance(item, dict) and "id" in item:
-                            results_by_id[item["id"]] = {
-                                "name": item.get("name"),
-                                "emoji": item.get("emoji", "✨"),
-                                "tagline": item.get("tagline", "")
-                            }
+                            cand_name = item.get("name")
+                            if is_valid_persona_name(cand_name):
+                                results_by_id[item["id"]] = {
+                                    "name": cand_name.strip(),
+                                    "emoji": item.get("emoji", "✨"),
+                                    "tagline": item.get("tagline", "")
+                                }
                     if len(results_by_id) == len(personas):
                         return results_by_id
             except Exception:
@@ -276,16 +305,18 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
         # 2. Busca por objetos JSON individuais {"id": "persona_X", ...}
         matches = re.findall(r'\{\s*"id"\s*:\s*"(persona_\d+)"\s*,\s*"name"\s*:\s*"([^"]+)"\s*,\s*"emoji"\s*:\s*"([^"]+)"(?:\s*,\s*"tagline"\s*:\s*"([^"]*)")?', clean_content)
         for m in matches:
-            results_by_id[m[0]] = {
-                "name": m[1],
-                "emoji": m[2],
-                "tagline": m[3] if len(m) > 3 else ""
-            }
+            cand_name = m[1].strip()
+            if is_valid_persona_name(cand_name):
+                results_by_id[m[0]] = {
+                    "name": cand_name,
+                    "emoji": m[2],
+                    "tagline": m[3] if len(m) > 3 else ""
+                }
 
         if len(results_by_id) >= len(personas):
             return results_by_id
 
-        # 3. Fallback de texto estruturado (ex: Persona_0: name: "...", emoji: "...", tagline: "...")
+        # 3. Fallback de texto estruturado APENAS se passar na validação estrita
         text_matches = re.findall(
             r'Persona[_\s]*(\d+)[:\s]+(?:[^\n]*\n)*?.*?name[:\s]+["\']?([^"\'\n\r]+)["\']?.*?emoji[:\s]+["\']?([^\s"\'\n\r]+)["\']?.*?tagline[:\s]+["\']?([^"\'\n\r]+)["\']?',
             clean_content,
@@ -293,9 +324,10 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
         )
         for tm in text_matches:
             p_id = f"persona_{tm[0]}"
-            if p_id not in results_by_id:
+            cand_name = tm[1].strip()
+            if p_id not in results_by_id and is_valid_persona_name(cand_name):
                 results_by_id[p_id] = {
-                    "name": tm[1].strip(),
+                    "name": cand_name,
                     "emoji": tm[2].strip(),
                     "tagline": tm[3].strip()
                 }
@@ -331,8 +363,9 @@ async def refine_user_clusters_llm_task(user_id: str):
                     p_id = c.get("id")
                     if p_id in llm_results:
                         meta = llm_results[p_id]
-                        if meta.get("name"):
-                            c["name"] = meta["name"]
+                        cand_name = meta.get("name")
+                        if cand_name and is_valid_persona_name(cand_name):
+                            c["name"] = cand_name.strip()
                         if meta.get("emoji"):
                             c["emoji"] = meta["emoji"]
                         if meta.get("tagline"):
