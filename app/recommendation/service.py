@@ -1,14 +1,14 @@
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import AsyncSessionLocal
-from app.recommendation.models import UserRecommendation
+from app.recommendation.models import UserRecommendation, UserDismissedRecommendation
 from app.recommendation.orchestrator import (
     get_personalized_recommendations,
     get_upcoming_recommendations,
@@ -338,3 +338,185 @@ async def run_recommendations_daily_sync_loop(interval_hours: int = 24):
 
         # Aguarda 24 horas
         await asyncio.sleep(interval_hours * 3600)
+
+async def dismiss_recommendation(
+    db: AsyncSession,
+    user_id: str,
+    tmdb_id: int,
+    media_type: str,
+    title: str = "",
+    poster_path: Optional[str] = None,
+    days_snooze: int = 180,
+) -> UserDismissedRecommendation:
+    """
+    Registra uma obra como dispensada ('Não tenho interesse') com Snooze de 6 a 12 meses.
+    Tenta capturar o embedding da obra para proteção semântica fina e ejeta
+    a obra imediatamente do carrossel do usuário.
+    """
+    u_uuid = _parse_uuid(user_id)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=days_snooze)
+
+    # 1. Tenta recuperar embedding da mídia se já estiver no banco
+    embedding = None
+    try:
+        from app.media.models import Media
+        stmt = select(Media.embedding, Media.title, Media.poster_path).where(
+            Media.tmdb_id == tmdb_id,
+            Media.media_type == media_type,
+        )
+        res = await db.execute(stmt)
+        row = res.first()
+        if row:
+            embedding = row[0]
+            if not title and row[1]:
+                title = row[1]
+            if not poster_path and row[2]:
+                poster_path = row[2]
+    except Exception as e:
+        logger.warning(f"[RECS-SERVICE] Falha ao buscar embedding de mídia local {tmdb_id}: {e}")
+
+    # 2. Busca se já existe registro de dispensa anterior para atualizar
+    stmt = select(UserDismissedRecommendation).where(
+        UserDismissedRecommendation.user_id == u_uuid,
+        UserDismissedRecommendation.tmdb_id == tmdb_id,
+        UserDismissedRecommendation.media_type == media_type,
+    )
+    res = await db.execute(stmt)
+    dismissed = res.scalars().first()
+
+    if dismissed:
+        dismissed.expires_at = expires_at
+        dismissed.created_at = now
+        if embedding:
+            dismissed.embedding = embedding
+        if title:
+            dismissed.title = title
+        if poster_path:
+            dismissed.poster_path = poster_path
+    else:
+        dismissed = UserDismissedRecommendation(
+            user_id=u_uuid,
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            title=title or "Sem título",
+            poster_path=poster_path,
+            embedding=embedding,
+            expires_at=expires_at,
+            created_at=now,
+        )
+        db.add(dismissed)
+
+    await db.commit()
+    await db.refresh(dismissed)
+
+    # 3. Ejetar imediatamente dos carrosséis salvos
+    await eject_media_from_user_recommendations(db, user_id, tmdb_id)
+
+    logger.info(f"[RECS-SERVICE] Obra {tmdb_id} dispensada pelo usuário {user_id} com snooze até {expires_at}.")
+    return dismissed
+
+async def undismiss_recommendation(
+    db: AsyncSession,
+    user_id: str,
+    tmdb_id: int,
+    media_type: Optional[str] = None,
+) -> bool:
+    """
+    Remove uma obra da lista de dispensadas, permitindo que ela volte a ser
+    recomendada no futuro caso o perfil do usuário tenha afinidade.
+    """
+    u_uuid = _parse_uuid(user_id)
+    stmt = select(UserDismissedRecommendation).where(
+        UserDismissedRecommendation.user_id == u_uuid,
+        UserDismissedRecommendation.tmdb_id == tmdb_id,
+    )
+    if media_type:
+        stmt = stmt.where(UserDismissedRecommendation.media_type == media_type)
+
+    res = await db.execute(stmt)
+    records = res.scalars().all()
+    if not records:
+        return False
+
+    for r in records:
+        await db.delete(r)
+
+    await db.commit()
+    logger.info(f"[RECS-SERVICE] Obra {tmdb_id} restaurada da lista de dispensadas para usuário {user_id}.")
+    return True
+
+async def get_active_dismissed_tmdb_ids(
+    db: AsyncSession,
+    user_id: str,
+) -> Set[int]:
+    """Retorna o conjunto de tmdb_ids ativos com dispensa vigente (dentro do prazo de snooze)."""
+    try:
+        u_uuid = _parse_uuid(user_id)
+        now = datetime.now(timezone.utc)
+        stmt = select(UserDismissedRecommendation.tmdb_id).where(
+            UserDismissedRecommendation.user_id == u_uuid,
+            UserDismissedRecommendation.expires_at > now,
+        )
+        res = await db.execute(stmt)
+        return set(res.scalars().all())
+    except Exception as e:
+        logger.error(f"[RECS-SERVICE] Erro ao buscar tmdb_ids dispensados para {user_id}: {e}")
+        return set()
+
+async def get_user_dismissed_records(
+    db: AsyncSession,
+    user_id: str,
+    limit: int = 100,
+) -> List[UserDismissedRecommendation]:
+    """Retorna todos os registros de dispensas ativas do usuário para a tela de configurações/perfil."""
+    u_uuid = _parse_uuid(user_id)
+    now = datetime.now(timezone.utc)
+    stmt = (
+        select(UserDismissedRecommendation)
+        .where(
+            UserDismissedRecommendation.user_id == u_uuid,
+            UserDismissedRecommendation.expires_at > now,
+        )
+        .order_by(UserDismissedRecommendation.created_at.desc())
+        .limit(limit)
+    )
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
+
+def calculate_semantic_dismiss_penalty(
+    candidate_embedding: Optional[List[float]],
+    dismissed_records: List[UserDismissedRecommendation],
+) -> float:
+    """
+    Calcula uma penalidade semântica suave (-15% a -25%) para candidatos que tenham
+    altíssima similaridade cosseno (>= 0.75) com obras dispensadas pelo usuário.
+    Aplica decaimento temporal conforme a data de expiração se aproxima.
+    """
+    if not candidate_embedding or not dismissed_records:
+        return 0.0
+
+    from app.recommendation.embeddings import calculate_cosine_similarity
+
+    max_penalty = 0.0
+    now = datetime.now(timezone.utc)
+
+    for item in dismissed_records:
+        if not item.embedding:
+            continue
+
+        sim = calculate_cosine_similarity(candidate_embedding, item.embedding)
+        if sim >= 0.75:
+            # Fator de decaimento temporal: quanto mais recente, mais próximo de 1.0; perto de expirar, chega a 0.2
+            total_duration = (item.expires_at - item.created_at).total_seconds() or 1.0
+            remaining = (item.expires_at - now).total_seconds()
+            time_factor = max(0.2, min(1.0, remaining / total_duration))
+
+            # Penalidade proporcional entre 0.75 e 1.0 (escala de 15 a 25 pontos percentuais)
+            norm_sim = (sim - 0.75) / 0.25  # 0.0 a 1.0
+            penalty = (15.0 + norm_sim * 10.0) * time_factor
+            if penalty > max_penalty:
+                max_penalty = penalty
+
+    return round(max_penalty, 1)
+

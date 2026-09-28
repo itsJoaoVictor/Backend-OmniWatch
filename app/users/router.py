@@ -24,3 +24,26 @@ async def register_user(request: Request, user: UserCreate, db: AsyncSession = D
     except Exception as e:
         logger.error(f"AUDIT FAILURE: Falha ao cadastrar usuário | Email: {user.email} | IP: {client_ip} | Motivo: {str(e)}")
         raise
+
+from app.auth.dependencies import get_current_user_id
+from fastapi import HTTPException
+import uuid
+from sqlalchemy.future import select
+from app.users.models import User
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user_profile(
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        u_uuid = uuid.UUID(current_user_id) if isinstance(current_user_id, str) else current_user_id
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de usuário inválido")
+
+    res = await db.execute(select(User).where(User.id == u_uuid))
+    user = res.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    return user
+

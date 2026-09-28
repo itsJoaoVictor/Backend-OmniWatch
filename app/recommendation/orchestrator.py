@@ -513,10 +513,18 @@ async def get_personalized_recommendations(
     else:
         discover_candidates = await fetch_discover_candidates(user_vector, db=db, user_id=user_id)
 
-    # 2. Filter out already watched/watchlisted items
+    # 2. Filter out already watched/watchlisted items and dismissed items
     from app.tracking.services import get_user_list
+    from app.recommendation.service import (
+        get_active_dismissed_tmdb_ids,
+        get_user_dismissed_records,
+        calculate_semantic_dismiss_penalty,
+    )
     user_list = await get_user_list(db, user_id)
     seen_tmdb_ids = {item.media.tmdb_id for item in user_list if item.media}
+    dismissed_ids = await get_active_dismissed_tmdb_ids(db, user_id)
+    dismissed_records = await get_user_dismissed_records(db, user_id)
+    seen_tmdb_ids = seen_tmdb_ids.union(dismissed_ids)
 
     filtered_discover = [c for c in discover_candidates if c.get("id") not in seen_tmdb_ids]
 
@@ -629,6 +637,12 @@ async def get_personalized_recommendations(
 
         if c.get("collaborative") and "Gosto similar" not in top_tags:
             top_tags.append("Gosto similar")
+
+        # Aplica penalidade contextual suave se o candidato for semanticamente muito próximo (>=0.75) de uma obra dispensada
+        if dismissed_records and cand_emb:
+            penalty = calculate_semantic_dismiss_penalty(cand_emb, dismissed_records)
+            if penalty > 0:
+                final_score = max(0.0, round(final_score - penalty, 1))
 
         c["match_score"] = final_score
         c["match_tags"] = top_tags
@@ -908,10 +922,13 @@ async def get_upcoming_recommendations(
     # Candidatos futuros
     upcoming_candidates = await fetch_upcoming_candidates(user_vector, db=db, user_id=user_id)
 
-    # Filtrar itens que o usuário já adicionou na lista (ex: já está em 'plan_to_watch')
+    # Filtrar itens que o usuário já adicionou na lista ou dispensou
     from app.tracking.services import get_user_list
+    from app.recommendation.service import get_active_dismissed_tmdb_ids
     user_list = await get_user_list(db, user_id)
     seen_tmdb_ids = {item.media.tmdb_id for item in user_list if item.media}
+    dismissed_ids = await get_active_dismissed_tmdb_ids(db, user_id)
+    seen_tmdb_ids = seen_tmdb_ids.union(dismissed_ids)
 
     filtered_candidates = [c for c in upcoming_candidates if c.get("id") not in seen_tmdb_ids]
 

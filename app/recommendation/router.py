@@ -15,17 +15,35 @@ from app.details.services import fetch_movie_details, fetch_tv_details
 router = APIRouter()
 
 from datetime import datetime, timezone
+from pydantic import BaseModel
 from app.recommendation.service import (
     get_user_recommendations_record,
     compute_and_save_user_recommendations,
+    dismiss_recommendation,
+    undismiss_recommendation,
+    get_user_dismissed_records,
+    get_active_dismissed_tmdb_ids,
     MAX_STALE_SECONDS,
 )
+
+class DismissRecommendationRequest(BaseModel):
+    tmdb_id: int
+    media_type: str
+    title: Optional[str] = ""
+    poster_path: Optional[str] = None
+    days_snooze: Optional[int] = 180
+
+class UndismissRecommendationRequest(BaseModel):
+    tmdb_id: int
+    media_type: Optional[str] = None
 
 async def _get_user_seen_tmdb_ids(db: AsyncSession, user_id: str) -> set:
     try:
         from app.tracking.services import get_user_list
         user_list = await get_user_list(db, user_id)
-        return {item.media.tmdb_id for item in user_list if item.media}
+        seen = {item.media.tmdb_id for item in user_list if item.media}
+        dismissed = await get_active_dismissed_tmdb_ids(db, user_id)
+        return seen.union(dismissed)
     except Exception:
         return set()
 
@@ -366,4 +384,86 @@ async def get_similar_users(
     except Exception as e:
         logger.exception(e)
         raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
+
+@router.post("/dismiss")
+async def dismiss_recommendation_endpoint(
+    payload: DismissRecommendationRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Registra que o usuário não tem interesse na obra.
+    Ejeta a obra do carrossel imediatamente e salva a preferência com expiração (snooze de 6-12 meses).
+    """
+    try:
+        item = await dismiss_recommendation(
+            db=db,
+            user_id=current_user_id,
+            tmdb_id=payload.tmdb_id,
+            media_type=payload.media_type,
+            title=payload.title or "",
+            poster_path=payload.poster_path,
+            days_snooze=payload.days_snooze or 180
+        )
+        return {
+            "status": "success",
+            "message": "Recomendação dispensada com sucesso.",
+            "tmdb_id": item.tmdb_id,
+            "expires_at": item.expires_at.isoformat()
+        }
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail="Erro ao dispensar recomendação.")
+
+@router.post("/undismiss")
+async def undismiss_recommendation_endpoint(
+    payload: UndismissRecommendationRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Restaura uma recomendação previamente dispensada.
+    """
+    try:
+        success = await undismiss_recommendation(
+            db=db,
+            user_id=current_user_id,
+            tmdb_id=payload.tmdb_id,
+            media_type=payload.media_type
+        )
+        return {
+            "status": "success" if success else "not_found",
+            "restored": success,
+            "tmdb_id": payload.tmdb_id
+        }
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail="Erro ao restaurar recomendação.")
+
+@router.get("/dismissed")
+async def list_dismissed_recommendations_endpoint(
+    limit: int = Query(50, ge=1, le=100),
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Retorna a lista de obras dispensadas ativas do usuário para a tela de configurações/perfil.
+    """
+    try:
+        items = await get_user_dismissed_records(db, current_user_id, limit=limit)
+        return [
+            {
+                "id": str(it.id),
+                "tmdb_id": it.tmdb_id,
+                "media_type": it.media_type,
+                "title": it.title,
+                "poster_path": it.poster_path,
+                "expires_at": it.expires_at.isoformat(),
+                "created_at": it.created_at.isoformat()
+            }
+            for it in items
+        ]
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail="Erro ao listar recomendações dispensadas.")
 
