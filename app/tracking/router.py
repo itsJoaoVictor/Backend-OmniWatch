@@ -135,9 +135,12 @@ async def rate_episode(
 
 @router.get("/statistics")
 async def get_statistics(
+    period: str = "all",
+    media_type: str = "all",
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
     from app.tracking.services import get_user_statistics
-    stats = await get_user_statistics(db, user_id)
+    stats = await get_user_statistics(db, user_id, period=period, media_type=media_type)
     return stats
+

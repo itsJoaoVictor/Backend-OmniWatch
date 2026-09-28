@@ -1,14 +1,15 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, load_only
 from app.tracking.models import UserListItem, UserEpisodeProgress
 from app.tracking.schemas import UserListItemCreate, UserListItemUpdate, UserEpisodeProgressCreate
 from app.media.services import get_media_by_tmdb_id, create_media
 from app.media.schemas import MediaCreate
-from app.core.cache import tv_status_cache
+from app.media.models import Media
+from app.core.cache import tv_status_cache, stats_cache
 import uuid
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import asyncio
 
 async def determine_tv_next_episode_status(tmdb_id: int, progress_list: list):
@@ -82,6 +83,10 @@ async def determine_tv_next_episode_status(tmdb_id: int, progress_list: list):
             "is_released": True
         }
         return False, fallback_next
+
+def invalidate_user_stats_cache(user_id: str):
+    """Invalida o cache de estatísticas do usuário quando houver modificação nos seus registros."""
+    stats_cache.delete_prefix(f"stats:{user_id}")
 
 async def get_user_list(db: AsyncSession, user_id: str):
     target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
@@ -373,6 +378,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
         from app.images.router import ensure_image_cached
         asyncio.create_task(ensure_image_cached(saved_item.media.poster_path, "w342"))
     
+    invalidate_user_stats_cache(user_id)
     return saved_item
 
 async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_data: UserListItemUpdate):
@@ -538,6 +544,7 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
             is_up_to_date, next_ep = await determine_tv_next_episode_status(item.media.tmdb_id, item.episodes)
             item.is_up_to_date = is_up_to_date
             item.next_episode = next_ep
+    invalidate_user_stats_cache(user_id)
     return item
 
 async def remove_from_list(db: AsyncSession, user_id: str, item_id: str):
@@ -561,6 +568,7 @@ async def remove_from_list(db: AsyncSession, user_id: str, item_id: str):
 
         await db.delete(item)
         await db.commit()
+        invalidate_user_stats_cache(user_id)
         return True
     return False
 
@@ -662,6 +670,7 @@ async def add_episode_progress(db: AsyncSession, user_id: str, item_id: str, pro
     if item.media:
         tv_status_cache.delete_prefix(f"tv_status:{item.media.tmdb_id}")
     
+    invalidate_user_stats_cache(user_id)
     return new_progress
 
 async def update_episode_rating(
@@ -912,77 +921,380 @@ async def bulk_mark_episodes(db: AsyncSession, user_id: str, item_id: str, targe
         if media_ref:
             await update_user_profile(db, user_id, item, media_ref, explicit_scale=completion_boost)
             tv_status_cache.delete_prefix(f"tv_status:{media_ref.tmdb_id}")
+        invalidate_user_stats_cache(user_id)
     return True
 
 
-async def get_user_statistics(db: AsyncSession, user_id: str):
+GENRE_NORMALIZATION = {
+    "action & adventure": "Ação e Aventura",
+    "action": "Ação",
+    "adventure": "Aventura",
+    "animation": "Animação",
+    "comedy": "Comédia",
+    "crime": "Crime",
+    "documentary": "Documentário",
+    "drama": "Drama",
+    "family": "Família",
+    "fantasy": "Fantasia",
+    "history": "História",
+    "horror": "Terror",
+    "music": "Música",
+    "mystery": "Mistério",
+    "romance": "Romance",
+    "sci-fi & fantasy": "Ficção Científica e Fantasia",
+    "science fiction": "Ficção Científica",
+    "tv movie": "Cinema TV",
+    "thriller": "Suspense",
+    "war & politics": "Guerra e Política",
+    "war": "Guerra",
+    "western": "Faroeste",
+    "ação": "Ação",
+    "ação e aventura": "Ação e Aventura",
+    "aventura": "Aventura",
+    "animação": "Animação",
+    "comédia": "Comédia",
+    "documentário": "Documentário",
+    "família": "Família",
+    "fantasia": "Fantasia",
+    "história": "História",
+    "terror": "Terror",
+    "música": "Música",
+    "mistério": "Mistério",
+    "ficção científica": "Ficção Científica",
+    "ficção científica e fantasia": "Ficção Científica e Fantasia",
+    "suspense": "Suspense",
+    "guerra": "Guerra",
+    "guerra e política": "Guerra e Política",
+    "faroeste": "Faroeste",
+}
+
+MONTH_NAMES_PT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+def normalize_genre(name: str) -> str:
+    clean = name.strip()
+    return GENRE_NORMALIZATION.get(clean.lower(), clean)
+
+async def get_user_statistics(db: AsyncSession, user_id: str, period: str = "all", media_type: str = "all"):
     try:
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         return {}
 
-    # Get all list items with their media
-    result = await db.execute(
+    # 1. Cache lookup: <1ms response for repeated queries
+    cache_key = f"stats:{user_id}:{period}:{media_type}"
+    cached_data, is_stale = stats_cache.get_with_status(cache_key)
+    if not is_stale and cached_data is not None:
+        return cached_data
+
+    now = datetime.now(timezone.utc)
+    cutoff = None
+    days_span = 365
+    if period == "30days":
+        cutoff = now - timedelta(days=30)
+        days_span = 30
+    elif period == "6months":
+        cutoff = now - timedelta(days=180)
+        days_span = 180
+    elif period == "year":
+        cutoff = now - timedelta(days=365)
+        days_span = 365
+
+    # 2. Optimized SQL Query: selective column loading (excludes heavy vector embeddings and keywords)
+    items_query = (
         select(UserListItem)
         .where(UserListItem.user_id == user_uuid)
-        .options(selectinload(UserListItem.media))
+        .options(
+            load_only(
+                UserListItem.id,
+                UserListItem.user_id,
+                UserListItem.media_id,
+                UserListItem.status,
+                UserListItem.rating,
+                UserListItem.rewatch_count,
+                UserListItem.last_watched_at,
+                UserListItem.created_at,
+                UserListItem.updated_at
+            ),
+            selectinload(UserListItem.media).options(
+                load_only(
+                    Media.id,
+                    Media.media_type,
+                    Media.title,
+                    Media.genres,
+                    Media.runtime,
+                    Media.directors,
+                    Media.main_cast
+                )
+            )
+        )
     )
+    if media_type != "all":
+        items_query = items_query.join(UserListItem.media).where(Media.media_type == media_type)
+
+    result = await db.execute(items_query)
     items = result.scalars().all()
 
-    # Get all episode progress for this user
-    # Optimize by querying all progress for the user's items
-    item_ids = [item.id for item in items]
+    # 3. Optimized Episode Query: SQL JOIN instead of WHERE IN, pushdown date cutoff to Postgres
     progress_map = {}
-    if item_ids:
-        prog_result = await db.execute(
-            select(UserEpisodeProgress)
-            .where(UserEpisodeProgress.user_list_item_id.in_(item_ids))
+    if media_type != "movie" and items:
+        prog_query = (
+            select(
+                UserEpisodeProgress.user_list_item_id,
+                UserEpisodeProgress.season_number,
+                UserEpisodeProgress.episode_number,
+                UserEpisodeProgress.rating,
+                UserEpisodeProgress.watched_at
+            )
+            .join(UserListItem, UserEpisodeProgress.user_list_item_id == UserListItem.id)
+            .where(UserListItem.user_id == user_uuid)
         )
-        progresses = prog_result.scalars().all()
+        if cutoff is not None:
+            prog_query = prog_query.where(UserEpisodeProgress.watched_at >= cutoff)
+
+        prog_result = await db.execute(prog_query)
+        progresses = prog_result.all()
         for p in progresses:
-            progress_map[p.user_list_item_id] = progress_map.get(p.user_list_item_id, 0) + 1
+            progress_map.setdefault(p.user_list_item_id, []).append(p)
 
     total_movies_watched = 0
     total_episodes_watched = 0
     total_time_movies_minutes = 0
     total_time_tv_minutes = 0
-    rating_distribution = {str(i): 0 for i in range(1, 11)}
-    genres_count = {}
+
+    rating_distribution = {str(i): 0 for i in range(1, 6)}
+    all_ratings = []
+    series_counts = {"completed": 0, "watching": 0, "plan_to_watch": 0, "dropped": 0, "paused": 0}
+    movies_counts = {"completed": 0, "watching": 0, "plan_to_watch": 0, "dropped": 0, "paused": 0}
+    total_counts = {"completed": 0, "watching": 0, "plan_to_watch": 0, "dropped": 0, "paused": 0}
+
+    genres_stats = {}
+    cast_stats = {}
+    directors_stats = {}
+
+    activity_months = {}
+    num_months = 12 if period in ("year", "all") else 6
+    for i in range(num_months - 1, -1, -1):
+        m_date = now - timedelta(days=i * 30)
+        key = f"{m_date.year:04d}-{m_date.month:02d}"
+        activity_months[key] = {
+            "minutes": 0,
+            "count": 0,
+            "label": f"{MONTH_NAMES_PT[m_date.month - 1]}/{str(m_date.year)[2:]}"
+        }
+
+    earliest_date = now
 
     for item in items:
-        # Rating
-        if item.rating:
-            rating_key = str(int(item.rating))
-            if rating_key in rating_distribution:
-                rating_distribution[rating_key] += 1
-        
-        # Genres
-        if item.media.genres:
-            for genre in item.media.genres:
-                # Handle both dict ({"name": "Action"}) and string ("Action") forms
-                g_name = genre.get('name') if isinstance(genre, dict) else genre
-                if g_name:
-                    genres_count[g_name] = genres_count.get(g_name, 0) + 1
+        m = item.media
+        if not m:
+            continue
 
-        # Watch Time
-        runtime = item.media.runtime or 0
-        if item.media.media_type == 'movie':
-            if item.status in ('completed', 'watching'): # completed movies count
-                total_movies_watched += 1 + item.rewatch_count
-                total_time_movies_minutes += runtime * (1 + item.rewatch_count)
-        elif item.media.media_type == 'tv':
-            episodes_watched = progress_map.get(item.id, 0)
-            total_episodes_watched += episodes_watched
-            total_time_tv_minutes += runtime * episodes_watched
+        if media_type != "all" and m.media_type != media_type:
+            continue
 
-    # Format output
+        runtime = m.runtime or 0
+
+        item_date = item.last_watched_at or item.updated_at or item.created_at
+        if item_date:
+            if item_date.tzinfo is None:
+                item_date = item_date.replace(tzinfo=timezone.utc)
+            if item_date < earliest_date:
+                earliest_date = item_date
+
+        if m.media_type == "tv":
+            if item.status in series_counts:
+                series_counts[item.status] += 1
+        elif m.media_type == "movie":
+            if item.status in movies_counts:
+                movies_counts[item.status] += 1
+
+        if item.status in total_counts:
+            total_counts[item.status] += 1
+
+        item_time_minutes = 0
+        is_watched_in_period = False
+
+        if m.media_type == "movie":
+            if item.status in ("completed", "watching"):
+                if cutoff is None or (item_date and item_date >= cutoff):
+                    is_watched_in_period = True
+                    factor = 1 + (item.rewatch_count or 0)
+                    total_movies_watched += factor
+                    item_time_minutes = runtime * factor
+                    total_time_movies_minutes += item_time_minutes
+
+                    if item_date:
+                        m_key = f"{item_date.year:04d}-{item_date.month:02d}"
+                        if m_key in activity_months:
+                            activity_months[m_key]["minutes"] += item_time_minutes
+                            activity_months[m_key]["count"] += factor
+
+        elif m.media_type == "tv":
+            eps = progress_map.get(item.id, [])
+            ep_count_in_period = 0
+            for ep in eps:
+                ep_date = ep.watched_at or item_date
+                if ep_date and ep_date.tzinfo is None:
+                    ep_date = ep_date.replace(tzinfo=timezone.utc)
+                if ep_date and ep_date < earliest_date:
+                    earliest_date = ep_date
+
+                if cutoff is None or (ep_date and ep_date >= cutoff):
+                    ep_count_in_period += 1
+                    if ep_date:
+                        m_key = f"{ep_date.year:04d}-{ep_date.month:02d}"
+                        if m_key in activity_months:
+                            activity_months[m_key]["minutes"] += runtime
+                            activity_months[m_key]["count"] += 1
+
+            if ep_count_in_period > 0 or (cutoff is None and item.status in ("completed", "watching")):
+                is_watched_in_period = True
+                total_episodes_watched += ep_count_in_period
+                item_time_minutes = runtime * ep_count_in_period
+                total_time_tv_minutes += item_time_minutes
+
+        if not is_watched_in_period and cutoff is not None:
+            continue
+
+        if item.rating and item.rating > 0:
+            r_key = str(min(5, max(1, int(round(item.rating)))))
+            if r_key in rating_distribution:
+                rating_distribution[r_key] += 1
+            all_ratings.append(item.rating)
+
+        raw_genres = m.genres or []
+        normalized_genres = set()
+        for g in raw_genres:
+            g_raw_name = g.get("name") if isinstance(g, dict) else g
+            if g_raw_name:
+                normalized_genres.add(normalize_genre(g_raw_name))
+
+        for g_name in normalized_genres:
+            g_entry = genres_stats.setdefault(g_name, {"count": 0, "totalTime": 0, "ratings": []})
+            g_entry["count"] += 1
+            g_entry["totalTime"] += item_time_minutes
+            if item.rating:
+                g_entry["ratings"].append(item.rating)
+
+        raw_cast = m.main_cast or []
+        if isinstance(raw_cast, list):
+            for actor in raw_cast[:5]:
+                a_name = actor.get("name") if isinstance(actor, dict) else str(actor).strip()
+                if a_name:
+                    c_entry = cast_stats.setdefault(a_name, {"count": 0, "totalTime": 0, "ratings": []})
+                    c_entry["count"] += 1
+                    c_entry["totalTime"] += item_time_minutes
+                    if item.rating:
+                        c_entry["ratings"].append(item.rating)
+
+        raw_dirs = m.directors or []
+        if isinstance(raw_dirs, list):
+            for director in raw_dirs:
+                d_name = director.get("name") if isinstance(director, dict) else str(director).strip()
+                if d_name:
+                    d_entry = directors_stats.setdefault(d_name, {"count": 0, "totalTime": 0, "ratings": []})
+                    d_entry["count"] += 1
+                    d_entry["totalTime"] += item_time_minutes
+                    if item.rating:
+                        d_entry["ratings"].append(item.rating)
+
+    total_time = total_time_movies_minutes + total_time_tv_minutes
+
+    if period == "all":
+        delta_days = (now - earliest_date).days
+        days_span = max(30, delta_days)
+
+    daily_avg_mins = round(total_time / days_span) if days_span > 0 else 0
+    weekly_avg_mins = round((total_time / days_span) * 7) if days_span > 0 else 0
+
+    # Taxas de conclusão dinâmicas
+    active_series = series_counts["completed"] + series_counts["watching"] + series_counts["plan_to_watch"]
+    series_completion_rate = round((series_counts["completed"] / active_series) * 100, 1) if active_series > 0 else 0.0
+
+    active_movies = movies_counts["completed"] + movies_counts["watching"] + movies_counts["plan_to_watch"]
+    movies_completion_rate = round((movies_counts["completed"] / active_movies) * 100, 1) if active_movies > 0 else 0.0
+
+    active_total = total_counts["completed"] + total_counts["watching"] + total_counts["plan_to_watch"]
+    overall_completion_rate = round((total_counts["completed"] / active_total) * 100, 1) if active_total > 0 else 0.0
+
+    if media_type == "movie":
+        dynamic_completion_rate = movies_completion_rate
+        dynamic_completed = movies_counts["completed"]
+        dynamic_pending = movies_counts["watching"] + movies_counts["plan_to_watch"]
+        dynamic_plan = movies_counts["plan_to_watch"]
+    elif media_type == "tv":
+        dynamic_completion_rate = series_completion_rate
+        dynamic_completed = series_counts["completed"]
+        dynamic_pending = series_counts["watching"] + series_counts["plan_to_watch"]
+        dynamic_plan = series_counts["plan_to_watch"]
+    else:
+        dynamic_completion_rate = overall_completion_rate
+        dynamic_completed = total_counts["completed"]
+        dynamic_pending = total_counts["watching"] + total_counts["plan_to_watch"]
+        dynamic_plan = total_counts["plan_to_watch"]
+
+    avg_rating = round(sum(all_ratings) / len(all_ratings), 1) if all_ratings else 0.0
+
+    def format_ranking(stats_dict, limit=15):
+        res = []
+        sorted_items = sorted(stats_dict.items(), key=lambda x: (x[1]["totalTime"], x[1]["count"]), reverse=True)[:limit]
+        for name, data in sorted_items:
+            res.append({
+                "name": name,
+                "count": data["count"],
+                "totalTime": data["totalTime"],
+                "avgRating": round(sum(data["ratings"]) / len(data["ratings"]), 1) if data["ratings"] else None,
+                "percentage": round((data["totalTime"] / total_time) * 100, 1) if total_time > 0 else 0.0
+            })
+        return res
+
+    genres_ranking = format_ranking(genres_stats, limit=20)
+    cast_ranking = format_ranking(cast_stats, limit=15)
+    directors_ranking = format_ranking(directors_stats, limit=15)
+
+    timeline = []
+    for k in sorted(activity_months.keys()):
+        val = activity_months[k]
+        timeline.append({
+            "month": val["label"],
+            "hours": round(val["minutes"] / 60, 1),
+            "count": val["count"]
+        })
+
     return {
-        'totalTime': total_time_movies_minutes + total_time_tv_minutes,
-        'totalTimeMovies': total_time_movies_minutes,
-        'totalTimeTv': total_time_tv_minutes,
-        'totalMovies': total_movies_watched,
-        'totalEpisodes': total_episodes_watched,
-        'ratingDistribution': [{'rating': k, 'count': v} for k, v in sorted(rating_distribution.items(), key=lambda x: int(x[0]))],
-        'topGenres': [{'name': k, 'count': v} for k, v in sorted(genres_count.items(), key=lambda item: item[1], reverse=True)[:10]]
+        "totalTime": total_time,
+        "totalTimeMovies": total_time_movies_minutes,
+        "totalTimeTv": total_time_tv_minutes,
+        "totalMovies": total_movies_watched,
+        "totalEpisodes": total_episodes_watched,
+        "ratingDistribution": [{"rating": k, "count": v} for k, v in sorted(rating_distribution.items(), key=lambda x: int(x[0]))],
+        "topGenres": genres_ranking[:10],
+        "kpis": {
+            "averageRating": avg_rating,
+            "totalRated": len(all_ratings),
+            "completionRate": dynamic_completion_rate,
+            "completedCount": dynamic_completed,
+            "pendingCount": dynamic_pending,
+            "planToWatchCount": dynamic_plan,
+            "seriesCompleted": series_counts["completed"],
+            "seriesWatching": series_counts["watching"],
+            "seriesPlanToWatch": series_counts["plan_to_watch"],
+            "seriesCompletionRate": series_completion_rate,
+            "moviesCompleted": movies_counts["completed"],
+            "moviesWatching": movies_counts["watching"],
+            "moviesPlanToWatch": movies_counts["plan_to_watch"],
+            "moviesCompletionRate": movies_completion_rate,
+            "dailyAverageMinutes": daily_avg_mins,
+            "weeklyAverageMinutes": weekly_avg_mins,
+        },
+        "rankings": {
+            "genres": genres_ranking,
+            "cast": cast_ranking,
+            "directors": directors_ranking
+        },
+        "timeline": timeline
     }
+
+    stats_cache.set(cache_key, output)
+    return output
 

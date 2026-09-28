@@ -46,3 +46,4 @@ trending_cache = SimpleTTLCache(ttl_seconds=3600) # 1 hour
 search_cache = SimpleTTLCache(ttl_seconds=1800) # 30 minutes
 details_cache = SimpleTTLCache(ttl_seconds=86400) # 24 hours (aumentado para evitar refetch contínuo)
 tv_status_cache = SimpleTTLCache(ttl_seconds=86400) # 24 hours para status de episódios da Minha Lista
+stats_cache = SimpleTTLCache(ttl_seconds=300) # 5 minutos para estatísticas do usuário
