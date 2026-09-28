@@ -33,7 +33,16 @@ class SimpleTTLCache:
             if k.startswith(prefix):
                 self._cache[k]["timestamp"] = 0
 
-# Global cache instance for trending items
+    def delete_prefix(self, prefix: str) -> None:
+        """
+        Remove completamente as chaves que começam com o prefixo.
+        """
+        keys_to_del = [k for k in self._cache if k.startswith(prefix)]
+        for k in keys_to_del:
+            self._cache.pop(k, None)
+
+# Global cache instances
 trending_cache = SimpleTTLCache(ttl_seconds=3600) # 1 hour
 search_cache = SimpleTTLCache(ttl_seconds=1800) # 30 minutes
-details_cache = SimpleTTLCache(ttl_seconds=3600) # 1 hour
+details_cache = SimpleTTLCache(ttl_seconds=86400) # 24 hours (aumentado para evitar refetch contínuo)
+tv_status_cache = SimpleTTLCache(ttl_seconds=86400) # 24 hours para status de episódios da Minha Lista

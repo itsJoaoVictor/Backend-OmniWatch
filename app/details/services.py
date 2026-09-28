@@ -1,7 +1,19 @@
 import httpx
 from fastapi import HTTPException
 from app.core.config import settings
+from typing import Optional
 from app.core.cache import details_cache
+
+_tmdb_client: Optional[httpx.AsyncClient] = None
+
+def get_tmdb_client() -> httpx.AsyncClient:
+    global _tmdb_client
+    if _tmdb_client is None or _tmdb_client.is_closed:
+        _tmdb_client = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        )
+    return _tmdb_client
 from app.details.schemas import (
     MovieDetailsResponse, 
     TvSeriesDetailsResponse,
@@ -40,12 +52,12 @@ async def fetch_movie_details(movie_id: int) -> MovieDetailsResponse:
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Filme não encontrado.")
-            response.raise_for_status()
-            data = response.json()
+        client = get_tmdb_client()
+        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Filme não encontrado.")
+        response.raise_for_status()
+        data = response.json()
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Filme não encontrado.")
@@ -198,12 +210,12 @@ async def fetch_tv_details(series_id: int) -> TvSeriesDetailsResponse:
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Série não encontrada.")
-            response.raise_for_status()
-            data = response.json()
+        client = get_tmdb_client()
+        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Série não encontrada.")
+        response.raise_for_status()
+        data = response.json()
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Série não encontrada.")
@@ -378,12 +390,12 @@ async def fetch_season_details(series_id: int, season_number: int) -> SeasonDeta
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Temporada não encontrada.")
-            response.raise_for_status()
-            data = response.json()
+        client = get_tmdb_client()
+        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Temporada não encontrada.")
+        response.raise_for_status()
+        data = response.json()
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Temporada não encontrada.")
@@ -445,12 +457,12 @@ async def fetch_episode_details(series_id: int, season_number: int, episode_numb
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Episódio não encontrado.")
-            response.raise_for_status()
-            data = response.json()
+        client = get_tmdb_client()
+        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Episódio não encontrado.")
+        response.raise_for_status()
+        data = response.json()
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Episódio não encontrado.")
@@ -499,12 +511,12 @@ async def fetch_collection_details(collection_id: int) -> CollectionResponse:
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Coleção não encontrada.")
-            response.raise_for_status()
-            data = response.json()
+        client = get_tmdb_client()
+        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Coleção não encontrada.")
+        response.raise_for_status()
+        data = response.json()
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Coleção não encontrada.")

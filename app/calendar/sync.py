@@ -34,6 +34,7 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
                     data = response.json()
                     rel_date_str = data.get("release_date")
                     if rel_date_str:
+                        media.release_date = rel_date_str
                         try:
                             r_date = datetime.strptime(rel_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                             await db.execute(delete(MediaRelease).where(MediaRelease.media_id == media.id))
@@ -53,6 +54,9 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
                 response = await client.get(url, headers=headers, params=params, timeout=10.0)
                 if response.status_code == 200:
                     data = response.json()
+                    first_air_date = data.get("first_air_date")
+                    if first_air_date:
+                        media.release_date = first_air_date
                     next_episode = data.get("next_episode_to_air")
                     
                     await db.execute(delete(MediaRelease).where(MediaRelease.media_id == media.id))
@@ -272,28 +276,31 @@ async def run_calendar_sync_loop(interval_hours: int = 24):
             all_changed_tmdb_ids = set(changed_movies + changed_tv)
             
             async with AsyncSessionLocal() as db:
+                stmt_tracked_ids = select(UserListItem.media_id).where(
+                    UserListItem.status.in_(["plan_to_watch", "completed", "watching", "upcoming"])
+                ).distinct()
+                res_tracked = await db.execute(stmt_tracked_ids)
+                tracked_media_ids = res_tracked.scalars().all()
+                
+                if tracked_media_ids:
+                    from sqlalchemy import or_
+                    conditions = [(Media.release_date == None) | (Media.release_date == "")]
+                    if all_changed_tmdb_ids:
+                        conditions.append(Media.tmdb_id.in_(all_changed_tmdb_ids))
+
+                    stmt_media_to_update = select(Media.id).where(
+                        Media.id.in_(tracked_media_ids),
+                        or_(*conditions)
+                    )
+                    res_media = await db.execute(stmt_media_to_update)
+                    media_ids_to_update = res_media.scalars().all()
+                    
+                    # 3. Update each matching media
+                    for m_id in media_ids_to_update:
+                        await sync_single_media_release(db, m_id)
+                
+                # 4. Revert completed shows if new episodes aired
                 if all_changed_tmdb_ids:
-                    # 2. Find tracked media in our DB that overlap with the changed IDs
-                    stmt_tracked_ids = select(UserListItem.media_id).where(
-                        UserListItem.status.in_(["plan_to_watch", "completed", "watching", "upcoming"])
-                    ).distinct()
-                    res_tracked = await db.execute(stmt_tracked_ids)
-                    tracked_media_ids = res_tracked.scalars().all()
-                    
-                    if tracked_media_ids:
-                        # Chunk the tracked media IDs or just use IN clause if not millions
-                        stmt_media_to_update = select(Media.id).where(
-                            Media.id.in_(tracked_media_ids),
-                            Media.tmdb_id.in_(all_changed_tmdb_ids)
-                        )
-                        res_media = await db.execute(stmt_media_to_update)
-                        media_ids_to_update = res_media.scalars().all()
-                        
-                        # 3. Update each matching media
-                        for m_id in media_ids_to_update:
-                            await sync_single_media_release(db, m_id)
-                    
-                    # 4. Revert completed shows if new episodes aired
                     await revert_completed_shows(db)
 
                 # 5. Promove itens 'upcoming' que estrearam e notifica os usuários
