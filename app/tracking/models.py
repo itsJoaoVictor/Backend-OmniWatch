@@ -19,6 +19,11 @@ class UserListItem(Base):
 
     user = relationship("User")
     media = relationship("Media")
+    episodes = relationship("UserEpisodeProgress", back_populates="user_list_item", cascade="all, delete-orphan")
+
+    # Atributos voláteis calculados em tempo de execução
+    is_up_to_date: bool = None
+    next_episode: dict = None
 
 class UserEpisodeProgress(Base):
     __tablename__ = "user_episode_progress"
@@ -30,4 +35,4 @@ class UserEpisodeProgress(Base):
     rating = Column(Float, nullable=True)
     watched_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    user_list_item = relationship("UserListItem")
+    user_list_item = relationship("UserListItem", back_populates="episodes")

@@ -25,6 +25,13 @@ class UserListItemUpdate(BaseModel):
     rating: Optional[float] = None
     rewatch_count: Optional[int] = None
 
+class NextEpisodeInfo(BaseModel):
+    season_number: int
+    episode_number: int
+    name: Optional[str] = None
+    air_date: Optional[str] = None
+    is_released: bool = True
+
 class UserListItemResponse(UserListItemBase):
     id: UUID
     user_id: UUID
@@ -33,6 +40,8 @@ class UserListItemResponse(UserListItemBase):
     created_at: datetime
     updated_at: datetime
     media: MediaResponse
+    is_up_to_date: Optional[bool] = None
+    next_episode: Optional[NextEpisodeInfo] = None
 
     class Config:
         from_attributes = True

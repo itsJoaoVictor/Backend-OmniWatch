@@ -8,13 +8,75 @@ from app.media.schemas import MediaCreate
 import uuid
 from typing import Optional
 from datetime import datetime, timezone
+import asyncio
+
+async def determine_tv_next_episode_status(tmdb_id: int, progress_list: list):
+    """
+    Retorna (is_up_to_date, next_episode_dict) para uma série de TV.
+    is_up_to_date é True se todos os episódios lançados até o momento já foram assistidos
+    ou se o próximo episódio ainda não estreou (futuro ou sem data).
+    """
+    from app.core.utils import is_date_released
+    from app.details.services import fetch_season_details
+    
+    max_season = 0
+    max_ep = 0
+    for ep in (progress_list or []):
+        if ep.season_number > max_season:
+            max_season = ep.season_number
+            max_ep = ep.episode_number
+        elif ep.season_number == max_season and ep.episode_number > max_ep:
+            max_ep = ep.episode_number
+            
+    next_season = max_season if max_season > 0 else 1
+    next_ep_num = (max_ep + 1) if max_season > 0 else 1
+
+    try:
+        season_details = await fetch_season_details(tmdb_id, next_season)
+        episodes = season_details.episodes or []
+        
+        # Se o episódio ultrapassar a contagem da temporada, checa a próxima
+        if episodes and next_ep_num > len(episodes):
+            next_season += 1
+            next_ep_num = 1
+            try:
+                season_details = await fetch_season_details(tmdb_id, next_season)
+                episodes = season_details.episodes or []
+            except Exception:
+                episodes = []
+                
+        ep_data = next((e for e in episodes if e.episode_number == next_ep_num), None)
+        if not ep_data:
+            # Próximo episódio ainda não existe no catálogo oficial -> Em dia!
+            return True, None
+            
+        is_released = is_date_released(ep_data.air_date)
+        next_ep_dict = {
+            "season_number": next_season,
+            "episode_number": next_ep_num,
+            "name": getattr(ep_data, "name", None) or f"Episódio {next_ep_num}",
+            "air_date": ep_data.air_date,
+            "is_released": is_released
+        }
+        
+        # Se a data de estreia ainda não chegou, o episódio não foi lançado -> Em dia!
+        if not is_released:
+            return True, next_ep_dict
+        else:
+            return False, next_ep_dict
+    except Exception as e:
+        # Se houver erro de rede com TMDB, não interrompe a exibição da lista
+        return False, None
 
 async def get_user_list(db: AsyncSession, user_id: str):
     target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
     result = await db.execute(
         select(UserListItem)
         .where(UserListItem.user_id == target_uuid)
-        .options(selectinload(UserListItem.media))
+        .options(
+            selectinload(UserListItem.media),
+            selectinload(UserListItem.episodes)
+        )
     )
     items = result.scalars().all()
 
@@ -50,6 +112,22 @@ async def get_user_list(db: AsyncSession, user_id: str):
 
     if needs_commit:
         await db.commit()
+
+    # Determina o status de "em dia" e próximo episódio para séries em watching
+    tv_watching_tasks = []
+    tv_watching_items = []
+    for item in items:
+        if item.media and item.media.media_type == "tv" and item.status == "watching":
+            tv_watching_items.append(item)
+            tv_watching_tasks.append(determine_tv_next_episode_status(item.media.tmdb_id, item.episodes))
+
+    if tv_watching_tasks:
+        results = await asyncio.gather(*tv_watching_tasks, return_exceptions=True)
+        for item, res in zip(tv_watching_items, results):
+            if isinstance(res, tuple) and len(res) == 2:
+                is_up_to_date, next_ep_dict = res
+                item.is_up_to_date = is_up_to_date
+                item.next_episode = next_ep_dict
 
     return items
 
@@ -230,6 +308,20 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
             await db.refresh(existing_item)
             from app.recommendation.profile_manager import update_user_profile
             await update_user_profile(db, user_id, existing_item, existing_item.media)
+        
+        reloaded = await db.execute(
+            select(UserListItem)
+            .where(UserListItem.id == existing_item.id)
+            .options(
+                selectinload(UserListItem.media),
+                selectinload(UserListItem.episodes)
+            )
+        )
+        existing_item = reloaded.scalars().first() or existing_item
+        if existing_item.media and existing_item.media.media_type == "tv" and existing_item.status == "watching":
+            is_up_to_date, next_ep = await determine_tv_next_episode_status(existing_item.media.tmdb_id, existing_item.episodes)
+            existing_item.is_up_to_date = is_up_to_date
+            existing_item.next_episode = next_ep
         return existing_item
 
     new_item = UserListItem(
@@ -243,13 +335,20 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
     await db.commit()
     await db.refresh(new_item)
     
-    # Reload with media relationship
+    # Reload with media and episodes relationship
     result = await db.execute(
         select(UserListItem)
         .where(UserListItem.id == new_item.id)
-        .options(selectinload(UserListItem.media))
+        .options(
+            selectinload(UserListItem.media),
+            selectinload(UserListItem.episodes)
+        )
     )
     saved_item = result.scalars().first()
+    if saved_item and saved_item.media and saved_item.media.media_type == "tv" and saved_item.status == "watching":
+        is_up_to_date, next_ep = await determine_tv_next_episode_status(saved_item.media.tmdb_id, saved_item.episodes)
+        saved_item.is_up_to_date = is_up_to_date
+        saved_item.next_episode = next_ep
     
     # Trigger Profile Update
     from app.recommendation.profile_manager import update_user_profile
@@ -415,9 +514,16 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
     reloaded = await db.execute(
         select(UserListItem)
         .where(UserListItem.id == item.id)
-        .options(selectinload(UserListItem.media))
+        .options(
+            selectinload(UserListItem.media),
+            selectinload(UserListItem.episodes)
+        )
     )
     item = reloaded.scalars().first() or item
+    if item.media and item.media.media_type == "tv" and item.status == "watching":
+        is_up_to_date, next_ep = await determine_tv_next_episode_status(item.media.tmdb_id, item.episodes)
+        item.is_up_to_date = is_up_to_date
+        item.next_episode = next_ep
     return item
 
 async def remove_from_list(db: AsyncSession, user_id: str, item_id: str):
