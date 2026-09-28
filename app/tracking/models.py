@@ -6,6 +6,7 @@ from app.core.database import Base
 
 class UserListItem(Base):
     __tablename__ = "user_list_items"
+    __allow_unmapped__ = True
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
