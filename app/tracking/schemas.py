@@ -64,3 +64,31 @@ class UserEpisodeProgressResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class MediaRankingItem(BaseModel):
+    rank: int
+    id: UUID
+    media_id: UUID
+    tmdb_id: int
+    title: str
+    media_type: str
+    poster_path: Optional[str] = None
+    release_date: Optional[str] = None
+    runtime: Optional[int] = 0
+    genres: List[str] = []
+    rating: Optional[float] = None
+    rewatch_count: int = 0
+    total_time_minutes: int = 0
+    episodes_watched: int = 0
+    status: str = "completed"
+    last_watched_at: Optional[datetime] = None
+
+class MediaRankingResponse(BaseModel):
+    items: List[MediaRankingItem]
+    total_items: int
+    page: int
+    page_size: int
+    total_pages: int
+    media_type: str
+    sort_by: str
+    period: str

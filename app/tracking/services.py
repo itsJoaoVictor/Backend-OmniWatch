@@ -1298,3 +1298,251 @@ async def get_user_statistics(db: AsyncSession, user_id: str, period: str = "all
     stats_cache.set(cache_key, output)
     return output
 
+
+async def get_user_media_ranking(
+    db: AsyncSession,
+    user_id: str,
+    media_type: str = "movie",
+    sort_by: str = "time",
+    period: str = "all",
+    page: int = 1,
+    page_size: int = 10,
+    search: Optional[str] = None
+):
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return {
+            "items": [],
+            "total_items": 0,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+            "media_type": media_type,
+            "sort_by": sort_by,
+            "period": period
+        }
+
+    clean_search = (search or "").strip().lower()
+    page = max(1, int(page))
+    page_size = max(1, min(50, int(page_size)))
+
+    cache_key = f"stats:{user_id}:rankings:{media_type}:{sort_by}:{period}:{page}:{page_size}:{clean_search}"
+    cached_data, is_stale = stats_cache.get_with_status(cache_key)
+    if not is_stale and cached_data is not None:
+        return cached_data
+
+    now = datetime.now(timezone.utc)
+    cutoff = None
+    if period == "30days":
+        cutoff = now - timedelta(days=30)
+    elif period == "6months":
+        cutoff = now - timedelta(days=180)
+    elif period == "year":
+        cutoff = now - timedelta(days=365)
+
+    items_query = (
+        select(UserListItem)
+        .join(UserListItem.media)
+        .where(
+            UserListItem.user_id == user_uuid,
+            Media.media_type == media_type
+        )
+        .options(
+            load_only(
+                UserListItem.id,
+                UserListItem.user_id,
+                UserListItem.media_id,
+                UserListItem.status,
+                UserListItem.rating,
+                UserListItem.rewatch_count,
+                UserListItem.last_watched_at,
+                UserListItem.created_at,
+                UserListItem.updated_at
+            ),
+            selectinload(UserListItem.media).options(
+                load_only(
+                    Media.id,
+                    Media.tmdb_id,
+                    Media.media_type,
+                    Media.title,
+                    Media.poster_path,
+                    Media.release_date,
+                    Media.genres,
+                    Media.runtime
+                )
+            )
+        )
+    )
+
+    if clean_search:
+        items_query = items_query.where(Media.title.ilike(f"%{clean_search}%"))
+
+    result = await db.execute(items_query)
+    user_items = result.scalars().all()
+
+    progress_map = {}
+    if media_type == "tv" and user_items:
+        prog_query = (
+            select(
+                UserEpisodeProgress.user_list_item_id,
+                UserEpisodeProgress.season_number,
+                UserEpisodeProgress.episode_number,
+                UserEpisodeProgress.rating,
+                UserEpisodeProgress.watched_at
+            )
+            .join(UserListItem, UserEpisodeProgress.user_list_item_id == UserListItem.id)
+            .where(UserListItem.user_id == user_uuid)
+        )
+        if cutoff is not None:
+            prog_query = prog_query.where(UserEpisodeProgress.watched_at >= cutoff)
+
+        prog_result = await db.execute(prog_query)
+        for p in prog_result.all():
+            progress_map.setdefault(p.user_list_item_id, []).append(p)
+
+    candidates = []
+    for item in user_items:
+        m = item.media
+        if not m:
+            continue
+
+        runtime = m.runtime or 0
+        item_date = item.last_watched_at or item.updated_at or item.created_at
+        if item_date and item_date.tzinfo is None:
+            item_date = item_date.replace(tzinfo=timezone.utc)
+
+        raw_genres = m.genres or []
+        genres_list = []
+        for g in raw_genres:
+            g_name = g.get("name") if isinstance(g, dict) else str(g)
+            if g_name:
+                genres_list.append(normalize_genre(g_name))
+
+        if media_type == "movie":
+            is_valid = False
+            if cutoff is not None:
+                if item_date and item_date >= cutoff and item.status in ("completed", "watching"):
+                    is_valid = True
+            else:
+                if item.status in ("completed", "watching") or (item.rewatch_count and item.rewatch_count > 0) or item.rating is not None:
+                    is_valid = True
+
+            if not is_valid:
+                continue
+
+            factor = 1 + (item.rewatch_count or 0)
+            total_time = runtime * factor
+            episodes_watched = 1 if item.status == "completed" else 0
+
+            candidates.append({
+                "id": item.id,
+                "media_id": m.id,
+                "tmdb_id": m.tmdb_id,
+                "title": m.title,
+                "media_type": "movie",
+                "poster_path": m.poster_path,
+                "release_date": m.release_date,
+                "runtime": runtime,
+                "genres": genres_list[:3],
+                "rating": item.rating,
+                "rewatch_count": item.rewatch_count or 0,
+                "total_time_minutes": total_time,
+                "episodes_watched": episodes_watched,
+                "status": item.status,
+                "last_watched_at": item_date
+            })
+
+        elif media_type == "tv":
+            eps = progress_map.get(item.id, [])
+            ep_count = len(eps)
+
+            is_valid = False
+            if cutoff is not None:
+                if ep_count > 0:
+                    is_valid = True
+            else:
+                if ep_count > 0 or item.status in ("completed", "watching") or item.rating is not None:
+                    is_valid = True
+
+            if not is_valid:
+                continue
+
+            total_time = runtime * ep_count
+            last_date = item_date
+            for ep in eps:
+                ep_dt = ep.watched_at
+                if ep_dt:
+                    if ep_dt.tzinfo is None:
+                        ep_dt = ep_dt.replace(tzinfo=timezone.utc)
+                    if not last_date or ep_dt > last_date:
+                        last_date = ep_dt
+
+            final_rating = item.rating
+            if final_rating is None:
+                ep_ratings = [ep.rating for ep in eps if ep.rating is not None and ep.rating > 0]
+                if ep_ratings:
+                    final_rating = round(sum(ep_ratings) / len(ep_ratings), 1)
+
+            candidates.append({
+                "id": item.id,
+                "media_id": m.id,
+                "tmdb_id": m.tmdb_id,
+                "title": m.title,
+                "media_type": "tv",
+                "poster_path": m.poster_path,
+                "release_date": m.release_date,
+                "runtime": runtime,
+                "genres": genres_list[:3],
+                "rating": final_rating,
+                "rewatch_count": item.rewatch_count or 0,
+                "total_time_minutes": total_time,
+                "episodes_watched": ep_count,
+                "status": item.status,
+                "last_watched_at": last_date
+            })
+
+    def sort_key(x):
+        r_val = x["rating"] if x["rating"] is not None else -1.0
+        t_val = x["total_time_minutes"]
+        time_key = x["last_watched_at"].timestamp() if x["last_watched_at"] else 0
+
+        if sort_by == "rating":
+            return (x["rating"] is not None, r_val, t_val)
+        elif sort_by == "rewatch":
+            return (x["rewatch_count"], t_val, r_val)
+        elif sort_by == "episodes":
+            return (x["episodes_watched"], t_val, r_val)
+        elif sort_by == "recent":
+            return (time_key, t_val)
+        elif sort_by == "title":
+            return x["title"].lower()
+        else: # "time" (default)
+            return (t_val, r_val)
+
+    reverse_sort = (sort_by != "title")
+    candidates.sort(key=sort_key, reverse=reverse_sort)
+
+    total_items = len(candidates)
+    total_pages = max(1, (total_items + page_size - 1) // page_size) if total_items > 0 else 0
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = candidates[start:end]
+
+    for idx, obj in enumerate(page_items):
+        obj["rank"] = start + idx + 1
+
+    output = {
+        "items": page_items,
+        "total_items": total_items,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "media_type": media_type,
+        "sort_by": sort_by,
+        "period": period
+    }
+
+    stats_cache.set(cache_key, output)
+    return output
+

@@ -1,12 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, Optional
 
 from app.core.database import get_db
 from app.auth.dependencies import get_current_user_id
 from app.tracking.schemas import (
     UserListItemCreate, UserListItemUpdate, UserListItemResponse,
-    UserEpisodeProgressCreate, UserEpisodeProgressResponse, UserEpisodeRatingUpdate
+    UserEpisodeProgressCreate, UserEpisodeProgressResponse, UserEpisodeRatingUpdate,
+    MediaRankingResponse
 )
 from app.tracking.services import (
     get_user_list, add_to_list, update_list_item, remove_from_list, add_episode_progress
@@ -143,4 +144,27 @@ async def get_statistics(
     from app.tracking.services import get_user_statistics
     stats = await get_user_statistics(db, user_id, period=period, media_type=media_type)
     return stats
+
+@router.get("/statistics/rankings/media", response_model=MediaRankingResponse)
+async def get_media_ranking(
+    media_type: str = "movie",
+    sort_by: str = "time",
+    period: str = "all",
+    page: int = 1,
+    page_size: int = 10,
+    search: Optional[str] = None,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.tracking.services import get_user_media_ranking
+    return await get_user_media_ranking(
+        db=db,
+        user_id=user_id,
+        media_type=media_type,
+        sort_by=sort_by,
+        period=period,
+        page=page,
+        page_size=page_size,
+        search=search
+    )
 
