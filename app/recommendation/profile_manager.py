@@ -110,17 +110,26 @@ async def update_user_profile(
     if explicit_scale is not None:
         final_scale = explicit_scale
     else:
-        action_date = (list_item.updated_at or list_item.created_at) if list_item else None
+        action_date = None
+        rating_val = None
+        status_val = None
+        if list_item:
+            try:
+                action_date = list_item.updated_at or list_item.created_at
+                rating_val = list_item.rating
+                status_val = list_item.status
+            except Exception:
+                pass
         time_decay = calculate_time_decay(action_date)
-        rating_scale = calculate_rating_scale(
-            list_item.rating if list_item else None,
-            list_item.status if list_item else None
-        )
+        rating_scale = calculate_rating_scale(rating_val, status_val)
         
         # TV Show episode modifier (if media is TV)
         episode_modifier = 1.0
-        if media and media.media_type == "tv":
-            episode_modifier = 1.2
+        try:
+            if media and getattr(media, "media_type", None) == "tv":
+                episode_modifier = 1.2
+        except Exception:
+            pass
 
         final_scale = time_decay * rating_scale * episode_modifier
     
@@ -128,7 +137,10 @@ async def update_user_profile(
     if media_vector is None:
         if media is None:
             return
-        media_vector = build_sparse_vector(media)
+        try:
+            media_vector = build_sparse_vector(media)
+        except Exception:
+            return
         
     if not media_vector:
         return
@@ -150,14 +162,21 @@ async def update_user_profile(
 
     # Fase 6: Atualização incremental do embedding semântico do usuário
     if media:
-        media_emb = media.embedding
+        media_emb = None
+        try:
+            media_emb = media.embedding
+        except Exception:
+            media_emb = None
         if not media_emb:
             try:
                 from app.recommendation.embeddings import build_text_for_embedding, generate_embedding
                 text = build_text_for_embedding(media)
                 media_emb = await generate_embedding(text)
                 if media_emb:
-                    media.embedding = media_emb
+                    try:
+                        media.embedding = media_emb
+                    except Exception:
+                        pass
             except Exception:
                 media_emb = None
 

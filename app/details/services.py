@@ -446,6 +446,26 @@ async def fetch_episode_details(series_id: int, season_number: int, episode_numb
     if not is_stale and cached_data:
         return EpisodeDetailsResponse(**cached_data)
 
+    # Otimização Fast-Path: Verifica se a temporada completa já está em cache
+    season_cache_key = f"details:tv:{series_id}:season:{season_number}"
+    cached_season, is_season_stale = details_cache.get_with_status(season_cache_key)
+    if not is_season_stale and cached_season and "episodes" in cached_season:
+        for ep in cached_season["episodes"]:
+            if ep.get("episode_number") == episode_number:
+                response_data = {
+                    "id": ep.get("id"),
+                    "name": ep.get("name", ""),
+                    "air_date": ep.get("air_date"),
+                    "episode_number": ep.get("episode_number", episode_number),
+                    "season_number": ep.get("season_number", season_number),
+                    "overview": ep.get("overview", ""),
+                    "still_path": ep.get("still_path"),
+                    "vote_average": ep.get("vote_average", 0.0),
+                    "runtime": ep.get("runtime")
+                }
+                details_cache.set(cache_key, response_data)
+                return EpisodeDetailsResponse(**response_data)
+
     url = f"{settings.TMDB_BASE_URL}/tv/{series_id}/season/{season_number}/episode/{episode_number}"
     params = {
         "language": "pt-BR"
@@ -458,7 +478,7 @@ async def fetch_episode_details(series_id: int, season_number: int, episode_numb
 
     try:
         client = get_tmdb_client()
-        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        response = await client.get(url, headers=headers, params=params, timeout=3.0)
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="Episódio não encontrado.")
         response.raise_for_status()

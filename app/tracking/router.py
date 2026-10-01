@@ -51,10 +51,11 @@ async def add_item_to_list(
 async def update_item(
     item_id: str,
     update_data: UserListItemUpdate,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    updated = await update_list_item(db, user_id, item_id, update_data)
+    updated = await update_list_item(db, user_id, item_id, update_data, background_tasks=background_tasks)
     if not updated:
         raise HTTPException(status_code=404, detail="Item não encontrado")
     return updated
@@ -74,10 +75,11 @@ async def remove_item(
 async def mark_episode_watched(
     item_id: str,
     progress: UserEpisodeProgressCreate,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    new_progress = await add_episode_progress(db, user_id, item_id, progress)
+    new_progress = await add_episode_progress(db, user_id, item_id, progress, background_tasks=background_tasks)
     if not new_progress:
         raise HTTPException(status_code=404, detail="Item não encontrado ou você não tem permissão")
     return new_progress
@@ -86,11 +88,12 @@ async def mark_episode_watched(
 async def bulk_mark_episodes_watched(
     item_id: str,
     progress: UserEpisodeProgressCreate,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
     from app.tracking.services import bulk_mark_episodes
-    success = await bulk_mark_episodes(db, user_id, item_id, progress)
+    success = await bulk_mark_episodes(db, user_id, item_id, progress, background_tasks=background_tasks)
     if not success:
         raise HTTPException(status_code=404, detail="Item não encontrado ou falha ao marcar em lote")
     return {"status": "ok"}
@@ -125,11 +128,12 @@ async def rate_episode(
     season_number: int,
     episode_number: int,
     rating_data: UserEpisodeRatingUpdate,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
     from app.tracking.services import update_episode_rating
-    prog = await update_episode_rating(db, user_id, item_id, season_number, episode_number, rating_data.rating)
+    prog = await update_episode_rating(db, user_id, item_id, season_number, episode_number, rating_data.rating, background_tasks=background_tasks)
     if not prog:
         raise HTTPException(status_code=404, detail="Item ou episódio não encontrado")
     return prog

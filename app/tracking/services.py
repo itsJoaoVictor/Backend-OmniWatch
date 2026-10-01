@@ -1,16 +1,21 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload, load_only
+from fastapi import BackgroundTasks
+import logging
+import uuid
+from typing import Optional
+from datetime import datetime, timezone, timedelta
+import asyncio
+
+logger = logging.getLogger(__name__)
+
 from app.tracking.models import UserListItem, UserEpisodeProgress
 from app.tracking.schemas import UserListItemCreate, UserListItemUpdate, UserEpisodeProgressCreate
 from app.media.services import get_media_by_tmdb_id, create_media
 from app.media.schemas import MediaCreate
 from app.media.models import Media
-from app.core.cache import tv_status_cache, stats_cache
-import uuid
-from typing import Optional
-from datetime import datetime, timezone, timedelta
-import asyncio
+from app.core.cache import tv_status_cache, stats_cache, details_cache
 
 async def determine_tv_next_episode_status(tmdb_id: int, progress_list: list):
     """
@@ -381,7 +386,13 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
     invalidate_user_stats_cache(user_id)
     return saved_item
 
-async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_data: UserListItemUpdate):
+async def update_list_item(
+    db: AsyncSession, 
+    user_id: str, 
+    item_id: str, 
+    update_data: UserListItemUpdate,
+    background_tasks: Optional[BackgroundTasks] = None
+):
     try:
         item_uuid = uuid.UUID(item_id)
         user_uuid = uuid.UUID(user_id)
@@ -403,17 +414,27 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
 
         rel_date = item.media.release_date if item.media else None
         if not rel_date and item.media:
-            from app.details.services import fetch_movie_details, fetch_tv_details
-            try:
-                if item.media.media_type == "movie":
-                    tmdb_data = await fetch_movie_details(item.media.tmdb_id)
-                else:
-                    tmdb_data = await fetch_tv_details(item.media.tmdb_id)
-                rel_date = tmdb_data.release_date if hasattr(tmdb_data, 'release_date') else getattr(tmdb_data, 'first_air_date', None)
-                if rel_date:
-                    item.media.release_date = rel_date
-            except Exception:
-                pass
+            from app.core.cache import details_cache
+            cached_details, _ = details_cache.get_with_status(f"details:{item.media.media_type}:{item.media.tmdb_id}")
+            if cached_details and "release_date" in cached_details:
+                rel_date = cached_details["release_date"]
+                item.media.release_date = rel_date
+            elif cached_details and "first_air_date" in cached_details:
+                rel_date = cached_details["first_air_date"]
+                item.media.release_date = rel_date
+            else:
+                from app.details.services import fetch_movie_details, fetch_tv_details
+                try:
+                    if item.media.media_type == "movie":
+                        tmdb_data = await fetch_movie_details(item.media.tmdb_id)
+                        rel_date = getattr(tmdb_data, 'release_date', None)
+                    else:
+                        tmdb_data = await fetch_tv_details(item.media.tmdb_id)
+                        rel_date = getattr(tmdb_data, 'first_air_date', None)
+                    if rel_date:
+                        item.media.release_date = rel_date
+                except Exception:
+                    pass
 
         is_released = is_date_released(rel_date)
 
@@ -433,18 +454,7 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
 
         if update_data.status == "completed":
             if item.media.media_type == "movie":
-                from app.core.utils import is_date_released
-                from fastapi import HTTPException
                 rel_date = item.media.release_date
-                if not rel_date:
-                    from app.details.services import fetch_movie_details
-                    try:
-                        tmdb_data = await fetch_movie_details(item.media.tmdb_id)
-                        rel_date = tmdb_data.release_date
-                        if rel_date:
-                            item.media.release_date = rel_date
-                    except Exception:
-                        pass
                 if not is_date_released(rel_date):
                     raise HTTPException(
                         status_code=400,
@@ -477,7 +487,7 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
                                     else:
                                         has_unreleased_episodes = True
                             except Exception as e:
-                                print(f"Failed to fetch season {season.season_number} details: {e}")
+                                logger.warning(f"Failed to fetch season {season.season_number} details: {e}")
                                 if season.air_date and not is_date_released(season.air_date):
                                     has_unreleased_episodes = True
                                 else:
@@ -498,10 +508,8 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
                     else:
                         item.status = "watching"
                 except Exception as e:
-                    print(f"Failed to auto-mark episodes: {e}")
+                    logger.warning(f"Failed to auto-mark episodes: {e}")
         elif update_data.status == "watching" and item.media.media_type == "movie":
-            from app.core.utils import is_date_released
-            from fastapi import HTTPException
             rel_date = item.media.release_date
             if not is_date_released(rel_date):
                 raise HTTPException(
@@ -512,12 +520,19 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
         else:
             item.status = update_data.status
 
-        # Regra de negócio: itens em 'plan_to_watch' ou 'upcoming' não possuem nota
-        if item.status in ["plan_to_watch", "upcoming"]:
+        # Regra de negócio: se foi para plan_to_watch ou upcoming sem nota explícita, limpa nota
+        if item.status in ["plan_to_watch", "upcoming"] and update_data.rating is None:
             item.rating = None
-    
-    if update_data.rating is not None and item.status not in ["plan_to_watch", "upcoming"]:
-        item.rating = update_data.rating
+
+    # Resolução de corrida e nota:
+    # Se recebeu nota e o item estava em 'plan_to_watch' ou 'upcoming' (sem status explícito no payload),
+    # gradua automaticamente para 'watching' para nunca descartar a nota enviada pelo usuário
+    if update_data.rating is not None:
+        if item.status in ["plan_to_watch", "upcoming"] and update_data.status is None:
+            item.status = "watching"
+        if item.status not in ["plan_to_watch", "upcoming"]:
+            item.rating = update_data.rating
+
     if update_data.rewatch_count is not None:
         item.rewatch_count = update_data.rewatch_count
 
@@ -525,25 +540,27 @@ async def update_list_item(db: AsyncSession, user_id: str, item_id: str, update_
     await db.commit()
     await db.refresh(item)
     
-    # Trigger Profile Update (rating or watch status might have changed)
-    from app.recommendation.profile_manager import update_user_profile
+    # Fast-Path: Trigger Profile Update em background (0ms no request)
     if media_ref:
-        await update_user_profile(db, user_id, item, media_ref)
-    
-    reloaded = await db.execute(
-        select(UserListItem)
-        .where(UserListItem.id == item.id)
-        .options(
-            selectinload(UserListItem.media),
-            selectinload(UserListItem.episodes)
-        )
-    )
-    if item.media and item.media.media_type == "tv":
+        if background_tasks:
+            background_tasks.add_task(_async_post_process_list_item_update, user_id=user_id, item_id=str(item.id))
+        else:
+            asyncio.create_task(_async_post_process_list_item_update(user_id=user_id, item_id=str(item.id)))
+
+    # Apenas recalcula próximo episódio de TV se o status foi explicitamente alterado
+    if update_data.status is not None and item.media and item.media.media_type == "tv":
         tv_status_cache.delete_prefix(f"tv_status:{item.media.tmdb_id}")
         if item.status == "watching":
-            is_up_to_date, next_ep = await determine_tv_next_episode_status(item.media.tmdb_id, item.episodes)
+            reloaded = await db.execute(
+                select(UserListItem)
+                .where(UserListItem.id == item.id)
+                .options(selectinload(UserListItem.episodes))
+            )
+            item_with_episodes = reloaded.scalars().first() or item
+            is_up_to_date, next_ep = await determine_tv_next_episode_status(item.media.tmdb_id, item_with_episodes.episodes)
             item.is_up_to_date = is_up_to_date
             item.next_episode = next_ep
+
     invalidate_user_stats_cache(user_id)
     return item
 
@@ -572,7 +589,109 @@ async def remove_from_list(db: AsyncSession, user_id: str, item_id: str):
         return True
     return False
 
-async def add_episode_progress(db: AsyncSession, user_id: str, item_id: str, progress: UserEpisodeProgressCreate):
+async def _async_post_process_episode(
+    user_id: str,
+    item_id: str,
+    media_id: Optional[int],
+    rating: Optional[float],
+    is_completed: bool,
+    needs_completion_check: bool
+):
+    from app.core.database import AsyncSessionLocal
+    from app.tracking.models import UserListItem, UserEpisodeProgress
+    from sqlalchemy.orm import selectinload
+    
+    async with AsyncSessionLocal() as session:
+        # 1. Se precisa checar finalização da série em background
+        if needs_completion_check and media_id:
+            try:
+                from app.details.services import fetch_tv_details
+                tv_data = await fetch_tv_details(media_id)
+                if tv_data.status in ("Ended", "Canceled") and tv_data.number_of_episodes:
+                    all_prog = await session.execute(
+                        select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == uuid.UUID(item_id))
+                    )
+                    if len(all_prog.scalars().all()) >= tv_data.number_of_episodes:
+                        item_res = await session.execute(
+                            select(UserListItem).where(UserListItem.id == uuid.UUID(item_id))
+                        )
+                        it = item_res.scalars().first()
+                        if it and it.status != "completed":
+                            it.status = "completed"
+                            is_completed = True
+                            await session.commit()
+            except Exception as e:
+                logger.warning(f"Error in background completion check: {e}")
+
+        # 2. Atualiza perfil do usuário e recomendações
+        try:
+            from app.recommendation.profile_manager import update_user_profile, calculate_episode_rating_scale
+            item_res = await session.execute(
+                select(UserListItem)
+                .where(UserListItem.id == uuid.UUID(item_id))
+                .options(selectinload(UserListItem.media))
+            )
+            item_obj = item_res.scalars().first()
+            if item_obj and item_obj.media:
+                if rating is not None:
+                    episode_scale = calculate_episode_rating_scale(rating)
+                    await update_user_profile(session, user_id, item_obj, item_obj.media, explicit_scale=episode_scale)
+                else:
+                    completion_boost = 1.5 if is_completed else None
+                    await update_user_profile(session, user_id, item_obj, item_obj.media, explicit_scale=completion_boost)
+        except Exception as e:
+            logger.warning(f"Error in background update_user_profile: {e}")
+
+async def _async_post_process_list_item_update(user_id: str, item_id: str):
+    from app.core.database import AsyncSessionLocal
+    from app.tracking.models import UserListItem
+    from sqlalchemy.orm import selectinload
+    
+    async with AsyncSessionLocal() as session:
+        try:
+            from app.recommendation.profile_manager import update_user_profile
+            item_res = await session.execute(
+                select(UserListItem)
+                .where(UserListItem.id == uuid.UUID(item_id))
+                .options(selectinload(UserListItem.media))
+            )
+            item_obj = item_res.scalars().first()
+            if item_obj and item_obj.media:
+                await update_user_profile(session, user_id, item_obj, item_obj.media)
+        except Exception as e:
+            logger.warning(f"Error in background update_list_item profile update: {e}")
+
+async def _async_post_process_bulk(
+    user_id: str,
+    item_id: str,
+    is_completed: bool
+):
+    from app.core.database import AsyncSessionLocal
+    from app.tracking.models import UserListItem
+    from sqlalchemy.orm import selectinload
+    
+    async with AsyncSessionLocal() as session:
+        try:
+            from app.recommendation.profile_manager import update_user_profile
+            item_res = await session.execute(
+                select(UserListItem)
+                .where(UserListItem.id == uuid.UUID(item_id))
+                .options(selectinload(UserListItem.media))
+            )
+            item_obj = item_res.scalars().first()
+            if item_obj and item_obj.media:
+                completion_boost = 1.5 if is_completed else None
+                await update_user_profile(session, user_id, item_obj, item_obj.media, explicit_scale=completion_boost)
+        except Exception as e:
+            logger.warning(f"Error in background bulk update_user_profile: {e}")
+
+async def add_episode_progress(
+    db: AsyncSession, 
+    user_id: str, 
+    item_id: str, 
+    progress: UserEpisodeProgressCreate,
+    background_tasks: Optional[BackgroundTasks] = None
+):
     try:
         item_uuid = uuid.UUID(item_id)
         user_uuid = uuid.UUID(user_id)
@@ -589,7 +708,7 @@ async def add_episode_progress(db: AsyncSession, user_id: str, item_id: str, pro
     if not item:
         return None
 
-    # Validação de data de lançamento do episódio
+    # Validação de data de lançamento do episódio (Fast-path com cache de temporada)
     if item.media and item.media.media_type == "tv":
         from app.details.services import fetch_episode_details
         from app.core.utils import is_date_released
@@ -604,13 +723,13 @@ async def add_episode_progress(db: AsyncSession, user_id: str, item_id: str, pro
         except HTTPException:
             raise
         except Exception as e:
-            print(f"Error checking episode release date: {e}")
+            logger.warning(f"Error checking episode release date: {e}")
 
     # Check if episode already marked
     prog_result = await db.execute(
         select(UserEpisodeProgress)
         .where(
-            UserEpisodeProgress.user_list_item_id == uuid.UUID(item_id),
+            UserEpisodeProgress.user_list_item_id == item_uuid,
             UserEpisodeProgress.season_number == progress.season_number,
             UserEpisodeProgress.episode_number == progress.episode_number
         )
@@ -621,14 +740,31 @@ async def add_episode_progress(db: AsyncSession, user_id: str, item_id: str, pro
             existing.rating = progress.rating
             await db.commit()
             await db.refresh(existing)
-            if item.media:
-                from app.recommendation.profile_manager import update_user_profile, calculate_episode_rating_scale
-                scale = calculate_episode_rating_scale(progress.rating)
-                await update_user_profile(db, user_id, item, item.media, explicit_scale=scale)
+            if background_tasks:
+                background_tasks.add_task(
+                    _async_post_process_episode,
+                    user_id=user_id,
+                    item_id=str(item.id),
+                    media_id=item.media.tmdb_id if item.media else None,
+                    rating=progress.rating,
+                    is_completed=False,
+                    needs_completion_check=False
+                )
+            else:
+                asyncio.create_task(
+                    _async_post_process_episode(
+                        user_id=user_id,
+                        item_id=str(item.id),
+                        media_id=item.media.tmdb_id if item.media else None,
+                        rating=progress.rating,
+                        is_completed=False,
+                        needs_completion_check=False
+                    )
+                )
         return existing
 
     new_progress = UserEpisodeProgress(
-        user_list_item_id=uuid.UUID(item_id),
+        user_list_item_id=item_uuid,
         season_number=progress.season_number,
         episode_number=progress.episode_number,
         rating=progress.rating
@@ -639,38 +775,55 @@ async def add_episode_progress(db: AsyncSession, user_id: str, item_id: str, pro
     item.last_watched_at = datetime.now(timezone.utc)
     
     is_completed = False
+    needs_completion_check = False
     if item.media and item.media.media_type == "tv":
-        from app.details.services import fetch_tv_details
-        try:
-            tv_data = await fetch_tv_details(item.media.tmdb_id)
-            if tv_data.status in ("Ended", "Canceled"):
-                all_prog = await db.execute(select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item_uuid))
-                total_marked = len(all_prog.scalars().all()) + 1
-                if total_marked >= tv_data.number_of_episodes:
-                    item.status = "completed"
-                    is_completed = True
-        except Exception:
-            pass
+        cached_tv, _ = details_cache.get_with_status(f"details:tv:{item.media.tmdb_id}")
+        if cached_tv and cached_tv.get("status") in ("Ended", "Canceled") and cached_tv.get("number_of_episodes"):
+            all_prog = await db.execute(select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item_uuid))
+            total_marked = len(all_prog.scalars().all()) + 1
+            if total_marked >= cached_tv["number_of_episodes"]:
+                item.status = "completed"
+                is_completed = True
+        else:
+            needs_completion_check = True
 
     if not is_completed and item.status == "plan_to_watch":
         item.status = "watching"
 
+    media_ref = item.media
+    tmdb_id_val = media_ref.tmdb_id if media_ref else None
+
     await db.commit()
     await db.refresh(new_progress)
     
-    # Trigger Profile Update
-    from app.recommendation.profile_manager import update_user_profile, calculate_episode_rating_scale
-    if progress.rating is not None:
-        episode_scale = calculate_episode_rating_scale(progress.rating)
-        await update_user_profile(db, user_id, item, item.media, explicit_scale=episode_scale)
-    else:
-        completion_boost = 1.5 if is_completed else None
-        await update_user_profile(db, user_id, item, item.media, explicit_scale=completion_boost)
-    
-    if item.media:
-        tv_status_cache.delete_prefix(f"tv_status:{item.media.tmdb_id}")
+    if tmdb_id_val:
+        tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
     
     invalidate_user_stats_cache(user_id)
+
+    # Fast-Path: Processa perfis e recomendações em segundo plano sem travar a resposta HTTP
+    if background_tasks:
+        background_tasks.add_task(
+            _async_post_process_episode,
+            user_id=user_id,
+            item_id=str(item.id),
+            media_id=tmdb_id_val,
+            rating=progress.rating,
+            is_completed=is_completed,
+            needs_completion_check=needs_completion_check
+        )
+    else:
+        asyncio.create_task(
+            _async_post_process_episode(
+                user_id=user_id,
+                item_id=str(item.id),
+                media_id=tmdb_id_val,
+                rating=progress.rating,
+                is_completed=is_completed,
+                needs_completion_check=needs_completion_check
+            )
+        )
+
     return new_progress
 
 async def update_episode_rating(
@@ -679,7 +832,8 @@ async def update_episode_rating(
     item_id_or_tmdb_id: str,
     season_number: int,
     episode_number: int,
-    rating: Optional[float]
+    rating: Optional[float],
+    background_tasks: Optional[BackgroundTasks] = None
 ):
     try:
         user_uuid = uuid.UUID(user_id)
@@ -774,16 +928,37 @@ async def update_episode_rating(
     if item.status == "plan_to_watch":
         item.status = "watching"
 
+    media_ref = item.media
+    tmdb_id_val = media_ref.tmdb_id if media_ref else None
+
     await db.commit()
     await db.refresh(prog)
 
-    if rating is not None and item.media:
-        from app.recommendation.profile_manager import update_user_profile, calculate_episode_rating_scale
-        scale = calculate_episode_rating_scale(rating)
-        await update_user_profile(db, user_id, item, item.media, explicit_scale=scale)
+    if rating is not None and media_ref:
+        if background_tasks:
+            background_tasks.add_task(
+                _async_post_process_episode,
+                user_id=user_id,
+                item_id=str(item.id),
+                media_id=tmdb_id_val,
+                rating=rating,
+                is_completed=False,
+                needs_completion_check=False
+            )
+        else:
+            asyncio.create_task(
+                _async_post_process_episode(
+                    user_id=user_id,
+                    item_id=str(item.id),
+                    media_id=tmdb_id_val,
+                    rating=rating,
+                    is_completed=False,
+                    needs_completion_check=False
+                )
+            )
 
-    if item.media:
-        tv_status_cache.delete_prefix(f"tv_status:{item.media.tmdb_id}")
+    if tmdb_id_val:
+        tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
 
     return prog
 
@@ -816,14 +991,18 @@ async def remove_episode_progress(db: AsyncSession, user_id: str, item_id: str, 
     except ValueError:
         return False
 
+    from sqlalchemy.orm import selectinload
     # Verify if the item belongs to the user
     result = await db.execute(
         select(UserListItem)
         .where(UserListItem.id == item_uuid, UserListItem.user_id == user_uuid)
+        .options(selectinload(UserListItem.media))
     )
     item = result.scalars().first()
     if not item:
         return False
+
+    tmdb_id_val = item.media.tmdb_id if item.media else None
 
     prog_result = await db.execute(
         select(UserEpisodeProgress)
@@ -837,13 +1016,20 @@ async def remove_episode_progress(db: AsyncSession, user_id: str, item_id: str, 
     if existing:
         await db.delete(existing)
         await db.commit()
-        if item.media:
-            tv_status_cache.delete_prefix(f"tv_status:{item.media.tmdb_id}")
+        if tmdb_id_val:
+            tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
+        invalidate_user_stats_cache(user_id)
         return True
     
     return False
 
-async def bulk_mark_episodes(db: AsyncSession, user_id: str, item_id: str, target: UserEpisodeProgressCreate):
+async def bulk_mark_episodes(
+    db: AsyncSession, 
+    user_id: str, 
+    item_id: str, 
+    target: UserEpisodeProgressCreate,
+    background_tasks: Optional[BackgroundTasks] = None
+):
     try:
         item_uuid = uuid.UUID(item_id)
         user_uuid = uuid.UUID(user_id)
@@ -887,7 +1073,7 @@ async def bulk_mark_episodes(db: AsyncSession, user_id: str, item_id: str, targe
                         else:
                             has_unreleased = True
             except Exception as e:
-                print(f"Failed to fetch season {season.season_number} details in bulk_mark: {e}")
+                logger.warning(f"Failed to fetch season {season.season_number} details in bulk_mark: {e}")
                 if not (season.air_date and not is_date_released(season.air_date)):
                     for ep_num in range(1, max_ep + 1):
                         if (season.season_number, ep_num) not in existing_map:
@@ -912,15 +1098,31 @@ async def bulk_mark_episodes(db: AsyncSession, user_id: str, item_id: str, targe
             item.status = "watching"
             
         media_ref = item.media
+        tmdb_id_val = media_ref.tmdb_id if media_ref else None
+
         await db.commit()
         await db.refresh(item)
-        
-        # Trigger Profile Update with completion boost
-        from app.recommendation.profile_manager import update_user_profile
-        completion_boost = 1.5 if is_completed else None
+
+        # Trigger Profile Update in background
         if media_ref:
-            await update_user_profile(db, user_id, item, media_ref, explicit_scale=completion_boost)
-            tv_status_cache.delete_prefix(f"tv_status:{media_ref.tmdb_id}")
+            if background_tasks:
+                background_tasks.add_task(
+                    _async_post_process_bulk,
+                    user_id=user_id,
+                    item_id=str(item.id),
+                    is_completed=is_completed
+                )
+            else:
+                asyncio.create_task(
+                    _async_post_process_bulk(
+                        user_id=user_id,
+                        item_id=str(item.id),
+                        is_completed=is_completed
+                    )
+                )
+
+        if tmdb_id_val:
+            tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
         invalidate_user_stats_cache(user_id)
     return True
 
