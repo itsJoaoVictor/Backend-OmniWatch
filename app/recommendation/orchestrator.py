@@ -75,6 +75,9 @@ async def fetch_discover_candidates(user_vector: Dict[str, float], db=None, user
                             if _name and _gid:
                                 live_genre_name_to_id[_name] = _gid
 
+                is_fav = getattr(list_item, "is_favorite", False)
+                fav_boost = 2.5 if is_fav else 1.0
+
                 if media.cast_ids:
                     for entry in media.cast_ids:
                         person_id = entry.get("person_id")
@@ -84,7 +87,7 @@ async def fetch_discover_candidates(user_vector: Dict[str, float], db=None, user
                         feature_key = f"cast_{name.lower()}"
                         signal = user_vector.get(feature_key, 0.0)
                         if signal > 0:
-                            cast_person_scores[person_id] = cast_person_scores.get(person_id, 0.0) + signal
+                            cast_person_scores[person_id] = cast_person_scores.get(person_id, 0.0) + (signal * fav_boost)
 
                 if media.crew_ids:
                     for entry in media.crew_ids:
@@ -95,7 +98,7 @@ async def fetch_discover_candidates(user_vector: Dict[str, float], db=None, user
                         feature_key = f"director_{name.lower()}"
                         signal = user_vector.get(feature_key, 0.0)
                         if signal > 0:
-                            crew_person_scores[person_id] = crew_person_scores.get(person_id, 0.0) + signal
+                            crew_person_scores[person_id] = crew_person_scores.get(person_id, 0.0) + (signal * fav_boost)
         except Exception:
             pass
             
@@ -657,6 +660,9 @@ async def get_personalized_recommendations(
             target_persona=matched_persona,
             fallback_tags=top_tags,
         )
+        if any(t.startswith("❤️") for t in c["match_tags"]):
+            c["match_score"] = min(100.0, round(c["match_score"] + 4.0, 1))
+
         scored_candidates.append(c)
 
     # 5. Aplica Reranking Garantindo Divisão 50/50 Exata

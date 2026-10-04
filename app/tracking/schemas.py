@@ -8,6 +8,7 @@ class UserListItemBase(BaseModel):
     status: Optional[str] = "plan_to_watch"
     rating: Optional[float] = None
     rewatch_count: Optional[int] = 0
+    is_favorite: Optional[bool] = False
 
 class UserListItemCreate(UserListItemBase):
     tmdb_id: int
@@ -24,6 +25,7 @@ class UserListItemUpdate(BaseModel):
     status: Optional[str] = None
     rating: Optional[float] = None
     rewatch_count: Optional[int] = None
+    is_favorite: Optional[bool] = None
 
 class NextEpisodeInfo(BaseModel):
     season_number: int

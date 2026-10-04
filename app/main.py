@@ -25,9 +25,13 @@ from app.images.router import router as images_router
 
 from app.recommendation.service import run_recommendations_daily_sync_loop
 from app.core.rate_limit import limiter
+from app.core.auto_migrate import run_auto_migrations
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Aplica migrações do banco de dados automaticamente no startup
+    await run_auto_migrations()
+
     # Sincroniza e migra títulos futuros para 'upcoming' automaticamente no startup
     await migrate_existing_future_media()
 
@@ -59,6 +63,7 @@ origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https://.*(\.vercel\.app|joaovictorguimaraes-dev\.com\.br)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

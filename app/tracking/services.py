@@ -101,7 +101,14 @@ async def get_user_list(db: AsyncSession, user_id: str):
         .where(UserListItem.user_id == target_uuid)
         .options(selectinload(UserListItem.media))
     )
-    items = result.scalars().all()
+    all_items = result.scalars().all()
+    # Ignora itens órfãos (sem mídia associada), que quebrariam a serialização (HTTP 500)
+    items = [item for item in all_items if item.media is not None]
+    if len(items) != len(all_items):
+        logger.warning(
+            "get_user_list: %d item(ns) sem mídia ignorado(s) para o usuário %s",
+            len(all_items) - len(items), user_id
+        )
 
     # Autocorreção transparente e em tempo real dos status upcoming / plan_to_watch
     # Utiliza apenas dados já existentes no banco (zero requisições de rede)
@@ -323,10 +330,22 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
     )
     existing_item = result.scalars().first()
     if existing_item:
+        changed = False
         if existing_item.status != final_status:
             existing_item.status = final_status
-            if item.rating is not None:
-                existing_item.rating = item.rating
+            changed = True
+            if existing_item.status not in ["watching", "completed"] and existing_item.is_favorite:
+                existing_item.is_favorite = False
+        if item.rating is not None and existing_item.rating != item.rating:
+            existing_item.rating = item.rating
+            changed = True
+        if item.is_favorite is not None:
+            new_fav = bool(item.is_favorite) and final_status in ["watching", "completed"]
+            if existing_item.is_favorite != new_fav:
+                existing_item.is_favorite = new_fav
+                changed = True
+        
+        if changed:
             await db.commit()
             await db.refresh(existing_item)
             from app.recommendation.profile_manager import update_user_profile
@@ -347,12 +366,14 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
             existing_item.next_episode = next_ep
         return existing_item
 
+    initial_fav = bool(item.is_favorite) if final_status in ["watching", "completed"] else False
     new_item = UserListItem(
         user_id=uuid.UUID(user_id),
         media_id=media.id,
         status=final_status,
         rating=item.rating,
-        rewatch_count=item.rewatch_count
+        rewatch_count=item.rewatch_count,
+        is_favorite=initial_fav
     )
     db.add(new_item)
     await db.commit()
@@ -520,9 +541,26 @@ async def update_list_item(
         else:
             item.status = update_data.status
 
+        # Regra de negócio: se mudou status para fora de 'watching'/'completed', automaticamente desfavorita
+        if item.status not in ["watching", "completed"] and item.is_favorite:
+            item.is_favorite = False
+
         # Regra de negócio: se foi para plan_to_watch ou upcoming sem nota explícita, limpa nota
         if item.status in ["plan_to_watch", "upcoming"] and update_data.rating is None:
             item.rating = None
+
+    # Tratamento de Favoritos
+    if update_data.is_favorite is not None:
+        if update_data.is_favorite:
+            if item.status not in ["watching", "completed"]:
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=400,
+                    detail="Apenas mídias com status 'Assistindo' ou 'Assistido' podem ser favoritadas."
+                )
+            item.is_favorite = True
+        else:
+            item.is_favorite = False
 
     # Resolução de corrida e nota:
     # Se recebeu nota e o item estava em 'plan_to_watch' ou 'upcoming' (sem status explícito no payload),

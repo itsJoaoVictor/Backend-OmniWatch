@@ -232,22 +232,27 @@ def build_rich_explanation_tags(
             if not media or not media.embedding or not media.title:
                 continue
 
-            # Prioriza obras com boa avaliação ou completadas
+            # Prioriza obras com boa avaliação, completadas ou favoritadas
             rating = getattr(item, "rating", None) or 0.0
             status = getattr(item, "status", "")
-            if rating < 3.5 and status != "completed":
+            is_fav = getattr(item, "is_favorite", False)
+            if rating < 3.5 and status != "completed" and not is_fav:
                 continue
 
             sim = calculate_cosine_similarity(cand_emb, media.embedding)
-            if sim > best_sim:
-                best_sim = sim
+            sim_effective = sim * (1.25 if is_fav else 1.0)
+            if sim_effective > best_sim:
+                best_sim = sim_effective
                 best_item = item
 
         # Se houver uma obra com afinidade semântica expressiva (>= 0.65)
         if best_item and best_sim >= 0.65:
             m_title = best_item.media.title
             m_rating = getattr(best_item, "rating", None)
-            if m_rating and m_rating >= 4.5:
+            is_fav = getattr(best_item, "is_favorite", False)
+            if is_fav:
+                rich_tags.append(f'❤️ Porque você favoritou "{m_title}"')
+            elif m_rating and m_rating >= 4.5:
                 rich_tags.append(f'🍿 Porque você deu {m_rating:.0f}★ em "{m_title}"')
             elif m_rating and m_rating >= 4.0:
                 rich_tags.append(f'🍿 Porque você curtiu "{m_title}"')

@@ -113,16 +113,21 @@ async def update_user_profile(
         action_date = None
         rating_val = None
         status_val = None
+        is_favorite_val = False
         if list_item:
             try:
                 action_date = list_item.updated_at or list_item.created_at
                 rating_val = list_item.rating
                 status_val = list_item.status
+                is_favorite_val = getattr(list_item, "is_favorite", False)
             except Exception:
                 pass
         time_decay = calculate_time_decay(action_date)
         rating_scale = calculate_rating_scale(rating_val, status_val)
         
+        # Favoritos: Multiplicador de peso 2.0x conforme estratégia híbrida
+        favorite_modifier = 2.0 if is_favorite_val else 1.0
+
         # TV Show episode modifier (if media is TV)
         episode_modifier = 1.0
         try:
@@ -131,7 +136,7 @@ async def update_user_profile(
         except Exception:
             pass
 
-        final_scale = time_decay * rating_scale * episode_modifier
+        final_scale = time_decay * rating_scale * episode_modifier * favorite_modifier
     
     # Build media vector if not provided
     if media_vector is None:
