@@ -71,6 +71,6 @@ async def trigger_collection_sync(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
-    """Trigger an on-demand sync of a collection from TMDB to check for new movies."""
-    result = await sync_collection_from_tmdb(db, tmdb_id)
+    """Trigger an on-demand sync of a collection from TMDB to check for new movies and reconcile missing items."""
+    result = await sync_collection_from_tmdb(db, tmdb_id, user_id=user_id)
     return result

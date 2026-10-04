@@ -315,8 +315,8 @@ async def get_user_collections(db: AsyncSession, user_id: str) -> List[Dict[str,
     return response_list
 
 
-async def sync_collection_from_tmdb(db: AsyncSession, tmdb_collection_id: int) -> Dict[str, Any]:
-    """Sync a collection from TMDB. Detects new movies, adds to followers lists, and generates notifications."""
+async def sync_collection_from_tmdb(db: AsyncSession, tmdb_collection_id: int, user_id: Optional[str] = None) -> Dict[str, Any]:
+    """Sync a collection from TMDB. Detects new movies, adds to followers lists, reconciles missing items for user, and generates notifications."""
     col_res = await db.execute(
         select(Collection)
         .where(Collection.tmdb_id == tmdb_collection_id)
@@ -387,12 +387,56 @@ async def sync_collection_from_tmdb(db: AsyncSession, tmdb_collection_id: int) -
             except Exception as e:
                 logger.error(f"Error auto-adding part {part.id} for user {follower.user_id}: {e}")
 
+    # Reconciliação para o usuário chamador: adiciona filmes existentes da coleção que não estejam na lista
+    reconciled_count = 0
+    if user_id:
+        try:
+            target_uuid = uuid.UUID(str(user_id))
+            # Recarregar itens da coleção atualizados
+            current_items_res = await db.execute(
+                select(CollectionItem).where(CollectionItem.collection_id == collection.id)
+            )
+            all_col_items = current_items_res.scalars().all()
+
+            for item in all_col_items:
+                media_res = await db.execute(select(Media).where(Media.tmdb_id == item.tmdb_id))
+                media = media_res.scalars().first()
+
+                in_user_list = False
+                if media:
+                    uli_res = await db.execute(
+                        select(UserListItem).where(
+                            UserListItem.user_id == target_uuid,
+                            UserListItem.media_id == media.id
+                        )
+                    )
+                    if uli_res.scalars().first():
+                        in_user_list = True
+
+                if not in_user_list:
+                    create_payload = UserListItemCreate(
+                        tmdb_id=item.tmdb_id,
+                        media_type="movie",
+                        title=item.title,
+                        poster_path=item.poster_path,
+                        backdrop_path=item.backdrop_path,
+                        release_date=item.release_date,
+                        status="plan_to_watch"
+                    )
+                    saved_item = await add_to_list(db, str(user_id), create_payload)
+                    if saved_item and saved_item.media_id and not item.media_id:
+                        item.media_id = saved_item.media_id
+                    reconciled_count += 1
+        except Exception as e:
+            logger.error(f"Error during user reconciliation for collection {collection.id}: {e}")
+
     await db.commit()
 
     return {
         "success": True,
         "collection_name": collection.name,
         "new_parts_count": new_items_added,
+        "reconciled_count": reconciled_count,
         "notifications_sent": notifications_created
     }
 
