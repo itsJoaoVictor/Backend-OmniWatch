@@ -180,6 +180,9 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
         cast_ids = []
         crew_ids = []
         
+        collection_tmdb_id = None
+        collection_name = None
+        
         if not title or not runtime or not genres or not directors or not main_cast or not release_date:
             from app.details.services import fetch_movie_details, fetch_tv_details
             try:
@@ -191,6 +194,11 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
                     runtime = tmdb_data.runtime or 0
                     original_language = tmdb_data.original_language or None
                     release_date = release_date or tmdb_data.release_date
+                    if hasattr(tmdb_data, 'belongs_to_collection') and tmdb_data.belongs_to_collection:
+                        collection_tmdb_id = tmdb_data.belongs_to_collection.id
+                        collection_name = tmdb_data.belongs_to_collection.name
+                    else:
+                        collection_tmdb_id = 0
                     if not genres and tmdb_data.genres:
                         genres = [{"id": g.id, "name": g.name} for g in tmdb_data.genres]
                     if not directors and tmdb_data.credits and tmdb_data.credits.crew:
@@ -261,7 +269,9 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
             crew_ids=crew_ids if crew_ids else None,
             embedding=embedding,
             release_date=release_date,
-            runtime=runtime
+            runtime=runtime,
+            collection_tmdb_id=collection_tmdb_id,
+            collection_name=collection_name
         )
         media = await create_media(db, media_create)
     else:
@@ -300,6 +310,20 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
                 if media.release_date:
                     await db.commit()
                     await db.refresh(media)
+            except Exception:
+                pass
+
+        if media.media_type == "movie" and media.collection_tmdb_id is None:
+            from app.details.services import fetch_movie_details
+            try:
+                tmdb_data = await fetch_movie_details(media.tmdb_id)
+                if tmdb_data and getattr(tmdb_data, "belongs_to_collection", None):
+                    media.collection_tmdb_id = tmdb_data.belongs_to_collection.id
+                    media.collection_name = tmdb_data.belongs_to_collection.name
+                else:
+                    media.collection_tmdb_id = 0
+                await db.commit()
+                await db.refresh(media)
             except Exception:
                 pass
 
@@ -403,7 +427,14 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
         import asyncio
         from app.images.router import ensure_image_cached
         asyncio.create_task(ensure_image_cached(saved_item.media.poster_path, "w342"))
-    
+    # Dispara sugestões de coleções em segundo plano se for filme
+    if saved_item and saved_item.media and saved_item.media.media_type == "movie":
+        try:
+            from app.media_collections.services import schedule_collection_suggestions_scan
+            schedule_collection_suggestions_scan(str(user_id))
+        except Exception:
+            pass
+
     invalidate_user_stats_cache(user_id)
     return saved_item
 
@@ -616,6 +647,7 @@ async def remove_from_list(db: AsyncSession, user_id: str, item_id: str):
     )
     item = result.scalars().first()
     if item:
+        is_movie = bool(item.media and item.media.media_type == "movie")
         # Fase 3: Feedback Implícito - sinal negativo (-0.5) ao remover item da lista
         if item.media:
             from app.recommendation.profile_manager import update_user_profile
@@ -624,6 +656,12 @@ async def remove_from_list(db: AsyncSession, user_id: str, item_id: str):
         await db.delete(item)
         await db.commit()
         invalidate_user_stats_cache(user_id)
+        if is_movie:
+            try:
+                from app.media_collections.services import schedule_collection_suggestions_scan
+                schedule_collection_suggestions_scan(str(user_id))
+            except Exception:
+                pass
         return True
     return False
 

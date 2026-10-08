@@ -47,3 +47,19 @@ class UserCollectionDetailResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class CollectionSuggestionResponse(BaseModel):
+    id: UUID4
+    tmdb_id: int
+    name: str
+    overview: Optional[str] = None
+    poster_path: Optional[str] = None
+    backdrop_path: Optional[str] = None
+    total_movies: int
+    movies_in_list: int
+    matched_movie_titles: List[str] = []
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+

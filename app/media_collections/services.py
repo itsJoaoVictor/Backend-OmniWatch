@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 import logging
+import time
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
@@ -10,7 +11,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy import delete
 
 from app.core.database import AsyncSessionLocal
-from app.media_collections.models import Collection, CollectionItem, UserCollection
+from app.media_collections.models import Collection, CollectionItem, UserCollection, UserCollectionSuggestion
 from app.media.models import Media
 from app.tracking.models import UserListItem
 from app.tracking.schemas import UserListItemCreate
@@ -160,6 +161,15 @@ async def follow_collection(db: AsyncSession, user_id: str, tmdb_collection_id: 
                 movies_added += 1
             except Exception as e:
                 logger.error(f"Error adding movie {item.tmdb_id} to user list: {e}")
+
+    # Remove qualquer sugestão existente para essa coleção
+    await db.execute(
+        delete(UserCollectionSuggestion).where(
+            UserCollectionSuggestion.user_id == user_uuid,
+            UserCollectionSuggestion.collection_tmdb_id == tmdb_collection_id
+        )
+    )
+    await db.commit()
 
     return {
         "success": True,
@@ -474,3 +484,312 @@ async def run_collection_sync_loop(interval_hours: int = 24):
         except Exception as e:
             logger.error(f"Unexpected error in run_collection_sync_loop: {e}")
             await asyncio.sleep(60)
+
+
+# ==============================================================================
+# COLEÇÕES: ALERTA E SUGESTÕES EM SEGUNDO PLANO
+# ==============================================================================
+
+_user_suggestion_debounce_tasks: Dict[str, asyncio.Task] = {}
+_user_last_scanned: Dict[str, float] = {}
+
+
+async def generate_user_collection_suggestions(db: AsyncSession, user_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Identifica de forma inteligente e em segundo plano franquias/coleções das quais
+    o usuário adicionou >= 1 filme e que possuem outros filmes ainda não adicionados
+    (total_movies > movies_in_list ou total_movies >= 2), mas que ele ainda NÃO está seguindo ativamente.
+    
+    Salva/atualiza em 'user_collection_suggestions' para que o endpoint responda
+    em tempo recorde (< 5ms) sem nenhuma latência externa.
+    """
+    user_uuid = uuid.UUID(str(user_id))
+
+    # 1. Obter tmdb_ids das coleções que o usuário já segue
+    followed_stmt = (
+        select(Collection.tmdb_id)
+        .join(UserCollection, UserCollection.collection_id == Collection.id)
+        .where(UserCollection.user_id == user_uuid)
+    )
+    res_followed = await db.execute(followed_stmt)
+    followed_col_tmdb_ids = set(res_followed.scalars().all())
+
+    # 2. Obter filmes na lista do usuário
+    uli_stmt = (
+        select(UserListItem)
+        .where(UserListItem.user_id == user_uuid)
+        .options(selectinload(UserListItem.media))
+    )
+    res_uli = await db.execute(uli_stmt)
+    user_movies = [ui for ui in res_uli.scalars().all() if ui.media and ui.media.media_type == "movie"]
+
+    if not user_movies:
+        await db.execute(
+            delete(UserCollectionSuggestion).where(UserCollectionSuggestion.user_id == user_uuid)
+        )
+        await db.commit()
+        return []
+
+    # 3. Enriquecer filmes que ainda não possuem collection_tmdb_id mapeado
+    unassigned_movies = [ui for ui in user_movies if ui.media.collection_tmdb_id is None]
+    if unassigned_movies:
+        # A. Checar primeiro na tabela collection_items existente no banco (0ms de rede)
+        unassigned_tmdb_ids = [ui.media.tmdb_id for ui in unassigned_movies]
+        ci_res = await db.execute(
+            select(CollectionItem)
+            .where(CollectionItem.tmdb_id.in_(unassigned_tmdb_ids))
+            .options(selectinload(CollectionItem.collection))
+        )
+        ci_map = {ci.tmdb_id: ci for ci in ci_res.scalars().all()}
+
+        for ui in unassigned_movies:
+            if ui.media.tmdb_id in ci_map:
+                ci = ci_map[ui.media.tmdb_id]
+                ui.media.collection_tmdb_id = ci.collection.tmdb_id
+                ui.media.collection_name = ci.collection.name
+                db.add(ui.media)
+
+        await db.commit()
+
+        # B. Para os que ainda não foram identificados, buscar no cache/TMDB
+        still_unassigned = [ui for ui in unassigned_movies if ui.media.collection_tmdb_id is None]
+        if still_unassigned:
+            from app.details.services import fetch_movie_details
+            for ui in still_unassigned:
+                try:
+                    tmdb_data = await fetch_movie_details(ui.media.tmdb_id)
+                    if tmdb_data and getattr(tmdb_data, "belongs_to_collection", None):
+                        ui.media.collection_tmdb_id = tmdb_data.belongs_to_collection.id
+                        ui.media.collection_name = tmdb_data.belongs_to_collection.name
+                    else:
+                        # 0 indica que o filme foi checado e é obra independente (sem coleção)
+                        ui.media.collection_tmdb_id = 0
+                    db.add(ui.media)
+                except Exception as ex:
+                    logger.debug(f"Could not fetch movie collection for tmdb_id={ui.media.tmdb_id}: {ex}")
+
+            await db.commit()
+
+    # 4. Agrupar os filmes do usuário por collection_tmdb_id (mapeia tmdb_id -> título para evitar contagem duplicada)
+    from collections import defaultdict
+    col_to_movies: Dict[int, Dict[int, str]] = defaultdict(dict)
+    for ui in user_movies:
+        col_id = ui.media.collection_tmdb_id
+        if col_id and col_id > 0 and col_id not in followed_col_tmdb_ids:
+            col_to_movies[col_id][ui.media.tmdb_id] = ui.media.title
+
+    # 5. Filtrar e gerar sugestões
+    candidate_col_tmdb_ids = set()
+
+    for col_tmdb_id, movies_map in col_to_movies.items():
+        movie_titles = list(movies_map.values())
+        movies_in_list = len(movie_titles)
+
+        # Obter dados da coleção
+        col_res = await db.execute(select(Collection).where(Collection.tmdb_id == col_tmdb_id))
+        col = col_res.scalars().first()
+
+        name = None
+        overview = None
+        poster_path = None
+        backdrop_path = None
+        total_movies = 0
+
+        if col:
+            name = col.name
+            overview = col.overview
+            poster_path = col.poster_path
+            backdrop_path = col.backdrop_path
+            total_movies = int(col.parts_count or 0)
+        else:
+            try:
+                tmdb_col = await fetch_collection_details(col_tmdb_id)
+                name = tmdb_col.name
+                overview = tmdb_col.overview
+                poster_path = tmdb_col.poster_path
+                backdrop_path = tmdb_col.backdrop_path
+                total_movies = len(tmdb_col.parts) if tmdb_col.parts else 0
+            except Exception as e:
+                logger.warning(f"Failed to fetch collection details for {col_tmdb_id}: {e}")
+                continue
+
+        # Regra de sugestão (Opção 2 - Sugerir com >= 1 filme):
+        # Qualquer filme adicionado (movies_in_list >= 1) que pertença a uma coleção oficial
+        # com outros filmes pendentes (total_movies > movies_in_list ou total_movies >= 2 ou total_movies == 0)
+        # e que o usuário ainda não siga.
+        is_candidate = (movies_in_list >= 1) and (
+            total_movies > movies_in_list or total_movies >= 2 or total_movies == 0
+        )
+
+        if not is_candidate:
+            continue
+
+        candidate_col_tmdb_ids.add(col_tmdb_id)
+
+        # Checar se já existe sugestão registrada para este usuário
+        sugg_res = await db.execute(
+            select(UserCollectionSuggestion).where(
+                UserCollectionSuggestion.user_id == user_uuid,
+                UserCollectionSuggestion.collection_tmdb_id == col_tmdb_id
+            )
+        )
+        existing_sugg = sugg_res.scalars().first()
+
+        if existing_sugg:
+            existing_sugg.name = name or existing_sugg.name
+            existing_sugg.overview = overview or existing_sugg.overview
+            existing_sugg.poster_path = poster_path or existing_sugg.poster_path
+            existing_sugg.backdrop_path = backdrop_path or existing_sugg.backdrop_path
+            existing_sugg.total_movies = total_movies
+            existing_sugg.movies_in_list = movies_in_list
+            existing_sugg.matched_movie_titles = movie_titles
+            db.add(existing_sugg)
+        else:
+            new_sugg = UserCollectionSuggestion(
+                user_id=user_uuid,
+                collection_tmdb_id=col_tmdb_id,
+                name=name or f"Coleção #{col_tmdb_id}",
+                overview=overview,
+                poster_path=poster_path,
+                backdrop_path=backdrop_path,
+                total_movies=total_movies,
+                movies_in_list=movies_in_list,
+                matched_movie_titles=movie_titles,
+                is_dismissed=False
+            )
+            db.add(new_sugg)
+
+    # 6. Remover sugestões que agora pertencem a coleções seguidas ou que não são mais candidatas
+    all_user_suggs_res = await db.execute(
+        select(UserCollectionSuggestion).where(UserCollectionSuggestion.user_id == user_uuid)
+    )
+    all_user_suggs = all_user_suggs_res.scalars().all()
+    for sugg in all_user_suggs:
+        if sugg.collection_tmdb_id in followed_col_tmdb_ids or sugg.collection_tmdb_id not in candidate_col_tmdb_ids:
+            await db.delete(sugg)
+
+    await db.commit()
+
+    return await get_user_collection_suggestions(db, str(user_id), limit=limit)
+
+
+async def get_user_collection_suggestions(db: AsyncSession, user_id: str, limit: Optional[int] = 5) -> List[Dict[str, Any]]:
+    """
+    Retorna instantaneamente (< 5ms) todas as sugestões ativas e não dispensadas do usuário,
+    com limite configurável de 3 a 5 sugestões (padrão 5) ordenadas por relevância e data.
+    """
+    user_uuid = uuid.UUID(str(user_id))
+    stmt = (
+        select(UserCollectionSuggestion)
+        .where(
+            UserCollectionSuggestion.user_id == user_uuid,
+            UserCollectionSuggestion.is_dismissed == False
+        )
+        .order_by(
+            UserCollectionSuggestion.movies_in_list.desc(),
+            UserCollectionSuggestion.created_at.desc()
+        )
+    )
+    if limit is not None and limit > 0:
+        stmt = stmt.limit(limit)
+
+    res = await db.execute(stmt)
+    records = res.scalars().all()
+
+    return [
+        {
+            "id": r.id,
+            "tmdb_id": r.collection_tmdb_id,
+            "name": r.name,
+            "overview": r.overview,
+            "poster_path": r.poster_path,
+            "backdrop_path": r.backdrop_path,
+            "total_movies": r.total_movies,
+            "movies_in_list": r.movies_in_list,
+            "matched_movie_titles": r.matched_movie_titles or [],
+            "created_at": r.created_at
+        }
+        for r in records
+    ]
+
+
+async def dismiss_collection_suggestion(db: AsyncSession, user_id: str, collection_tmdb_id: int) -> bool:
+    """Dispensar sugestão de coleção para que não reapareça para o usuário."""
+    user_uuid = uuid.UUID(str(user_id))
+    stmt = (
+        select(UserCollectionSuggestion)
+        .where(
+            UserCollectionSuggestion.user_id == user_uuid,
+            UserCollectionSuggestion.collection_tmdb_id == collection_tmdb_id
+        )
+    )
+    res = await db.execute(stmt)
+    sugg = res.scalars().first()
+    if not sugg:
+        return False
+    sugg.is_dismissed = True
+    await db.commit()
+    return True
+
+
+def schedule_collection_suggestions_scan(user_id: str, debounce_seconds: int = 4) -> None:
+    """Agenda a verificação de sugestões em segundo plano com debounce inteligente."""
+    user_id_str = str(user_id)
+    if user_id_str in _user_suggestion_debounce_tasks:
+        task = _user_suggestion_debounce_tasks.pop(user_id_str)
+        if not task.done():
+            task.cancel()
+
+    async def _runner():
+        try:
+            if debounce_seconds > 0:
+                await asyncio.sleep(debounce_seconds)
+            logger.info(f"[COLLECTION-SUGGESTIONS] Executando scan em background para usuário {user_id_str}...")
+            async with AsyncSessionLocal() as session:
+                await generate_user_collection_suggestions(session, user_id_str)
+            _user_last_scanned[user_id_str] = time.time()
+            logger.info(f"[COLLECTION-SUGGESTIONS] Scan finalizado para usuário {user_id_str}.")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[COLLECTION-SUGGESTIONS] Erro no scan para {user_id_str}: {e}")
+        finally:
+            if _user_suggestion_debounce_tasks.get(user_id_str) is asyncio.current_task():
+                _user_suggestion_debounce_tasks.pop(user_id_str, None)
+
+    _user_suggestion_debounce_tasks[user_id_str] = asyncio.create_task(_runner())
+
+
+async def scan_all_users_collection_suggestions():
+    """Varredura periódica de todos os usuários cadastrados."""
+    try:
+        from app.users.models import User
+        async with AsyncSessionLocal() as db:
+            users_res = await db.execute(select(User.id))
+            user_ids = [str(uid) for uid in users_res.scalars().all()]
+
+        logger.info(f"[COLLECTION-SUGGESTIONS] Iniciando varredura para {len(user_ids)} usuários...")
+        for uid in user_ids:
+            try:
+                async with AsyncSessionLocal() as session:
+                    await generate_user_collection_suggestions(session, uid)
+            except Exception as ex:
+                logger.error(f"[COLLECTION-SUGGESTIONS] Erro ao escanear coleções para {uid}: {ex}")
+        logger.info("[COLLECTION-SUGGESTIONS] Varredura periódica concluída com sucesso.")
+    except Exception as e:
+        logger.error(f"[COLLECTION-SUGGESTIONS] Falha na rotina scan_all_users_collection_suggestions: {e}")
+
+
+async def run_collection_suggestions_loop(interval_hours: int = 24):
+    """Loop diário em background para manter sugestões de coleções atualizadas."""
+    while True:
+        try:
+            await asyncio.sleep(interval_hours * 3600)
+            await scan_all_users_collection_suggestions()
+        except asyncio.CancelledError:
+            logger.info("Loop de sugestões de coleções cancelado.")
+            break
+        except Exception as e:
+            logger.error(f"Erro inesperado no run_collection_suggestions_loop: {e}")
+            await asyncio.sleep(60)
+

@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer, Boolean, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Column, String, DateTime, Integer, Boolean, ForeignKey, UniqueConstraint, func, JSON
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -60,3 +60,28 @@ class UserCollection(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "collection_id", name="uq_user_collection"),
     )
+
+
+class UserCollectionSuggestion(Base):
+    __tablename__ = "user_collection_suggestions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    collection_tmdb_id = Column(Integer, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    overview = Column(String, nullable=True)
+    poster_path = Column(String, nullable=True)
+    backdrop_path = Column(String, nullable=True)
+    total_movies = Column(Integer, default=0, nullable=False)
+    movies_in_list = Column(Integer, default=0, nullable=False)
+    matched_movie_titles = Column(JSON, default=list, nullable=False)
+    is_dismissed = Column(Boolean, default=False, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "collection_tmdb_id", name="uq_user_collection_suggestion"),
+    )
+
