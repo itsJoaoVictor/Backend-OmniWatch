@@ -308,6 +308,10 @@ async def get_user_collections(db: AsyncSession, user_id: str) -> List[Dict[str,
         total_movies = len(items_data)
         completion_pct = round((watched_count / total_movies) * 100, 1) if total_movies > 0 else 0.0
 
+        rated_items = [it for it in items_data if it.get("rating") is not None and it.get("rating") > 0]
+        rated_count = len(rated_items)
+        user_avg = round(sum(it["rating"] for it in rated_items) / rated_count, 2) if rated_count > 0 else None
+
         response_list.append({
             "id": col.id,
             "tmdb_id": col.tmdb_id,
@@ -318,6 +322,8 @@ async def get_user_collections(db: AsyncSession, user_id: str) -> List[Dict[str,
             "total_movies": total_movies,
             "watched_movies": watched_count,
             "completion_percentage": completion_pct,
+            "user_average_rating": user_avg,
+            "rated_movies_count": rated_count,
             "items": items_data,
             "created_at": uc.created_at
         })

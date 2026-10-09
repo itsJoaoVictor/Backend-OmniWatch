@@ -42,6 +42,8 @@ class UserCollectionDetailResponse(BaseModel):
     total_movies: int
     watched_movies: int
     completion_percentage: float
+    user_average_rating: Optional[float] = None
+    rated_movies_count: int = 0
     items: List[CollectionItemResponse] = []
     created_at: datetime
 
