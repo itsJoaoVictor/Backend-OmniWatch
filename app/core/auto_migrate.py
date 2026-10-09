@@ -97,8 +97,56 @@ async def run_auto_migrations():
                 CREATE INDEX IF NOT EXISTS ix_user_collection_suggestions_is_dismissed 
                 ON user_collection_suggestions (is_dismissed);
             """))
+            # 5. Garantia idempotente para custom_lists e custom_list_items
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS custom_lists (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    title VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    is_public BOOLEAN NOT NULL DEFAULT TRUE,
+                    is_ranked BOOLEAN NOT NULL DEFAULT FALSE,
+                    cover_backdrop_path VARCHAR(500),
+                    cover_poster_path VARCHAR(500),
+                    items_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_custom_lists_user_id ON custom_lists (user_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_custom_lists_is_public ON custom_lists (is_public);
+            """))
+
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS custom_list_items (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    list_id UUID NOT NULL REFERENCES custom_lists(id) ON DELETE CASCADE,
+                    media_id UUID REFERENCES media(id) ON DELETE SET NULL,
+                    tmdb_id INTEGER NOT NULL,
+                    media_type VARCHAR(20) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    poster_path VARCHAR(500),
+                    backdrop_path VARCHAR(500),
+                    release_date VARCHAR(50),
+                    runtime INTEGER DEFAULT 0,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    note TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    CONSTRAINT uq_custom_list_item UNIQUE (list_id, tmdb_id, media_type)
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_custom_list_items_list_id ON custom_list_items (list_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_custom_list_items_tmdb_id ON custom_list_items (tmdb_id);
+            """))
+
             await session.commit()
-            logger.info("✅ [AutoMigrate] Tabela 'user_collection_suggestions' e colunas de mídia validadas no banco de dados.")
+            logger.info("✅ [AutoMigrate] Tabelas 'custom_lists' e 'custom_list_items' validadas no banco de dados.")
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
 

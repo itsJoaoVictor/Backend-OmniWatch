@@ -1,7 +1,7 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, Field
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: str = Field(..., description="E-mail ou nome de usuário")
     password: str
     remember_me: bool = False
 

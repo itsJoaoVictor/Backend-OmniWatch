@@ -19,6 +19,7 @@ from app.recommendation.router import router as recommendation_router
 from app.recommendation.ranker import run_ranker_training_loop
 from app.notifications.router import router as notifications_router
 from app.media_collections.router import router as collections_router
+from app.custom_lists.router import router as custom_lists_router
 from app.media_collections.services import (
     run_collection_sync_loop,
     run_collection_suggestions_loop,
@@ -83,6 +84,7 @@ app.include_router(users_router, prefix="/api/users", tags=["users"])
 app.include_router(trending_router, prefix="/api/trending", tags=["trending"])
 app.include_router(search_router, prefix="/api/search", tags=["search"])
 app.include_router(collections_router, prefix="/api")
+app.include_router(custom_lists_router, prefix="/api")
 app.include_router(details_router, prefix="/api")
 app.include_router(tracking_router, prefix="/api", tags=["tracking"])
 app.include_router(media_router, prefix="/api/media", tags=["media"])

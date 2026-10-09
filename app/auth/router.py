@@ -12,12 +12,19 @@ import asyncio
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+from sqlalchemy import func
+
 @router.post("/login", response_model=TokenResponse)
 @limiter.limit("10/minute")
 async def login(request: Request, response: Response, login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
-    email = login_data.email.lower().strip()
+    identifier = login_data.email.lower().strip()
     
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(
+        select(User).where(
+            (func.lower(User.email) == identifier) | 
+            (func.lower(User.username) == identifier)
+        )
+    )
     user = result.scalars().first()
     
     if not user:
@@ -61,7 +68,7 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
     
     return TokenResponse(
         message="Login realizado com sucesso",
-        user={"id": str(user.id), "name": user.name, "email": user.email, "role": user.role}
+        user={"id": str(user.id), "name": user.name, "email": user.email, "username": user.username, "role": user.role}
     )
 
 @router.post("/refresh")
