@@ -27,6 +27,7 @@ from app.media_collections.services import (
 )
 from app.calendar.sync import run_calendar_sync_loop, migrate_existing_future_media
 from app.images.router import router as images_router
+from app.friends.router import router as friends_router
 
 from app.recommendation.service import run_recommendations_daily_sync_loop
 from app.core.rate_limit import limiter
@@ -93,6 +94,7 @@ app.include_router(calendar_router, prefix="/api")
 app.include_router(notifications_router, prefix="/api")
 app.include_router(recommendation_router, prefix="/api/recommendations", tags=["recommendations"])
 app.include_router(images_router, prefix="/api/images", tags=["images"])
+app.include_router(friends_router, prefix="/api")
 
 @app.get("/")
 def root():

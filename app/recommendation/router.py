@@ -510,3 +510,42 @@ async def list_dismissed_recommendations_endpoint(
         logger.exception(e)
         raise HTTPException(status_code=500, detail="Erro ao listar recomendações dispensadas.")
 
+@router.get("/together")
+async def get_together_recommendations_endpoint(
+    friend_id: str = Query(..., description="ID do amigo com quem fazer o match"),
+    unseen_mode: str = Query("one", description="'one' (inédito para pelo menos 1) ou 'both' (inédito para ambos)"),
+    media_type: str = Query("all", description="'all', 'movie' ou 'tv'"),
+    genre_id: Optional[int] = Query(None, description="ID do gênero TMDB para filtrar"),
+    min_vote_average: Optional[float] = Query(None, ge=0.0, le=10.0, description="Nota mínima TMDB"),
+    limit: int = Query(30, ge=1, le=100),
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Gera recomendações conjuntas ('Assistir Juntos') combinando os gostos
+    do usuário autenticado e do amigo especificado.
+    """
+    try:
+        import uuid
+        u_uuid = uuid.UUID(current_user_id) if isinstance(current_user_id, str) else current_user_id
+        f_uuid = uuid.UUID(friend_id) if isinstance(friend_id, str) else friend_id
+
+        from app.recommendation.together_service import get_together_recommendations
+        return await get_together_recommendations(
+            db=db,
+            current_user_id=u_uuid,
+            friend_id=f_uuid,
+            unseen_mode=unseen_mode,
+            media_type=media_type,
+            genre_id=genre_id,
+            min_vote_average=min_vote_average,
+            limit=limit,
+        )
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de amigo inválido.")
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail="Erro interno ao gerar recomendações em dupla.")
+

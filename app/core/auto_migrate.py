@@ -147,6 +147,30 @@ async def run_auto_migrations():
 
             await session.commit()
             logger.info("✅ [AutoMigrate] Tabelas 'custom_lists' e 'custom_list_items' validadas no banco de dados.")
+
+            # 6. Garantia idempotente para friendships
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS friendships (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    requester_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    addressee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    CONSTRAINT uq_friendship_requester_addressee UNIQUE (requester_id, addressee_id)
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_friendships_requester_id ON friendships (requester_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_friendships_addressee_id ON friendships (addressee_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_friendships_status ON friendships (status);
+            """))
+            await session.commit()
+            logger.info("✅ [AutoMigrate] Tabela 'friendships' e índices validados no banco de dados.")
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
 
