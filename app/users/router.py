@@ -4,8 +4,19 @@ from sqlalchemy.future import select
 import logging
 import uuid
 
-from app.users.schemas import UserCreate, UserResponse, UsernameUpdate, UsernameCheckResponse
-from app.users.services import create_user, update_user_username, check_username_availability
+from app.users.schemas import (
+    UserCreate,
+    UserResponse,
+    UsernameUpdate,
+    UsernameCheckResponse,
+    PublicUserProfileResponse,
+)
+from app.users.services import (
+    create_user,
+    update_user_username,
+    check_username_availability,
+    get_public_user_profile,
+)
 from app.users.models import User
 from app.auth.dependencies import get_current_user_id
 from app.core.database import get_db
@@ -80,4 +91,20 @@ async def update_username_put(
     db: AsyncSession = Depends(get_db)
 ):
     return await update_username(request, body, current_user_id, db)
+
+@router.get("/profile/{identifier}", response_model=PublicUserProfileResponse)
+@limiter.limit("60/minute")
+async def get_user_public_profile(
+    request: Request,
+    identifier: str,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        u_uuid = uuid.UUID(current_user_id) if isinstance(current_user_id, str) else current_user_id
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de usuário inválido")
+
+    return await get_public_user_profile(db, identifier=identifier, current_user_id=u_uuid)
+
 

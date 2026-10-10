@@ -104,3 +104,172 @@ async def update_user_username(
     await db.refresh(user)
     return user
 
+async def get_public_user_profile(
+    db: AsyncSession,
+    identifier: str,
+    current_user_id: uuid.UUID
+):
+    from sqlalchemy import or_, and_
+    from app.friends.models import Friendship
+    from app.tracking.models import UserListItem
+    from app.media.models import Media
+    from app.custom_lists.models import CustomList
+    from app.users.schemas import (
+        PublicUserProfileResponse,
+        PublicUserProfileStats,
+        PublicUserProfileList,
+        PublicUserProfileFavorite,
+        PublicUserTrackedItem,
+    )
+
+    clean_id = identifier.strip().lstrip("@")
+    target_user = None
+
+    # Tenta resolver por UUID se for formato válido
+    try:
+        target_uuid = uuid.UUID(clean_id)
+        res = await db.execute(select(User).where(User.id == target_uuid))
+        target_user = res.scalar_one_or_none()
+    except (ValueError, AttributeError):
+        pass
+
+    # Se não encontrado por UUID, busca por username case-insensitive
+    if not target_user:
+        res = await db.execute(select(User).where(func.lower(User.username) == clean_id.lower()))
+        target_user = res.scalar_one_or_none()
+
+    if not target_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuário não encontrado"
+        )
+
+    # 1. Determina status de relacionamento
+    rel_status = "none"
+    f_id = None
+
+    if target_user.id == current_user_id:
+        rel_status = "self"
+    else:
+        rel_query = select(Friendship).where(
+            or_(
+                and_(Friendship.requester_id == current_user_id, Friendship.addressee_id == target_user.id),
+                and_(Friendship.addressee_id == current_user_id, Friendship.requester_id == target_user.id)
+            )
+        )
+        rel_res = await db.execute(rel_query)
+        friendship = rel_res.scalar_one_or_none()
+
+        if friendship:
+            f_id = friendship.id
+            if friendship.status == "accepted":
+                rel_status = "friends"
+            elif friendship.status == "pending":
+                if friendship.requester_id == current_user_id:
+                    rel_status = "pending_sent"
+                else:
+                    rel_status = "pending_received"
+
+    # 2. Estatísticas de consumo
+    try:
+        from app.tracking.services import get_user_statistics
+        stats_data = await get_user_statistics(db, str(target_user.id))
+    except Exception:
+        stats_data = {}
+
+    total_movies = stats_data.get("totalMovies", 0) if isinstance(stats_data, dict) else 0
+    total_episodes = stats_data.get("totalEpisodes", 0) if isinstance(stats_data, dict) else 0
+    total_time_minutes = stats_data.get("totalTime", 0) if isinstance(stats_data, dict) else 0
+    total_time_hours = round(total_time_minutes / 60, 1)
+    kpis = stats_data.get("kpis", {}) if isinstance(stats_data, dict) else {}
+    average_rating = kpis.get("averageRating", 0.0)
+    completed_count = kpis.get("completedCount", 0)
+
+    stats_obj = PublicUserProfileStats(
+        total_movies=total_movies,
+        total_episodes=total_episodes,
+        total_time_minutes=total_time_minutes,
+        total_time_hours=total_time_hours,
+        average_rating=average_rating,
+        completed_count=completed_count
+    )
+
+    # 3. Listas customizadas públicas
+    lists_res = await db.execute(
+        select(CustomList)
+        .where(
+            CustomList.user_id == target_user.id,
+            CustomList.is_public == True
+        )
+        .order_by(CustomList.created_at.desc())
+        .limit(20)
+    )
+    custom_lists_rows = lists_res.scalars().all()
+    public_lists = [
+        PublicUserProfileList.model_validate(cl)
+        for cl in custom_lists_rows
+    ]
+
+    # 4. Obras favoritas
+    fav_res = await db.execute(
+        select(UserListItem, Media)
+        .join(Media, UserListItem.media_id == Media.id)
+        .where(
+            UserListItem.user_id == target_user.id,
+            UserListItem.is_favorite == True
+        )
+        .order_by(UserListItem.updated_at.desc())
+        .limit(30)
+    )
+    fav_rows = fav_res.all()
+    favorite_media = [
+        PublicUserProfileFavorite(
+            media_id=media.id,
+            tmdb_id=media.tmdb_id,
+            media_type=media.media_type,
+            title=media.title,
+            poster_path=media.poster_path,
+            rating=item.rating
+        )
+        for item, media in fav_rows
+    ]
+
+    # 5. Obras acompanhadas (My List)
+    try:
+        from app.tracking.services import get_user_list
+        user_list_items = await get_user_list(db, str(target_user.id))
+    except Exception:
+        user_list_items = []
+
+    tracked_media = [
+        PublicUserTrackedItem(
+            id=item.id,
+            media_id=item.media_id,
+            tmdb_id=item.media.tmdb_id,
+            media_type=item.media.media_type,
+            title=item.media.title,
+            poster_path=item.media.poster_path,
+            backdrop_path=item.media.backdrop_path,
+            status=item.status,
+            rating=item.rating,
+            is_favorite=item.is_favorite,
+            last_watched_at=item.last_watched_at
+        )
+        for item in user_list_items
+        if item.media is not None
+    ]
+
+    return PublicUserProfileResponse(
+        id=target_user.id,
+        name=target_user.name,
+        username=target_user.username,
+        created_at=target_user.created_at,
+        relationship_status=rel_status,
+        friendship_id=f_id,
+        stats=stats_obj,
+        public_lists=public_lists,
+        favorite_media=favorite_media,
+        tracked_media=tracked_media
+    )
+
+

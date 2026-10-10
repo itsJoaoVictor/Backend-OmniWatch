@@ -81,3 +81,58 @@ class UserResponse(BaseModel):
 
     model_config = {'from_attributes': True}
 
+class PublicUserProfileStats(BaseModel):
+    total_movies: int = 0
+    total_episodes: int = 0
+    total_time_minutes: int = 0
+    total_time_hours: float = 0.0
+    average_rating: float = 0.0
+    completed_count: int = 0
+
+class PublicUserProfileList(BaseModel):
+    id: uuid.UUID
+    title: str
+    description: Optional[str] = None
+    is_ranked: bool = False
+    cover_poster_path: Optional[str] = None
+    cover_backdrop_path: Optional[str] = None
+    items_count: int = 0
+    created_at: datetime
+
+    model_config = {'from_attributes': True}
+
+class PublicUserProfileFavorite(BaseModel):
+    media_id: uuid.UUID
+    tmdb_id: int
+    media_type: str
+    title: str
+    poster_path: Optional[str] = None
+    rating: Optional[float] = None
+
+class PublicUserTrackedItem(BaseModel):
+    id: uuid.UUID
+    media_id: uuid.UUID
+    tmdb_id: int
+    media_type: str
+    title: str
+    poster_path: Optional[str] = None
+    backdrop_path: Optional[str] = None
+    status: str
+    rating: Optional[float] = None
+    is_favorite: bool = False
+    last_watched_at: Optional[datetime] = None
+
+class PublicUserProfileResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    username: Optional[str] = None
+    created_at: datetime
+    relationship_status: str  # 'none' | 'friends' | 'pending_sent' | 'pending_received' | 'self'
+    friendship_id: Optional[uuid.UUID] = None
+    stats: PublicUserProfileStats
+    public_lists: list[PublicUserProfileList] = []
+    favorite_media: list[PublicUserProfileFavorite] = []
+    tracked_media: list[PublicUserTrackedItem] = []
+
+
+
