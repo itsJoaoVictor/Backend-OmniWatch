@@ -76,6 +76,9 @@ async def get_together_recommendations(
     
     seen_a: set = set()
     seen_b: set = set()
+    watchlist_a: set = set()
+    watchlist_b: set = set()
+
     for row in list_items_res.all():
         u_id, tmdb_id, item_status = row[0], row[1], row[2]
         if item_status in ("completed", "watching"):
@@ -83,6 +86,13 @@ async def get_together_recommendations(
                 seen_a.add(tmdb_id)
             elif u_id == friend_id:
                 seen_b.add(tmdb_id)
+        elif item_status == "plan_to_watch":
+            if u_id == current_user_id:
+                watchlist_a.add(tmdb_id)
+            elif u_id == friend_id:
+                watchlist_b.add(tmdb_id)
+
+    in_both_watchlists = watchlist_a.intersection(watchlist_b)
 
     # RN: Recomendações Ocultadas / Dispensadas por A ou por B
     dismissed_a, dismissed_b = await asyncio.gather(
@@ -114,6 +124,34 @@ async def get_together_recommendations(
                 if cid and cid not in seen_cand_ids:
                     seen_cand_ids.add(cid)
                     all_raw_candidates.append(c)
+
+    # 4.1 Injeta mídias que estão no 'Quero Ver' de ambos os usuários para garantir que participem do ranking
+    if in_both_watchlists:
+        try:
+            shared_media_stmt = select(Media).where(Media.tmdb_id.in_(in_both_watchlists))
+            shared_media_res = await db.execute(shared_media_stmt)
+            for sm in shared_media_res.scalars().all():
+                if sm.tmdb_id not in seen_cand_ids and sm.tmdb_id not in dismissed_both:
+                    seen_cand_ids.add(sm.tmdb_id)
+                    genre_ids_list = []
+                    if sm.genres and isinstance(sm.genres, list):
+                        for g in sm.genres:
+                            if isinstance(g, dict) and "id" in g:
+                                genre_ids_list.append(g["id"])
+                    all_raw_candidates.append({
+                        "id": sm.tmdb_id,
+                        "title": sm.title,
+                        "name": sm.title if sm.media_type == "tv" else None,
+                        "media_type": sm.media_type,
+                        "poster_path": sm.poster_path,
+                        "backdrop_path": sm.backdrop_path,
+                        "genre_ids": genre_ids_list,
+                        "vote_average": 7.0,
+                        "release_date": sm.release_date,
+                        "overview": "",
+                    })
+        except Exception as e:
+            logger.warning(f"Erro ao injetar obras do Quero Ver compartilhado: {e}")
 
     # 5. Aplica filtros básicos antes do enriquecimento (tipo de mídia, gênero, nota mínima, ineditismo e ocultadas)
     filtered_candidates: List[Dict[str, Any]] = []
@@ -250,6 +288,13 @@ async def get_together_recommendations(
             elif tags_b:
                 shared_tags.append(tags_b[0])
 
+        # Priorização de obras no 'Quero Ver' de ambos os usuários
+        is_in_both_watchlists = c.get("id") in in_both_watchlists
+        if is_in_both_watchlists:
+            # Garante pontuação de destaque para o desejo mútuo explícito
+            combined_score = round(min(100.0, max(combined_score, 85.0) + 10.0), 1)
+            shared_tags.insert(0, "🎯 No Quero Ver de ambos")
+
         item_data = {
             "id": c.get("id"),
             "title": c.get("title") or c.get("name") or "Sem título",
@@ -266,11 +311,12 @@ async def get_together_recommendations(
             "match_tags": shared_tags[:3],
             "watched_by_user": c.get("_watched_by_user", False),
             "watched_by_friend": c.get("_watched_by_friend", False),
+            "in_both_watchlists": is_in_both_watchlists,
         }
         scored_items.append(item_data)
 
-    # 8. Ordena por Match Duplo decrescente
-    scored_items.sort(key=lambda x: x["match_score"], reverse=True)
+    # 8. Ordena priorizando obras no 'Quero Ver' de ambos e em seguida por Match Duplo decrescente
+    scored_items.sort(key=lambda x: (1 if x.get("in_both_watchlists") else 0, x["match_score"]), reverse=True)
 
     return {
         "friend": {
