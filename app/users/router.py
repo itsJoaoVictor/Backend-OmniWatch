@@ -10,6 +10,7 @@ from app.users.schemas import (
     UsernameUpdate,
     UsernameCheckResponse,
     PublicUserProfileResponse,
+    SeenReleaseUpdate,
 )
 from app.users.services import (
     create_user,
@@ -54,6 +55,29 @@ async def get_current_user_profile(
     user = res.scalars().first()
     if not user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    return user
+
+@router.patch("/me/seen-release", response_model=UserResponse)
+async def update_seen_release(
+    body: SeenReleaseUpdate,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        u_uuid = uuid.UUID(current_user_id) if isinstance(current_user_id, str) else current_user_id
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de usuário inválido")
+
+    res = await db.execute(select(User).where(User.id == u_uuid))
+    user = res.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+    current_seen = user.last_seen_release_id or 0
+    if body.release_id > current_seen:
+        user.last_seen_release_id = body.release_id
+        await db.commit()
+        await db.refresh(user)
     return user
 
 @router.get("/check-username", response_model=UsernameCheckResponse)
@@ -106,5 +130,6 @@ async def get_user_public_profile(
         raise HTTPException(status_code=400, detail="ID de usuário inválido")
 
     return await get_public_user_profile(db, identifier=identifier, current_user_id=u_uuid)
+
 
 

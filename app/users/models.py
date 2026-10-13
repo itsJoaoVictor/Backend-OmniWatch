@@ -19,8 +19,11 @@ class User(Base):
     embedding = Column(JSON, nullable=True)
     # V2: Personas / Multi-clusters de gosto do usuário
     taste_clusters = Column(JSON, nullable=True)
+    # Controle do último ID de novidade (Changelog / What's New) visto pelo usuário
+    last_seen_release_id = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
 
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"

@@ -169,8 +169,15 @@ async def run_auto_migrations():
             await session.execute(text("""
                 CREATE INDEX IF NOT EXISTS ix_friendships_status ON friendships (status);
             """))
+
+            # 7. Garantia idempotente para controle de novidades vistas pelo usuário (Changelog / What's New)
+            await session.execute(text("""
+                ALTER TABLE users 
+                ADD COLUMN IF NOT EXISTS last_seen_release_id INTEGER NOT NULL DEFAULT 0;
+            """))
             await session.commit()
-            logger.info("✅ [AutoMigrate] Tabela 'friendships' e índices validados no banco de dados.")
+            logger.info("✅ [AutoMigrate] Tabela 'friendships', 'last_seen_release_id' e índices validados no banco de dados.")
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
+
 

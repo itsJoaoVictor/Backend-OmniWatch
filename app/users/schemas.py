@@ -71,15 +71,20 @@ class UsernameCheckResponse(BaseModel):
     available: bool
     message: str
 
+class SeenReleaseUpdate(BaseModel):
+    release_id: int = Field(..., ge=0, description="ID da atualização/changelog visualizada pelo usuário")
+
 class UserResponse(BaseModel):
     id: uuid.UUID
     name: str
     email: EmailStr
     username: Optional[str] = None
     role: str
+    last_seen_release_id: int = 0
     created_at: datetime
 
     model_config = {'from_attributes': True}
+
 
 class PublicUserProfileStats(BaseModel):
     total_movies: int = 0
