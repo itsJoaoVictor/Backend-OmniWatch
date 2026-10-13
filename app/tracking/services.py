@@ -1091,6 +1091,8 @@ async def remove_episode_progress(db: AsyncSession, user_id: str, item_id: str, 
     existing = prog_result.scalars().first()
     if existing:
         await db.delete(existing)
+        if item.status == "completed":
+            item.status = "watching"
         await db.commit()
         if tmdb_id_val:
             tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
@@ -1098,6 +1100,170 @@ async def remove_episode_progress(db: AsyncSession, user_id: str, item_id: str, 
         return True
     
     return False
+
+async def mark_season_watched(
+    db: AsyncSession,
+    user_id: str,
+    item_id: str,
+    season_number: int,
+    background_tasks: Optional[BackgroundTasks] = None
+):
+    try:
+        item_uuid = uuid.UUID(item_id)
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return None
+
+    from sqlalchemy.orm import selectinload
+    from fastapi import HTTPException
+    result = await db.execute(
+        select(UserListItem)
+        .where(UserListItem.id == item_uuid, UserListItem.user_id == user_uuid)
+        .options(selectinload(UserListItem.media))
+    )
+    item = result.scalars().first()
+    if not item or not item.media or item.media.media_type != "tv":
+        return None
+
+    from app.details.services import fetch_tv_details, fetch_season_details
+    from app.core.utils import is_date_released
+
+    tv_data = None
+    try:
+        tv_data = await fetch_tv_details(item.media.tmdb_id)
+    except Exception:
+        pass
+
+    prog_res = await db.execute(
+        select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item_uuid)
+    )
+    existing_map = {(p.season_number, p.episode_number): p for p in prog_res.scalars().all()}
+
+    new_progresses = []
+    released_in_season = 0
+    has_unreleased_in_season = False
+
+    try:
+        season_details = await fetch_season_details(item.media.tmdb_id, season_number)
+        for ep in (season_details.episodes or []):
+            if is_date_released(ep.air_date):
+                released_in_season += 1
+                if (season_number, ep.episode_number) not in existing_map:
+                    new_progresses.append(
+                        UserEpisodeProgress(
+                            user_list_item_id=item.id,
+                            season_number=season_number,
+                            episode_number=ep.episode_number
+                        )
+                    )
+            else:
+                has_unreleased_in_season = True
+    except Exception as e:
+        logger.warning(f"Failed to fetch season {season_number} details in mark_season_watched: {e}")
+        if tv_data:
+            season_meta = next((s for s in tv_data.seasons if s.season_number == season_number), None)
+            if season_meta and (not season_meta.air_date or is_date_released(season_meta.air_date)):
+                released_in_season = season_meta.episode_count
+                for ep_num in range(1, season_meta.episode_count + 1):
+                    if (season_number, ep_num) not in existing_map:
+                        new_progresses.append(
+                            UserEpisodeProgress(
+                                user_list_item_id=item.id,
+                                season_number=season_number,
+                                episode_number=ep_num
+                            )
+                        )
+
+    if released_in_season == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A temporada {season_number} ainda não possui episódios lançados."
+        )
+
+    if new_progresses:
+        db.add_all(new_progresses)
+        item.last_watched_at = datetime.now(timezone.utc)
+
+        total_episodes_now = len(existing_map) + len(new_progresses)
+        is_completed = False
+        if tv_data:
+            is_ended = tv_data.status in ("Ended", "Canceled")
+            if is_ended and not has_unreleased_in_season and tv_data.number_of_episodes and total_episodes_now >= tv_data.number_of_episodes:
+                item.status = "completed"
+                is_completed = True
+            elif item.status == "plan_to_watch":
+                item.status = "watching"
+        elif item.status == "plan_to_watch":
+            item.status = "watching"
+
+        media_ref = item.media
+        tmdb_id_val = media_ref.tmdb_id if media_ref else None
+
+        await db.commit()
+        await db.refresh(item)
+
+        if media_ref:
+            if background_tasks:
+                background_tasks.add_task(
+                    _async_post_process_bulk,
+                    user_id=user_id,
+                    item_id=str(item.id),
+                    is_completed=is_completed
+                )
+            else:
+                asyncio.create_task(
+                    _async_post_process_bulk(
+                        user_id=user_id,
+                        item_id=str(item.id),
+                        is_completed=is_completed
+                    )
+                )
+
+        if tmdb_id_val:
+            tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
+        invalidate_user_stats_cache(user_id)
+
+    return True
+
+async def remove_season_progress(
+    db: AsyncSession,
+    user_id: str,
+    item_id: str,
+    season_number: int
+):
+    try:
+        item_uuid = uuid.UUID(item_id)
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return False
+
+    from sqlalchemy.orm import selectinload
+    from sqlalchemy import delete
+    result = await db.execute(
+        select(UserListItem)
+        .where(UserListItem.id == item_uuid, UserListItem.user_id == user_uuid)
+        .options(selectinload(UserListItem.media))
+    )
+    item = result.scalars().first()
+    if not item:
+        return False
+
+    tmdb_id_val = item.media.tmdb_id if item.media else None
+
+    await db.execute(
+        delete(UserEpisodeProgress).where(
+            UserEpisodeProgress.user_list_item_id == item_uuid,
+            UserEpisodeProgress.season_number == season_number
+        )
+    )
+    if item.status == "completed":
+        item.status = "watching"
+
+    await db.commit()
+    if tmdb_id_val:
+        tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
+    invalidate_user_stats_cache(user_id)
+    return True
 
 async def bulk_mark_episodes(
     db: AsyncSession, 

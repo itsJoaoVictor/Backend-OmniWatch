@@ -98,6 +98,33 @@ async def bulk_mark_episodes_watched(
         raise HTTPException(status_code=404, detail="Item não encontrado ou falha ao marcar em lote")
     return {"status": "ok"}
 
+@router.post("/my-list/{item_id}/progress/season/{season_number}", status_code=status.HTTP_200_OK)
+async def mark_season_episodes_watched(
+    item_id: str,
+    season_number: int,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.tracking.services import mark_season_watched
+    success = await mark_season_watched(db, user_id, item_id, season_number, background_tasks=background_tasks)
+    if not success:
+        raise HTTPException(status_code=404, detail="Item não encontrado ou falha ao marcar temporada")
+    return {"status": "ok"}
+
+@router.delete("/my-list/{item_id}/progress/season/{season_number}", status_code=status.HTTP_204_NO_CONTENT)
+async def unmark_season_episodes_watched(
+    item_id: str,
+    season_number: int,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.tracking.services import remove_season_progress
+    success = await remove_season_progress(db, user_id, item_id, season_number)
+    if not success:
+        raise HTTPException(status_code=404, detail="Progresso da temporada não encontrado ou permissão negada")
+    return None
+
 @router.get("/my-list/{item_id}/progress", response_model=List[UserEpisodeProgressResponse])
 async def get_item_episode_progress(
     item_id: str,
