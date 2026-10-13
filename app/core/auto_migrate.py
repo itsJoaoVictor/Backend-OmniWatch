@@ -175,8 +175,14 @@ async def run_auto_migrations():
                 ALTER TABLE users 
                 ADD COLUMN IF NOT EXISTS last_seen_release_id INTEGER NOT NULL DEFAULT 0;
             """))
+
+            # 8. Garantia idempotente para rewatch_count em user_episode_progress
+            await session.execute(text("""
+                ALTER TABLE user_episode_progress 
+                ADD COLUMN IF NOT EXISTS rewatch_count INTEGER NOT NULL DEFAULT 0;
+            """))
             await session.commit()
-            logger.info("✅ [AutoMigrate] Tabela 'friendships', 'last_seen_release_id' e índices validados no banco de dados.")
+            logger.info("✅ [AutoMigrate] Tabela 'friendships', 'last_seen_release_id', 'rewatch_count' e índices validados no banco de dados.")
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
 

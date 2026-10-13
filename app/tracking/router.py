@@ -7,7 +7,7 @@ from app.auth.dependencies import get_current_user_id
 from app.tracking.schemas import (
     UserListItemCreate, UserListItemUpdate, UserListItemResponse,
     UserEpisodeProgressCreate, UserEpisodeProgressResponse, UserEpisodeRatingUpdate,
-    MediaRankingResponse
+    UserEpisodeRewatchUpdate, MediaRankingResponse
 )
 from app.tracking.services import (
     get_user_list, add_to_list, update_list_item, remove_from_list, add_episode_progress
@@ -112,6 +112,23 @@ async def mark_season_episodes_watched(
         raise HTTPException(status_code=404, detail="Item não encontrado ou falha ao marcar temporada")
     return {"status": "ok"}
 
+@router.post("/my-list/{item_id}/progress/season/{season_number}/rewatch", status_code=status.HTTP_200_OK)
+async def rewatch_season_episodes(
+    item_id: str,
+    season_number: int,
+    rewatch_data: UserEpisodeRewatchUpdate,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.tracking.services import update_season_rewatch
+    result = await update_season_rewatch(
+        db, user_id, item_id, season_number, rewatch_data.rewatch_count, background_tasks=background_tasks
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Item não encontrado ou falha ao marcar temporada como reassistida")
+    return result
+
 @router.delete("/my-list/{item_id}/progress/season/{season_number}", status_code=status.HTTP_204_NO_CONTENT)
 async def unmark_season_episodes_watched(
     item_id: str,
@@ -161,6 +178,24 @@ async def rate_episode(
 ):
     from app.tracking.services import update_episode_rating
     prog = await update_episode_rating(db, user_id, item_id, season_number, episode_number, rating_data.rating, background_tasks=background_tasks)
+    if not prog:
+        raise HTTPException(status_code=404, detail="Item ou episódio não encontrado")
+    return prog
+
+@router.patch("/my-list/{item_id}/progress/{season_number}/{episode_number}/rewatch", response_model=UserEpisodeProgressResponse)
+async def rewatch_episode(
+    item_id: str,
+    season_number: int,
+    episode_number: int,
+    rewatch_data: UserEpisodeRewatchUpdate,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.tracking.services import update_episode_rewatch
+    prog = await update_episode_rewatch(
+        db, user_id, item_id, season_number, episode_number, rewatch_data.rewatch_count, background_tasks=background_tasks
+    )
     if not prog:
         raise HTTPException(status_code=404, detail="Item ou episódio não encontrado")
     return prog

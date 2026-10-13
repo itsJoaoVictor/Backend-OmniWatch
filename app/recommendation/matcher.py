@@ -202,6 +202,79 @@ NICHE_LANGUAGE_MAP: Dict[str, str] = {
     "de": "🇩🇪 Cinema Alemão",
 }
 
+def calculate_rewatch_boost(
+    candidate_vector: Dict[str, float],
+    cand_emb: Optional[List[float]],
+    user_items: Optional[List[Any]]
+) -> Tuple[float, Optional[str]]:
+    """
+    Calcula um bônus direto no Match Score (0.0 a 6.0 pontos) quando o candidato
+    possui forte afinidade semântica ou de features (gêneros/elenco/direção/temas)
+    com uma obra que o usuário reassistiu (ou reassistiu episódios).
+    Retorna (score_boost, rewatch_tag).
+    """
+    if not user_items:
+        return 0.0, None
+
+    from app.recommendation.embeddings import calculate_cosine_similarity
+    from app.recommendation.vector_builder import build_sparse_vector
+
+    best_boost = 0.0
+    best_tag = None
+
+    for item in user_items:
+        media = getattr(item, "media", None)
+        if not media or not media.title:
+            continue
+
+        rewatch_cnt = getattr(item, "rewatch_count", 0) or 0
+        episodes_list = getattr(item, "__dict__", {}).get("episodes") or []
+        ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+
+        if rewatch_cnt <= 0 and ep_rewatches <= 0:
+            continue
+
+        # 1. Similaridade Semântica (se houver embeddings)
+        sem_sim = 0.0
+        if cand_emb and getattr(media, "embedding", None):
+            sem_sim = calculate_cosine_similarity(cand_emb, media.embedding)
+
+        # 2. Afinidade de Features Esparsas (gênero, elenco, direção, keywords)
+        feat_sim = 0.0
+        if candidate_vector:
+            try:
+                item_vec = build_sparse_vector(media)
+                if item_vec:
+                    feat_sim = cosine_similarity(item_vec, candidate_vector)
+            except Exception:
+                feat_sim = 0.0
+
+        effective_sim = max(sem_sim, feat_sim * 0.90)
+        if effective_sim < 0.45:
+            continue
+
+        if rewatch_cnt > 0:
+            # Obra inteira reassistida: bônus base de 3.5 até 6.0 pontos proporcional à similaridade e nº de rewatches
+            base_pts = 3.5 + min(1.0 * (rewatch_cnt - 1), 2.5)
+            boost = round(base_pts * min(1.0, effective_sim / 0.65), 1)
+            tag = (
+                f'🔄 Porque você reassistiu "{media.title}" ({rewatch_cnt + 1}x)'
+                if rewatch_cnt > 1
+                else f'🔄 Porque você reassistiu "{media.title}"'
+            )
+        else:
+            # Episódios reassistidos individualmente: bônus moderado (até 2.5 pontos)
+            base_pts = min(2.5, 0.8 + 0.35 * ep_rewatches)
+            boost = round(base_pts * min(1.0, effective_sim / 0.65), 1)
+            tag = f'🔄 Porque você reassistiu episódios de "{media.title}"'
+
+        if boost > best_boost:
+            best_boost = boost
+            best_tag = tag if effective_sim >= 0.55 else None
+
+    return best_boost, best_tag
+
+
 def build_rich_explanation_tags(
     candidate: Dict[str, Any],
     user_vector: Dict[str, float],
@@ -212,7 +285,7 @@ def build_rich_explanation_tags(
 ) -> List[str]:
     """
     Gera tags de explicabilidade ricas, humanas e contextuais para a recomendação:
-    1. 'Porque você curtiu [Obra X]' (conexão semântica com itens avaliados com nota alta)
+    1. 'Porque você curtiu / favoritou / reassistiu [Obra X]' (conexão semântica com itens de alto peso)
     2. Talentos de destaque (Diretor ou Ator favorito)
     3. Associação com Persona do usuário ('Para sua faceta Explorador Sci-Fi')
     4. Microtemas / Vibe da obra (Viagem no tempo, Distopia, etc.)
@@ -232,15 +305,25 @@ def build_rich_explanation_tags(
             if not media or not media.embedding or not media.title:
                 continue
 
-            # Prioriza obras com boa avaliação, completadas ou favoritadas
+            # Prioriza obras com boa avaliação, completadas, favoritadas ou reassistidas
             rating = getattr(item, "rating", None) or 0.0
             status = getattr(item, "status", "")
             is_fav = getattr(item, "is_favorite", False)
-            if rating < 3.5 and status != "completed" and not is_fav:
+            rewatch_cnt = getattr(item, "rewatch_count", 0) or 0
+            episodes_list = getattr(item, "__dict__", {}).get("episodes") or []
+            ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+
+            if rating < 3.5 and status != "completed" and not is_fav and rewatch_cnt <= 0 and ep_rewatches <= 0:
                 continue
 
             sim = calculate_cosine_similarity(cand_emb, media.embedding)
-            sim_effective = sim * (1.25 if is_fav else 1.0)
+            fav_mult = 1.25 if is_fav else 1.0
+            rewatch_mult = (
+                (1.25 + min(0.10 * (rewatch_cnt - 1), 0.25))
+                if rewatch_cnt > 0
+                else (1.12 if ep_rewatches > 0 else 1.0)
+            )
+            sim_effective = sim * fav_mult * rewatch_mult
             if sim_effective > best_sim:
                 best_sim = sim_effective
                 best_item = item
@@ -250,8 +333,18 @@ def build_rich_explanation_tags(
             m_title = best_item.media.title
             m_rating = getattr(best_item, "rating", None)
             is_fav = getattr(best_item, "is_favorite", False)
-            if is_fav:
+            rewatch_cnt = getattr(best_item, "rewatch_count", 0) or 0
+            episodes_list = getattr(best_item, "__dict__", {}).get("episodes") or []
+            ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+
+            if is_fav and rewatch_cnt > 0:
+                rich_tags.append(f'❤️🔄 Porque você favoritou e reassistiu "{m_title}"')
+            elif is_fav:
                 rich_tags.append(f'❤️ Porque você favoritou "{m_title}"')
+            elif rewatch_cnt > 0:
+                rich_tags.append(f'🔄 Porque você reassistiu "{m_title}"')
+            elif ep_rewatches >= 2:
+                rich_tags.append(f'🔄 Porque você reassistiu episódios de "{m_title}"')
             elif m_rating and m_rating >= 4.5:
                 rich_tags.append(f'🍿 Porque você deu {m_rating:.0f}★ em "{m_title}"')
             elif m_rating and m_rating >= 4.0:

@@ -76,7 +76,17 @@ async def fetch_discover_candidates(user_vector: Dict[str, float], db=None, user
                                 live_genre_name_to_id[_name] = _gid
 
                 is_fav = getattr(list_item, "is_favorite", False)
+                rewatch_cnt = getattr(list_item, "rewatch_count", 0) or 0
+                episodes_list = getattr(list_item, "__dict__", {}).get("episodes") or []
+                ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+
                 fav_boost = 2.5 if is_fav else 1.0
+                rewatch_boost = (
+                    (1.5 + min(0.35 * (rewatch_cnt - 1), 1.0))
+                    if rewatch_cnt > 0
+                    else (1.25 if ep_rewatches > 0 else 1.0)
+                )
+                combined_boost = fav_boost * rewatch_boost
 
                 if media.cast_ids:
                     for entry in media.cast_ids:
@@ -87,7 +97,7 @@ async def fetch_discover_candidates(user_vector: Dict[str, float], db=None, user
                         feature_key = f"cast_{name.lower()}"
                         signal = user_vector.get(feature_key, 0.0)
                         if signal > 0:
-                            cast_person_scores[person_id] = cast_person_scores.get(person_id, 0.0) + (signal * fav_boost)
+                            cast_person_scores[person_id] = cast_person_scores.get(person_id, 0.0) + (signal * combined_boost)
 
                 if media.crew_ids:
                     for entry in media.crew_ids:
@@ -98,7 +108,7 @@ async def fetch_discover_candidates(user_vector: Dict[str, float], db=None, user
                         feature_key = f"director_{name.lower()}"
                         signal = user_vector.get(feature_key, 0.0)
                         if signal > 0:
-                            crew_person_scores[person_id] = crew_person_scores.get(person_id, 0.0) + (signal * fav_boost)
+                            crew_person_scores[person_id] = crew_person_scores.get(person_id, 0.0) + (signal * combined_boost)
         except Exception:
             pass
             
@@ -650,7 +660,7 @@ async def get_personalized_recommendations(
         c["match_score"] = final_score
 
         # Gera explicações ricas, persuasivas e humanas (Item-to-item, Talento, Persona, Microtemas)
-        from app.recommendation.matcher import build_rich_explanation_tags
+        from app.recommendation.matcher import build_rich_explanation_tags, calculate_rewatch_boost
         matched_persona = next((p for p in active_personas if p.get("id") == c.get("_best_persona_id")), None) if active_personas else None
         c["match_tags"] = build_rich_explanation_tags(
             candidate=c,
@@ -662,6 +672,12 @@ async def get_personalized_recommendations(
         )
         if any(t.startswith("❤️") for t in c["match_tags"]):
             c["match_score"] = min(100.0, round(c["match_score"] + 4.0, 1))
+
+        rewatch_boost_pts, rewatch_tag = calculate_rewatch_boost(candidate_vector, cand_emb, user_list)
+        if rewatch_boost_pts > 0:
+            c["match_score"] = min(100.0, round(c["match_score"] + rewatch_boost_pts, 1))
+            if rewatch_tag and not any("reassistiu" in t for t in c["match_tags"]):
+                c["match_tags"] = ([rewatch_tag] + c["match_tags"])[:3]
 
         scored_candidates.append(c)
 
@@ -984,13 +1000,18 @@ async def get_upcoming_recommendations(
 
         c["match_score"] = final_score
 
-        from app.recommendation.matcher import build_rich_explanation_tags
+        from app.recommendation.matcher import build_rich_explanation_tags, calculate_rewatch_boost
         c["match_tags"] = build_rich_explanation_tags(
             candidate=c,
             user_vector=user_vector or {},
             user_items=user_list,
             fallback_tags=top_tags,
         )
+        rewatch_boost_pts, rewatch_tag = calculate_rewatch_boost(candidate_vector, None, user_list)
+        if rewatch_boost_pts > 0:
+            c["match_score"] = min(100.0, round(c["match_score"] + rewatch_boost_pts, 1))
+            if rewatch_tag and not any("reassistiu" in t for t in c["match_tags"]):
+                c["match_tags"] = ([rewatch_tag] + c["match_tags"])[:3]
 
         if c.get("media_type") == "movie":
             scored_movies.append(c)

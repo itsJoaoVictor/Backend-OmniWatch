@@ -125,12 +125,35 @@ def generate_persona_metadata(cluster_media: List[Any]) -> Dict[str, Any]:
         "top_genres": top_genres
     }
 
-def build_cluster_feature_vector(cluster_media: List[Any]) -> Dict[str, float]:
+def _get_cluster_item_weight(list_item: Any) -> float:
+    """
+    Calcula o peso de uma obra na formação da Persona (cluster):
+    Obras favoritadas e/ou reassistidas (incluindo episódios reassistidos) têm peso maior
+    no centroide semântico e no vetor de features da Persona.
+    """
+    w = 1.0
+    if getattr(list_item, "is_favorite", False):
+        w *= 1.8
+    rewatch_cnt = getattr(list_item, "rewatch_count", 0) or 0
+    if rewatch_cnt > 0:
+        w *= (1.5 + min(0.25 * (rewatch_cnt - 1), 0.75))
+    else:
+        episodes_list = getattr(list_item, "__dict__", {}).get("episodes") or []
+        ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+        if ep_rewatches > 0:
+            w *= (1.0 + min(0.08 * ep_rewatches, 0.40))
+    rating = getattr(list_item, "rating", None)
+    if rating is not None and rating >= 4.5:
+        w *= 1.2
+    return w
+
+def build_cluster_feature_vector(cluster_media: List[Any], weights: Optional[List[float]] = None) -> Dict[str, float]:
     cluster_vec: Dict[str, float] = {}
-    for media in cluster_media:
+    for idx, media in enumerate(cluster_media):
+        w = weights[idx] if (weights and idx < len(weights)) else 1.0
         m_vec = build_sparse_vector(media)
         for k, v in m_vec.items():
-            cluster_vec[k] = cluster_vec.get(k, 0.0) + v
+            cluster_vec[k] = cluster_vec.get(k, 0.0) + (v * w)
 
     if cluster_vec:
         max_val = max(cluster_vec.values())
@@ -478,17 +501,21 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
         if not indices:
             continue
 
-        cluster_media = [items_with_emb[i].media for i in indices]
+        cluster_items = [items_with_emb[i] for i in indices]
+        cluster_media = [it.media for it in cluster_items]
+        item_weights = [_get_cluster_item_weight(it) for it in cluster_items]
         meta = generate_persona_metadata(cluster_media)
 
         cluster_embs = embeddings[indices]
-        centroid_vec = np.mean(cluster_embs, axis=0)
+        centroid_vec = np.average(cluster_embs, axis=0, weights=item_weights)
         norm = np.linalg.norm(centroid_vec)
         if norm > 0:
             centroid_vec = centroid_vec / norm
 
-        feature_vector = build_cluster_feature_vector(cluster_media)
-        sample_titles = [m.title for m in cluster_media[:5]]
+        feature_vector = build_cluster_feature_vector(cluster_media, weights=item_weights)
+        # Prioriza obras reassistidas/favoritadas nos exemplos da Persona
+        sorted_for_sample = sorted(cluster_items, key=lambda it: _get_cluster_item_weight(it), reverse=True)
+        sample_titles = [it.media.title for it in sorted_for_sample[:5]]
 
         candidate_cluster = {
             "id": f"persona_{cluster_idx}",

@@ -35,6 +35,7 @@ class UserEpisodeProgress(Base):
     season_number = Column(Integer, nullable=False)
     episode_number = Column(Integer, nullable=False)
     rating = Column(Float, nullable=True)
+    rewatch_count = Column(Integer, default=0, nullable=False)
     watched_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user_list_item = relationship("UserListItem", back_populates="episodes")

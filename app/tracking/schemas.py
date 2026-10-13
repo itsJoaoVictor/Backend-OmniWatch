@@ -52,9 +52,13 @@ class UserEpisodeProgressCreate(BaseModel):
     season_number: int
     episode_number: int
     rating: Optional[float] = None
+    rewatch_count: Optional[int] = 0
 
 class UserEpisodeRatingUpdate(BaseModel):
     rating: Optional[float] = None
+
+class UserEpisodeRewatchUpdate(BaseModel):
+    rewatch_count: int = 1
 
 class UserEpisodeProgressResponse(BaseModel):
     id: UUID
@@ -62,6 +66,7 @@ class UserEpisodeProgressResponse(BaseModel):
     season_number: int
     episode_number: int
     rating: Optional[float] = None
+    rewatch_count: int = 0
     watched_at: datetime
 
     class Config:

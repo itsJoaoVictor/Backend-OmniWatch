@@ -1,4 +1,4 @@
-﻿import uuid
+import uuid
 from typing import List, Dict, Any, Set, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -165,7 +165,10 @@ async def fetch_collaborative_candidates(
         peer_sim = user_weight_map.get(str(item.user_id), 0.5)
         # Nota relativa (ou 0.8 se não tiver nota explícita mas estiver completed)
         rating_factor = (item.rating / 5.0) if item.rating else 0.8
-        item_score = peer_sim * rating_factor
+        fav_factor = 1.35 if getattr(item, "is_favorite", False) else 1.0
+        rewatch_cnt = getattr(item, "rewatch_count", 0) or 0
+        rewatch_factor = (1.0 + min(0.30 * rewatch_cnt, 0.75)) if rewatch_cnt > 0 else 1.0
+        item_score = peer_sim * rating_factor * fav_factor * rewatch_factor
 
         candidate_scores[tmdb_id] = candidate_scores.get(tmdb_id, 0.0) + item_score
         media_map[tmdb_id] = media

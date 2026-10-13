@@ -438,6 +438,80 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
     invalidate_user_stats_cache(user_id)
     return saved_item
 
+async def _get_tv_released_episodes_and_status(tmdb_id: int, tv_data=None):
+    """
+    Retorna (released_episode_keys, has_unreleased_episodes, tv_data) para uma série de TV,
+    onde released_episode_keys é a lista de tuplas (season_number, episode_number) já lançados.
+    """
+    from app.details.services import fetch_tv_details, fetch_season_details
+    from app.core.utils import is_date_released
+
+    if tv_data is None:
+        tv_data = await fetch_tv_details(tmdb_id)
+
+    has_unreleased_episodes = False
+    released_keys = []
+
+    for season in (tv_data.seasons or []):
+        if season.season_number > 0:
+            try:
+                season_details = await fetch_season_details(tmdb_id, season.season_number)
+                for ep in (season_details.episodes or []):
+                    if is_date_released(ep.air_date):
+                        released_keys.append((season.season_number, ep.episode_number))
+                    else:
+                        has_unreleased_episodes = True
+            except Exception as e:
+                logger.warning(f"Failed to fetch season {season.season_number} details: {e}")
+                if season.air_date and not is_date_released(season.air_date):
+                    has_unreleased_episodes = True
+                else:
+                    for ep_num in range(1, (season.episode_count or 0) + 1):
+                        released_keys.append((season.season_number, ep_num))
+
+    return released_keys, has_unreleased_episodes, tv_data
+
+
+async def sync_tv_rewatch_from_episodes(db: AsyncSession, item: UserListItem, tv_data=None) -> int:
+    """
+    Calcula o rewatch_count da série inteira baseado nos episódios:
+    Se todos os episódios lançados foram assistidos e possuem rewatch_count >= k (k >= 1),
+    a obra toda é marcada como reassistida com rewatch_count = min(ep.rewatch_count).
+    Caso contrário, se algum episódio não foi reassistido (ou não assistido), rewatch_count = 0.
+    """
+    if not item or not item.media or item.media.media_type != "tv":
+        return item.rewatch_count if item else 0
+
+    try:
+        released_keys, has_unreleased, tv_data = await _get_tv_released_episodes_and_status(
+            item.media.tmdb_id, tv_data=tv_data
+        )
+        if not released_keys:
+            return item.rewatch_count or 0
+
+        await db.flush()
+        prog_res = await db.execute(
+            select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item.id)
+        )
+        prog_map = {(p.season_number, p.episode_number): p for p in prog_res.scalars().all()}
+
+        all_watched = all(k in prog_map for k in released_keys)
+        if all_watched:
+            min_rewatch = min((prog_map[k].rewatch_count or 0) for k in released_keys)
+            item.rewatch_count = max(0, min_rewatch)
+            is_series_ended = tv_data and tv_data.status in ("Ended", "Canceled")
+            if is_series_ended and not has_unreleased:
+                item.status = "completed"
+            elif item.status in ("plan_to_watch", "upcoming"):
+                item.status = "watching"
+        else:
+            item.rewatch_count = 0
+    except Exception as e:
+        logger.warning(f"Error syncing TV rewatch from episodes: {e}")
+
+    return item.rewatch_count or 0
+
+
 async def update_list_item(
     db: AsyncSession, 
     user_id: str, 
@@ -460,36 +534,36 @@ async def update_list_item(
     if not item:
         return None
 
+    from app.core.utils import is_date_released
+    from fastapi import HTTPException
+
+    rel_date = item.media.release_date if item.media else None
+    if not rel_date and item.media:
+        from app.core.cache import details_cache
+        cached_details, _ = details_cache.get_with_status(f"details:{item.media.media_type}:{item.media.tmdb_id}")
+        if cached_details and "release_date" in cached_details:
+            rel_date = cached_details["release_date"]
+            item.media.release_date = rel_date
+        elif cached_details and "first_air_date" in cached_details:
+            rel_date = cached_details["first_air_date"]
+            item.media.release_date = rel_date
+        else:
+            from app.details.services import fetch_movie_details, fetch_tv_details
+            try:
+                if item.media.media_type == "movie":
+                    tmdb_data = await fetch_movie_details(item.media.tmdb_id)
+                    rel_date = getattr(tmdb_data, 'release_date', None)
+                else:
+                    tmdb_data = await fetch_tv_details(item.media.tmdb_id)
+                    rel_date = getattr(tmdb_data, 'first_air_date', None)
+                if rel_date:
+                    item.media.release_date = rel_date
+            except Exception:
+                pass
+
+    is_released = is_date_released(rel_date)
+
     if update_data.status is not None:
-        from app.core.utils import is_date_released
-        from fastapi import HTTPException
-
-        rel_date = item.media.release_date if item.media else None
-        if not rel_date and item.media:
-            from app.core.cache import details_cache
-            cached_details, _ = details_cache.get_with_status(f"details:{item.media.media_type}:{item.media.tmdb_id}")
-            if cached_details and "release_date" in cached_details:
-                rel_date = cached_details["release_date"]
-                item.media.release_date = rel_date
-            elif cached_details and "first_air_date" in cached_details:
-                rel_date = cached_details["first_air_date"]
-                item.media.release_date = rel_date
-            else:
-                from app.details.services import fetch_movie_details, fetch_tv_details
-                try:
-                    if item.media.media_type == "movie":
-                        tmdb_data = await fetch_movie_details(item.media.tmdb_id)
-                        rel_date = getattr(tmdb_data, 'release_date', None)
-                    else:
-                        tmdb_data = await fetch_tv_details(item.media.tmdb_id)
-                        rel_date = getattr(tmdb_data, 'first_air_date', None)
-                    if rel_date:
-                        item.media.release_date = rel_date
-                except Exception:
-                    pass
-
-        is_released = is_date_released(rel_date)
-
         # Regra de Negócio: 'upcoming' é 100% automático gerenciado pelo sistema
         if update_data.status == "upcoming" and is_released:
             raise HTTPException(
@@ -513,46 +587,28 @@ async def update_list_item(
                         detail="Filmes que ainda não estrearam não podem ser marcados como assistidos."
                     )
                 item.status = "completed"
+                item.last_watched_at = datetime.now(timezone.utc)
             elif item.media.media_type == "tv":
-                from app.details.services import fetch_tv_details, fetch_season_details
-                from app.core.utils import is_date_released
-                from sqlalchemy import delete
-                has_unreleased_episodes = False
-                new_progresses = []
                 try:
-                    tv_data = await fetch_tv_details(item.media.tmdb_id)
-                    await db.execute(delete(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item.id))
-                    
-                    for season in tv_data.seasons:
-                        if season.season_number > 0:
-                            try:
-                                season_details = await fetch_season_details(item.media.tmdb_id, season.season_number)
-                                for ep in season_details.episodes:
-                                    if is_date_released(ep.air_date):
-                                        new_progresses.append(
-                                            UserEpisodeProgress(
-                                                user_list_item_id=item.id,
-                                                season_number=season.season_number,
-                                                episode_number=ep.episode_number
-                                            )
-                                        )
-                                    else:
-                                        has_unreleased_episodes = True
-                            except Exception as e:
-                                logger.warning(f"Failed to fetch season {season.season_number} details: {e}")
-                                if season.air_date and not is_date_released(season.air_date):
-                                    has_unreleased_episodes = True
-                                else:
-                                    for ep_num in range(1, season.episode_count + 1):
-                                        new_progresses.append(
-                                            UserEpisodeProgress(
-                                                user_list_item_id=item.id,
-                                                season_number=season.season_number,
-                                                episode_number=ep_num
-                                            )
-                                        )
+                    released_keys, has_unreleased_episodes, tv_data = await _get_tv_released_episodes_and_status(item.media.tmdb_id)
+                    prog_res = await db.execute(
+                        select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item.id)
+                    )
+                    existing_map = {(p.season_number, p.episode_number): p for p in prog_res.scalars().all()}
+
+                    new_progresses = []
+                    for s_num, e_num in released_keys:
+                        if (s_num, e_num) not in existing_map:
+                            new_progresses.append(
+                                UserEpisodeProgress(
+                                    user_list_item_id=item.id,
+                                    season_number=s_num,
+                                    episode_number=e_num
+                                )
+                            )
                     if new_progresses:
                         db.add_all(new_progresses)
+                        item.last_watched_at = datetime.now(timezone.utc)
                     
                     is_series_ended = tv_data.status in ("Ended", "Canceled")
                     if is_series_ended and not has_unreleased_episodes:
@@ -576,15 +632,17 @@ async def update_list_item(
         if item.status not in ["watching", "completed"] and item.is_favorite:
             item.is_favorite = False
 
-        # Regra de negócio: se foi para plan_to_watch ou upcoming sem nota explícita, limpa nota
-        if item.status in ["plan_to_watch", "upcoming"] and update_data.rating is None:
-            item.rating = None
+        # Regra de negócio: se foi para plan_to_watch ou upcoming sem nota explícita, limpa nota e rewatches
+        if item.status in ["plan_to_watch", "upcoming"]:
+            if update_data.rating is None:
+                item.rating = None
+            if update_data.rewatch_count is None:
+                item.rewatch_count = 0
 
     # Tratamento de Favoritos
     if update_data.is_favorite is not None:
         if update_data.is_favorite:
             if item.status not in ["watching", "completed"]:
-                from fastapi import HTTPException
                 raise HTTPException(
                     status_code=400,
                     detail="Apenas mídias com status 'Assistindo' ou 'Assistido' podem ser favoritadas."
@@ -603,7 +661,65 @@ async def update_list_item(
             item.rating = update_data.rating
 
     if update_data.rewatch_count is not None:
-        item.rewatch_count = update_data.rewatch_count
+        target_rewatch = max(0, update_data.rewatch_count)
+        old_rewatch = item.rewatch_count or 0
+        if target_rewatch > 0 and not is_released:
+            raise HTTPException(
+                status_code=400,
+                detail="Títulos que ainda não estrearam não podem ser marcados como reassistidos."
+            )
+
+        if item.media and item.media.media_type == "movie":
+            if target_rewatch > 0 and item.status != "completed" and update_data.status is None:
+                item.status = "completed"
+            item.rewatch_count = target_rewatch
+            if target_rewatch > old_rewatch:
+                item.last_watched_at = datetime.now(timezone.utc)
+        elif item.media and item.media.media_type == "tv":
+            try:
+                released_keys, has_unreleased_episodes, tv_data = await _get_tv_released_episodes_and_status(item.media.tmdb_id)
+                prog_res = await db.execute(
+                    select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item.id)
+                )
+                existing_map = {(p.season_number, p.episode_number): p for p in prog_res.scalars().all()}
+
+                if target_rewatch > 0:
+                    new_progresses = []
+                    for s_num, e_num in released_keys:
+                        ep_prog = existing_map.get((s_num, e_num))
+                        if ep_prog:
+                            if target_rewatch > old_rewatch:
+                                ep_prog.rewatch_count = max(ep_prog.rewatch_count or 0, target_rewatch)
+                            else:
+                                if (ep_prog.rewatch_count or 0) > target_rewatch:
+                                    ep_prog.rewatch_count = target_rewatch
+                        else:
+                            new_progresses.append(
+                                UserEpisodeProgress(
+                                    user_list_item_id=item.id,
+                                    season_number=s_num,
+                                    episode_number=e_num,
+                                    rewatch_count=target_rewatch
+                                )
+                            )
+                    if new_progresses:
+                        db.add_all(new_progresses)
+                    is_series_ended = tv_data.status in ("Ended", "Canceled")
+                    if is_series_ended and not has_unreleased_episodes:
+                        item.status = "completed"
+                    elif item.status in ("plan_to_watch", "upcoming"):
+                        item.status = "watching"
+                    if target_rewatch > old_rewatch:
+                        item.last_watched_at = datetime.now(timezone.utc)
+                else:
+                    for ep_prog in existing_map.values():
+                        ep_prog.rewatch_count = 0
+                item.rewatch_count = target_rewatch
+            except Exception as e:
+                logger.warning(f"Failed to sync TV episodes on rewatch_count update: {e}")
+                item.rewatch_count = target_rewatch
+        else:
+            item.rewatch_count = target_rewatch
 
     media_ref = item.media
     await db.commit()
@@ -616,8 +732,8 @@ async def update_list_item(
         else:
             asyncio.create_task(_async_post_process_list_item_update(user_id=user_id, item_id=str(item.id)))
 
-    # Apenas recalcula próximo episódio de TV se o status foi explicitamente alterado
-    if update_data.status is not None and item.media and item.media.media_type == "tv":
+    # Recalcula próximo episódio de TV se status ou rewatch_count foi alterado
+    if (update_data.status is not None or update_data.rewatch_count is not None) and item.media and item.media.media_type == "tv":
         tv_status_cache.delete_prefix(f"tv_status:{item.media.tmdb_id}")
         if item.status == "watching":
             reloaded = await db.execute(
@@ -729,7 +845,10 @@ async def _async_post_process_list_item_update(user_id: str, item_id: str):
             item_res = await session.execute(
                 select(UserListItem)
                 .where(UserListItem.id == uuid.UUID(item_id))
-                .options(selectinload(UserListItem.media))
+                .options(
+                    selectinload(UserListItem.media),
+                    selectinload(UserListItem.episodes)
+                )
             )
             item_obj = item_res.scalars().first()
             if item_obj and item_obj.media:
@@ -1038,6 +1157,240 @@ async def update_episode_rating(
 
     return prog
 
+async def update_episode_rewatch(
+    db: AsyncSession,
+    user_id: str,
+    item_id_or_tmdb_id: str,
+    season_number: int,
+    episode_number: int,
+    rewatch_count: int,
+    background_tasks: Optional[BackgroundTasks] = None
+):
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return None
+
+    from sqlalchemy.orm import selectinload
+    from app.media.models import Media
+
+    item = None
+    try:
+        item_uuid = uuid.UUID(item_id_or_tmdb_id)
+        res = await db.execute(
+            select(UserListItem)
+            .where(UserListItem.id == item_uuid, UserListItem.user_id == user_uuid)
+            .options(selectinload(UserListItem.media))
+        )
+        item = res.scalars().first()
+    except ValueError:
+        pass
+
+    if not item:
+        try:
+            tmdb_id_int = int(item_id_or_tmdb_id)
+            res = await db.execute(
+                select(UserListItem)
+                .join(UserListItem.media)
+                .where(Media.tmdb_id == tmdb_id_int, UserListItem.user_id == user_uuid)
+                .options(selectinload(UserListItem.media))
+            )
+            item = res.scalars().first()
+        except ValueError:
+            pass
+
+    if not item and rewatch_count > 0:
+        try:
+            tmdb_id_int = int(item_id_or_tmdb_id)
+            from app.tracking.schemas import UserListItemCreate
+            item = await add_to_list(db, user_id, UserListItemCreate(
+                tmdb_id=tmdb_id_int,
+                media_type="tv",
+                status="watching"
+            ))
+        except Exception:
+            return None
+
+    if not item:
+        return None
+
+    target_rewatch = max(0, rewatch_count)
+
+    if target_rewatch > 0 and item.media and item.media.media_type == "tv":
+        from app.details.services import fetch_episode_details
+        from app.core.utils import is_date_released
+        from fastapi import HTTPException
+        try:
+            ep_data = await fetch_episode_details(item.media.tmdb_id, season_number, episode_number)
+            if not is_date_released(ep_data.air_date):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"O episódio S{season_number} E{episode_number} ainda não foi lançado (estreia prevista: {ep_data.air_date or 'Indefinida'})."
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Error checking episode release date: {e}")
+
+    prog_result = await db.execute(
+        select(UserEpisodeProgress)
+        .where(
+            UserEpisodeProgress.user_list_item_id == item.id,
+            UserEpisodeProgress.season_number == season_number,
+            UserEpisodeProgress.episode_number == episode_number
+        )
+    )
+    prog = prog_result.scalars().first()
+    old_ep_rewatch = (prog.rewatch_count or 0) if prog else 0
+
+    if not prog:
+        prog = UserEpisodeProgress(
+            user_list_item_id=item.id,
+            season_number=season_number,
+            episode_number=episode_number,
+            rewatch_count=target_rewatch
+        )
+        db.add(prog)
+    else:
+        prog.rewatch_count = target_rewatch
+        if target_rewatch > old_ep_rewatch:
+            prog.watched_at = datetime.now(timezone.utc)
+
+    if target_rewatch > old_ep_rewatch:
+        item.last_watched_at = datetime.now(timezone.utc)
+    if item.status == "plan_to_watch":
+        item.status = "watching"
+
+    # Sincroniza o rewatch_count da obra toda caso todos os episódios estejam reassistidos
+    await sync_tv_rewatch_from_episodes(db, item)
+
+    media_ref = item.media
+    tmdb_id_val = media_ref.tmdb_id if media_ref else None
+
+    await db.commit()
+    await db.refresh(prog)
+
+    if tmdb_id_val:
+        tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
+    invalidate_user_stats_cache(user_id)
+
+    if media_ref:
+        if background_tasks:
+            background_tasks.add_task(_async_post_process_list_item_update, user_id=user_id, item_id=str(item.id))
+        else:
+            asyncio.create_task(_async_post_process_list_item_update(user_id=user_id, item_id=str(item.id)))
+
+    return prog
+
+async def update_season_rewatch(
+    db: AsyncSession,
+    user_id: str,
+    item_id: str,
+    season_number: int,
+    rewatch_count: int,
+    background_tasks: Optional[BackgroundTasks] = None
+):
+    try:
+        item_uuid = uuid.UUID(item_id)
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return None
+
+    from sqlalchemy.orm import selectinload
+    from fastapi import HTTPException
+    result = await db.execute(
+        select(UserListItem)
+        .where(UserListItem.id == item_uuid, UserListItem.user_id == user_uuid)
+        .options(selectinload(UserListItem.media))
+    )
+    item = result.scalars().first()
+    if not item or not item.media or item.media.media_type != "tv":
+        return None
+
+    from app.details.services import fetch_tv_details, fetch_season_details
+    from app.core.utils import is_date_released
+
+    target_rewatch = max(0, rewatch_count)
+    tv_data = None
+    try:
+        tv_data = await fetch_tv_details(item.media.tmdb_id)
+    except Exception:
+        pass
+
+    prog_res = await db.execute(
+        select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item_uuid)
+    )
+    existing_map = {(p.season_number, p.episode_number): p for p in prog_res.scalars().all()}
+
+    released_ep_nums = []
+    try:
+        season_details = await fetch_season_details(item.media.tmdb_id, season_number)
+        for ep in (season_details.episodes or []):
+            if is_date_released(ep.air_date):
+                released_ep_nums.append(ep.episode_number)
+    except Exception as e:
+        logger.warning(f"Failed to fetch season {season_number} details in update_season_rewatch: {e}")
+        if tv_data:
+            season_meta = next((s for s in tv_data.seasons if s.season_number == season_number), None)
+            if season_meta and (not season_meta.air_date or is_date_released(season_meta.air_date)):
+                released_ep_nums = list(range(1, (season_meta.episode_count or 0) + 1))
+
+    if not released_ep_nums:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A temporada {season_number} ainda não possui episódios lançados."
+        )
+
+    new_progresses = []
+    now_utc = datetime.now(timezone.utc)
+    for ep_num in released_ep_nums:
+        ep_prog = existing_map.get((season_number, ep_num))
+        if ep_prog:
+            if target_rewatch > (ep_prog.rewatch_count or 0):
+                ep_prog.watched_at = now_utc
+            ep_prog.rewatch_count = target_rewatch
+        elif target_rewatch > 0:
+            new_progresses.append(
+                UserEpisodeProgress(
+                    user_list_item_id=item.id,
+                    season_number=season_number,
+                    episode_number=ep_num,
+                    rewatch_count=target_rewatch
+                )
+            )
+
+    if new_progresses:
+        db.add_all(new_progresses)
+
+    if target_rewatch > 0:
+        item.last_watched_at = now_utc
+        if item.status == "plan_to_watch":
+            item.status = "watching"
+
+    await sync_tv_rewatch_from_episodes(db, item, tv_data=tv_data)
+
+    media_ref = item.media
+    tmdb_id_val = media_ref.tmdb_id if media_ref else None
+
+    await db.commit()
+    await db.refresh(item)
+
+    if tmdb_id_val:
+        tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
+    invalidate_user_stats_cache(user_id)
+
+    if media_ref:
+        if background_tasks:
+            background_tasks.add_task(_async_post_process_list_item_update, user_id=user_id, item_id=str(item.id))
+        else:
+            asyncio.create_task(_async_post_process_list_item_update(user_id=user_id, item_id=str(item.id)))
+
+    return {
+        "status": "ok",
+        "season_rewatch_count": target_rewatch,
+        "series_rewatch_count": item.rewatch_count or 0
+    }
+
 async def get_episode_progress(db: AsyncSession, user_id: str, item_id: str):
     try:
         item_uuid = uuid.UUID(item_id)
@@ -1093,6 +1446,8 @@ async def remove_episode_progress(db: AsyncSession, user_id: str, item_id: str, 
         await db.delete(existing)
         if item.status == "completed":
             item.status = "watching"
+        if item.rewatch_count and item.rewatch_count > 0:
+            item.rewatch_count = 0
         await db.commit()
         if tmdb_id_val:
             tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
@@ -1258,6 +1613,8 @@ async def remove_season_progress(
     )
     if item.status == "completed":
         item.status = "watching"
+    if item.rewatch_count and item.rewatch_count > 0:
+        item.rewatch_count = 0
 
     await db.commit()
     if tmdb_id_val:
@@ -1487,6 +1844,7 @@ async def get_user_statistics(db: AsyncSession, user_id: str, period: str = "all
                 UserEpisodeProgress.season_number,
                 UserEpisodeProgress.episode_number,
                 UserEpisodeProgress.rating,
+                UserEpisodeProgress.rewatch_count,
                 UserEpisodeProgress.watched_at
             )
             .join(UserListItem, UserEpisodeProgress.user_list_item_id == UserListItem.id)
@@ -1584,12 +1942,13 @@ async def get_user_statistics(db: AsyncSession, user_id: str, period: str = "all
                     earliest_date = ep_date
 
                 if cutoff is None or (ep_date and ep_date >= cutoff):
-                    ep_count_in_period += 1
+                    ep_factor = 1 + (getattr(ep, "rewatch_count", 0) or 0)
+                    ep_count_in_period += ep_factor
                     if ep_date:
                         m_key = f"{ep_date.year:04d}-{ep_date.month:02d}"
                         if m_key in activity_months:
-                            activity_months[m_key]["minutes"] += runtime
-                            activity_months[m_key]["count"] += 1
+                            activity_months[m_key]["minutes"] += runtime * ep_factor
+                            activity_months[m_key]["count"] += ep_factor
 
             if ep_count_in_period > 0 or (cutoff is None and item.status in ("completed", "watching")):
                 is_watched_in_period = True
@@ -1833,6 +2192,7 @@ async def get_user_media_ranking(
                 UserEpisodeProgress.season_number,
                 UserEpisodeProgress.episode_number,
                 UserEpisodeProgress.rating,
+                UserEpisodeProgress.rewatch_count,
                 UserEpisodeProgress.watched_at
             )
             .join(UserListItem, UserEpisodeProgress.user_list_item_id == UserListItem.id)
@@ -1899,7 +2259,7 @@ async def get_user_media_ranking(
 
         elif media_type == "tv":
             eps = progress_map.get(item.id, [])
-            ep_count = len(eps)
+            ep_count = sum(1 + (getattr(ep, "rewatch_count", 0) or 0) for ep in eps)
 
             is_valid = False
             if cutoff is not None:

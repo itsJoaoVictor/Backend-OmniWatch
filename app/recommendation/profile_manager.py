@@ -32,7 +32,11 @@ def calculate_time_decay(action_date: Optional[datetime]) -> float:
     # Floor at 0.1 so we never completely forget old preferences
     return max(0.1, decay_factor)
 
-def calculate_rating_scale(rating: Optional[float], status: Optional[str] = None) -> float:
+def calculate_rating_scale(
+    rating: Optional[float],
+    status: Optional[str] = None,
+    rewatch_count: int = 0
+) -> float:
     """
     Fase 3 - Feedback Implícito & Explícito (Escala 0 a 5 estrelas):
     Diferenciação de pesos por nota:
@@ -44,32 +48,44 @@ def calculate_rating_scale(rating: Optional[float], status: Optional[str] = None
       * 3.5 -> 0.67
       * 4.0 -> 1.0
     
-    Se não houver nota explícita, infere do status de acompanhamento:
-    - "completed"     -> +1.5 (Assistiu até o fim / Boost de conclusão)
-    - "watching"      -> +1.0 (Engajamento ativo)
-    - "plan_to_watch" -> +0.8 (Interesse ao adicionar à Watchlist)
-    - "dropped"       -> -0.5 (Abandonou)
-    - default         -> +0.5
+    Se a obra foi reassistida (rewatch_count > 0), garante um piso positivo forte
+    (mínimo +1.25 mesmo com nota mediana, ou +1.5 sem nota explícita).
     """
+    base_scale = 0.5
     if rating is not None:
         if rating >= 4.5:
-            return 1.5
+            base_scale = 1.5
         elif rating <= 2.0:
-            return -1.0
+            base_scale = -1.0
         else:
             # Linear mapping from 2.5 (0.0) to 4.0 (1.0)
-            return (rating - 2.5) / 1.5
-
-    if status == "completed":
-        return 1.5
+            base_scale = (rating - 2.5) / 1.5
+    elif status == "completed":
+        base_scale = 1.5
     elif status == "watching":
-        return 1.0
+        base_scale = 1.0
     elif status == "plan_to_watch":
-        return 0.8
+        base_scale = 0.8
     elif status == "dropped":
-        return -0.5
+        base_scale = -0.5
 
-    return 0.5
+    if (rewatch_count or 0) > 0 and base_scale > -0.5:
+        base_scale = max(base_scale, 1.35 if rating is not None else 1.5)
+
+    return base_scale
+
+def calculate_rewatch_modifier(rewatch_count: int = 0, episode_rewatches: int = 0) -> float:
+    """
+    Calcula o multiplicador de peso para obras reassistidas:
+    - Obra completa reassistida: 1.5x no 1º rewatch + 0.25x por rewatch adicional (até 2.25x).
+    - Episódios reassistidos (quando a série toda ainda não foi reassistida por completo):
+      +0.08x por episódio reassistido (até 1.45x).
+    """
+    if (rewatch_count or 0) > 0:
+        return 1.5 + min(0.25 * (rewatch_count - 1), 0.75)
+    if (episode_rewatches or 0) > 0:
+        return 1.0 + min(0.08 * episode_rewatches, 0.45)
+    return 1.0
 
 def calculate_episode_rating_scale(rating: float) -> float:
     """
@@ -114,19 +130,28 @@ async def update_user_profile(
         rating_val = None
         status_val = None
         is_favorite_val = False
+        rewatch_val = 0
+        ep_rewatch_val = 0
         if list_item:
             try:
-                action_date = list_item.updated_at or list_item.created_at
+                action_date = list_item.last_watched_at or list_item.updated_at or list_item.created_at
                 rating_val = list_item.rating
                 status_val = list_item.status
                 is_favorite_val = getattr(list_item, "is_favorite", False)
+                rewatch_val = getattr(list_item, "rewatch_count", 0) or 0
+                episodes_list = list_item.__dict__.get("episodes")
+                if episodes_list:
+                    ep_rewatch_val = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
             except Exception:
                 pass
         time_decay = calculate_time_decay(action_date)
-        rating_scale = calculate_rating_scale(rating_val, status_val)
+        rating_scale = calculate_rating_scale(rating_val, status_val, rewatch_count=rewatch_val)
         
         # Favoritos: Multiplicador de peso 2.0x conforme estratégia híbrida
         favorite_modifier = 2.0 if is_favorite_val else 1.0
+
+        # Rewatch: Multiplicador de peso para obras/episódios reassistidos
+        rewatch_modifier = calculate_rewatch_modifier(rewatch_val, ep_rewatch_val)
 
         # TV Show episode modifier (if media is TV)
         episode_modifier = 1.0
@@ -136,7 +161,7 @@ async def update_user_profile(
         except Exception:
             pass
 
-        final_scale = time_decay * rating_scale * episode_modifier * favorite_modifier
+        final_scale = time_decay * rating_scale * episode_modifier * favorite_modifier * rewatch_modifier
     
     # Build media vector if not provided
     if media_vector is None:
