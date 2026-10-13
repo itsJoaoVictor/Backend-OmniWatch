@@ -4,8 +4,8 @@ from sqlalchemy.future import select
 from datetime import datetime, timedelta, timezone
 from app.core.database import get_db
 from app.users.models import User, RefreshToken
-from app.core.security import verify_password, create_access_token, create_refresh_token, decode_token, hash_token
-from app.auth.schemas import LoginRequest, TokenResponse
+from app.core.security import verify_password, get_password_hash, create_access_token, create_refresh_token, decode_token, hash_token
+from app.auth.schemas import LoginRequest, TokenResponse, ForgotPasswordRequest
 from app.core.rate_limit import limiter
 import uuid
 import asyncio
@@ -68,7 +68,14 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
     
     return TokenResponse(
         message="Login realizado com sucesso",
-        user={"id": str(user.id), "name": user.name, "email": user.email, "username": user.username, "role": user.role}
+        user={
+            "id": str(user.id),
+            "name": user.name,
+            "email": user.email,
+            "username": user.username,
+            "role": user.role,
+            "last_seen_release_id": user.last_seen_release_id or 0,
+        }
     )
 
 @router.post("/refresh")
@@ -157,3 +164,38 @@ async def logout(request: Request, response: Response, db: AsyncSession = Depend
     )
     
     return {"message": "Logout realizado com sucesso"}
+
+@router.post("/forgot-password")
+@limiter.limit("5/minute")
+async def forgot_password(request: Request, payload: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    email = payload.email.lower().strip()
+    username = payload.username.lower().strip()
+
+    result = await db.execute(
+        select(User).where(
+            (func.lower(User.email) == email) &
+            (func.lower(User.username) == username)
+        )
+    )
+    user = result.scalars().first()
+
+    if not user:
+        await asyncio.sleep(1)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Não encontramos uma conta com a combinação de e-mail e nome de usuário informados."
+        )
+
+    user.password_hash = get_password_hash(payload.new_password)
+    user.failed_login_attempts = 0
+    user.locked_until = None
+
+    await db.execute(
+        RefreshToken.__table__.update()
+        .where(RefreshToken.user_id == user.id)
+        .values(revoked=True)
+    )
+    await db.commit()
+
+    return {"message": "Senha redefinida com sucesso."}
+
