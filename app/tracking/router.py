@@ -202,17 +202,21 @@ async def rewatch_episode(
 
 @router.get("/statistics")
 async def get_statistics(
+    background_tasks: BackgroundTasks,
     period: str = "all",
     media_type: str = "all",
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
     from app.tracking.services import get_user_statistics
-    stats = await get_user_statistics(db, user_id, period=period, media_type=media_type)
+    stats = await get_user_statistics(
+        db, user_id, period=period, media_type=media_type, background_tasks=background_tasks
+    )
     return stats
 
 @router.get("/statistics/rankings/media", response_model=MediaRankingResponse)
 async def get_media_ranking(
+    background_tasks: BackgroundTasks,
     media_type: str = "movie",
     sort_by: str = "time",
     period: str = "all",
@@ -231,6 +235,7 @@ async def get_media_ranking(
         period=period,
         page=page,
         page_size=page_size,
-        search=search
+        search=search,
+        background_tasks=background_tasks
     )
 

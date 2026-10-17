@@ -23,6 +23,7 @@ class NotificationSchema(BaseModel):
     class Config:
         from_attributes = True
 
+@router.get("", response_model=List[NotificationSchema], include_in_schema=False)
 @router.get("/", response_model=List[NotificationSchema])
 async def get_notifications(
     unread_only: bool = False,

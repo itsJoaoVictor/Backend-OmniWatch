@@ -29,15 +29,16 @@ class SimpleTTLCache:
         Marca as chaves que começam com o prefixo como expiradas (stale).
         Mantém os dados para o SWR (Stale-While-Revalidate) funcionar.
         """
-        for k in self._cache:
+        for k in list(self._cache.keys()):
             if k.startswith(prefix):
-                self._cache[k]["timestamp"] = 0
+                if k in self._cache:
+                    self._cache[k]["timestamp"] = 0
 
     def delete_prefix(self, prefix: str) -> None:
         """
         Remove completamente as chaves que começam com o prefixo.
         """
-        keys_to_del = [k for k in self._cache if k.startswith(prefix)]
+        keys_to_del = [k for k in list(self._cache.keys()) if k.startswith(prefix)]
         for k in keys_to_del:
             self._cache.pop(k, None)
 

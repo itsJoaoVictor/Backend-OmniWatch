@@ -90,8 +90,8 @@ async def determine_tv_next_episode_status(tmdb_id: int, progress_list: list):
         return False, fallback_next
 
 def invalidate_user_stats_cache(user_id: str):
-    """Invalida o cache de estatísticas do usuário quando houver modificação nos seus registros."""
-    stats_cache.delete_prefix(f"stats:{user_id}")
+    """Invalida o cache de estatísticas do usuário marcando como stale para o SWR funcionar."""
+    stats_cache.invalidate_prefix(f"stats:{user_id}")
 
 async def get_user_list(db: AsyncSession, user_id: str):
     target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
@@ -1789,18 +1789,27 @@ def normalize_genre(name: str) -> str:
     clean = name.strip()
     return GENRE_NORMALIZATION.get(clean.lower(), clean)
 
-async def get_user_statistics(db: AsyncSession, user_id: str, period: str = "all", media_type: str = "all"):
+_revalidating_stats_keys: set = set()
+
+async def recompute_and_cache_stats(user_id: str, period: str, media_type: str):
+    """Recomputa as estatísticas do usuário em background e atualiza o cache."""
+    cache_key = f"stats:{user_id}:{period}:{media_type}"
+    try:
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await _compute_user_statistics(session, user_id, period=period, media_type=media_type)
+    except Exception as e:
+        logger.error("Erro ao revalidar estatísticas em background para usuário %s: %s", user_id, e)
+    finally:
+        _revalidating_stats_keys.discard(cache_key)
+
+async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str = "all", media_type: str = "all"):
     try:
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         return {}
 
-    # 1. Cache lookup: <1ms response for repeated queries
     cache_key = f"stats:{user_id}:{period}:{media_type}"
-    cached_data, is_stale = stats_cache.get_with_status(cache_key)
-    if not is_stale and cached_data is not None:
-        return cached_data
-
     now = datetime.now(timezone.utc)
     cutoff = None
     days_span = 365
@@ -2078,7 +2087,7 @@ async def get_user_statistics(db: AsyncSession, user_id: str, period: str = "all
             "count": val["count"]
         })
 
-    return {
+    output = {
         "totalTime": total_time,
         "totalTimeMovies": total_time_movies_minutes,
         "totalTimeTv": total_time_tv_minutes,
@@ -2115,8 +2124,61 @@ async def get_user_statistics(db: AsyncSession, user_id: str, period: str = "all
     stats_cache.set(cache_key, output)
     return output
 
+async def get_user_statistics(
+    db: AsyncSession, 
+    user_id: str, 
+    period: str = "all", 
+    media_type: str = "all",
+    background_tasks: Optional[BackgroundTasks] = None
+):
+    """
+    Retorna as estatísticas do usuário com suporte a Stale-While-Revalidate (SWR).
+    Se houver cache (mesmo expirado), retorna instantaneamente (<2ms) e agenda
+    recomputação assíncrona em background.
+    """
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return {}
 
-async def get_user_media_ranking(
+    cache_key = f"stats:{user_id}:{period}:{media_type}"
+    cached_data, is_stale = stats_cache.get_with_status(cache_key)
+
+    if cached_data is not None:
+        if is_stale and cache_key not in _revalidating_stats_keys:
+            _revalidating_stats_keys.add(cache_key)
+            if background_tasks is not None:
+                background_tasks.add_task(recompute_and_cache_stats, user_id, period, media_type)
+            else:
+                asyncio.create_task(recompute_and_cache_stats(user_id, period, media_type))
+        return cached_data
+
+    return await _compute_user_statistics(db, user_id, period=period, media_type=media_type)
+
+_revalidating_ranking_keys: set = set()
+
+async def recompute_and_cache_ranking(
+    user_id: str,
+    media_type: str,
+    sort_by: str,
+    period: str,
+    page: int,
+    page_size: int,
+    search: Optional[str]
+):
+    """Recomputa o ranking de mídias em background e atualiza o cache."""
+    clean_search = (search or "").strip().lower()
+    cache_key = f"stats:{user_id}:rankings:{media_type}:{sort_by}:{period}:{page}:{page_size}:{clean_search}"
+    try:
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await _compute_user_media_ranking(session, user_id, media_type, sort_by, period, page, page_size, search)
+    except Exception as e:
+        logger.error("Erro ao revalidar ranking em background para usuário %s: %s", user_id, e)
+    finally:
+        _revalidating_ranking_keys.discard(cache_key)
+
+async def _compute_user_media_ranking(
     db: AsyncSession,
     user_id: str,
     media_type: str = "movie",
@@ -2145,9 +2207,6 @@ async def get_user_media_ranking(
     page_size = max(1, min(50, int(page_size)))
 
     cache_key = f"stats:{user_id}:rankings:{media_type}:{sort_by}:{period}:{page}:{page_size}:{clean_search}"
-    cached_data, is_stale = stats_cache.get_with_status(cache_key)
-    if not is_stale and cached_data is not None:
-        return cached_data
 
     now = datetime.now(timezone.utc)
     cutoff = None
@@ -2363,4 +2422,63 @@ async def get_user_media_ranking(
 
     stats_cache.set(cache_key, output)
     return output
+
+
+async def get_user_media_ranking(
+    db: AsyncSession,
+    user_id: str,
+    media_type: str = "movie",
+    sort_by: str = "time",
+    period: str = "all",
+    page: int = 1,
+    page_size: int = 10,
+    search: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None
+):
+    """
+    Retorna o ranking de mídias do usuário com suporte a Stale-While-Revalidate (SWR).
+    Se houver cache (mesmo expirado), retorna instantaneamente (<2ms) e agenda
+    recomputação assíncrona em background.
+    """
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return {
+            "items": [],
+            "total_items": 0,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+            "media_type": media_type,
+            "sort_by": sort_by,
+            "period": period
+        }
+
+    clean_search = (search or "").strip().lower()
+    page = max(1, int(page))
+    page_size = max(1, min(50, int(page_size)))
+
+    cache_key = f"stats:{user_id}:rankings:{media_type}:{sort_by}:{period}:{page}:{page_size}:{clean_search}"
+    cached_data, is_stale = stats_cache.get_with_status(cache_key)
+
+    if cached_data is not None:
+        if is_stale and cache_key not in _revalidating_ranking_keys:
+            _revalidating_ranking_keys.add(cache_key)
+            if background_tasks is not None:
+                background_tasks.add_task(
+                    recompute_and_cache_ranking,
+                    user_id, media_type, sort_by, period, page, page_size, search
+                )
+            else:
+                asyncio.create_task(
+                    recompute_and_cache_ranking(
+                        user_id, media_type, sort_by, period, page, page_size, search
+                    )
+                )
+        return cached_data
+
+    return await _compute_user_media_ranking(
+        db, user_id, media_type=media_type, sort_by=sort_by, period=period, page=page, page_size=page_size, search=search
+    )
+
 

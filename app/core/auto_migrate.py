@@ -335,6 +335,22 @@ async def run_auto_migrations():
             """))
             await session.commit()
             logger.info("✅ [AutoMigrate] Tabelas de Universos e colunas validadas no banco de dados.")
+
+            # 10. Garantia idempotente para índices compostos de estatísticas e rankings
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_episode_progress_item_watched 
+                ON user_episode_progress (user_list_item_id, watched_at);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_list_items_user_status_media 
+                ON user_list_items (user_id, status, media_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_list_items_user_last_watched 
+                ON user_list_items (user_id, last_watched_at);
+            """))
+            await session.commit()
+            logger.info("✅ [AutoMigrate] Índices compostos de estatísticas e rankings validados no banco de dados.")
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
 
