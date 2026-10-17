@@ -1848,7 +1848,9 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
                     Media.genres,
                     Media.runtime,
                     Media.directors,
-                    Media.main_cast
+                    Media.main_cast,
+                    Media.cast_ids,
+                    Media.crew_ids
                 )
             )
         )
@@ -2022,14 +2024,29 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
             if item.rating:
                 g_entry["ratings"].append(item.rating)
 
+        # Mapeamento rápido de person_id via cast_ids e crew_ids salvos no Media
+        cast_person_map = {}
+        if m.cast_ids and isinstance(m.cast_ids, list):
+            for c_info in m.cast_ids:
+                if isinstance(c_info, dict) and c_info.get("name") and c_info.get("person_id"):
+                    cast_person_map[c_info["name"]] = c_info["person_id"]
+
+        crew_person_map = {}
+        if m.crew_ids and isinstance(m.crew_ids, list):
+            for c_info in m.crew_ids:
+                if isinstance(c_info, dict) and c_info.get("name") and c_info.get("person_id"):
+                    crew_person_map[c_info["name"]] = c_info["person_id"]
+
         raw_cast = m.main_cast or []
         if isinstance(raw_cast, list):
             for actor in raw_cast[:5]:
                 a_name = actor.get("name") if isinstance(actor, dict) else str(actor).strip()
                 if a_name:
-                    c_entry = cast_stats.setdefault(a_name, {"count": 0, "totalTime": 0, "ratings": []})
+                    c_entry = cast_stats.setdefault(a_name, {"count": 0, "totalTime": 0, "ratings": [], "person_id": None})
                     c_entry["count"] += 1
                     c_entry["totalTime"] += item_time_minutes
+                    if not c_entry.get("person_id") and a_name in cast_person_map:
+                        c_entry["person_id"] = cast_person_map[a_name]
                     if item.rating:
                         c_entry["ratings"].append(item.rating)
 
@@ -2038,9 +2055,11 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
             for director in raw_dirs:
                 d_name = director.get("name") if isinstance(director, dict) else str(director).strip()
                 if d_name:
-                    d_entry = directors_stats.setdefault(d_name, {"count": 0, "totalTime": 0, "ratings": []})
+                    d_entry = directors_stats.setdefault(d_name, {"count": 0, "totalTime": 0, "ratings": [], "person_id": None})
                     d_entry["count"] += 1
                     d_entry["totalTime"] += item_time_minutes
+                    if not d_entry.get("person_id") and d_name in crew_person_map:
+                        d_entry["person_id"] = crew_person_map[d_name]
                     if item.rating:
                         d_entry["ratings"].append(item.rating)
 
@@ -2104,6 +2123,7 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
         for name, data in sorted_items:
             res.append({
                 "name": name,
+                "person_id": data.get("person_id"),
                 "count": data["count"],
                 "totalTime": data["totalTime"],
                 "avgRating": round(sum(data["ratings"]) / len(data["ratings"]), 1) if data["ratings"] else None,
