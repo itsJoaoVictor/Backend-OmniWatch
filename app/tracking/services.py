@@ -1,6 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload, load_only
+from sqlalchemy import text
 from fastapi import BackgroundTasks
 import logging
 import uuid
@@ -1823,7 +1824,7 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
         cutoff = now - timedelta(days=365)
         days_span = 365
 
-    # 2. Optimized SQL Query: selective column loading (excludes heavy vector embeddings and keywords)
+    # 1. Busca os títulos do catálogo do usuário com campos necessários
     items_query = (
         select(UserListItem)
         .where(UserListItem.user_id == user_uuid)
@@ -1858,28 +1859,75 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
     result = await db.execute(items_query)
     items = result.scalars().all()
 
-    # 3. Optimized Episode Query: SQL JOIN instead of WHERE IN, pushdown date cutoff to Postgres
-    progress_map = {}
-    if media_type != "movie" and items:
-        prog_query = (
-            select(
-                UserEpisodeProgress.user_list_item_id,
-                UserEpisodeProgress.season_number,
-                UserEpisodeProgress.episode_number,
-                UserEpisodeProgress.rating,
-                UserEpisodeProgress.rewatch_count,
-                UserEpisodeProgress.watched_at
-            )
-            .join(UserListItem, UserEpisodeProgress.user_list_item_id == UserListItem.id)
-            .where(UserListItem.user_id == user_uuid)
-        )
-        if cutoff is not None:
-            prog_query = prog_query.where(UserEpisodeProgress.watched_at >= cutoff)
+    # 2. Pushdown para SQL: agregação de episódios e timeline diretamente no PostgreSQL
+    ep_agg_map = {}
+    ep_timeline_map = {}
+    earliest_ep_date = now
 
-        prog_result = await db.execute(prog_query)
-        progresses = prog_result.all()
-        for p in progresses:
-            progress_map.setdefault(p.user_list_item_id, []).append(p)
+    if media_type != "movie" and items:
+        ep_where = ""
+        params = {"user_uuid": user_uuid}
+        if cutoff is not None:
+            ep_where = "AND COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at) >= :cutoff"
+            params["cutoff"] = cutoff
+
+        ep_agg_sql = text(f"""
+            SELECT 
+                uep.user_list_item_id,
+                SUM(1 + COALESCE(uep.rewatch_count, 0)) AS total_eps_with_rewatch,
+                MIN(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at)) AS earliest_watched_at
+            FROM user_episode_progress uep
+            JOIN user_list_items uli ON uli.id = uep.user_list_item_id
+            WHERE uli.user_id = :user_uuid
+              {ep_where}
+            GROUP BY uep.user_list_item_id
+        """)
+        res_ep_agg = await db.execute(ep_agg_sql, params)
+        for row in res_ep_agg.fetchall():
+            ep_agg_map[row.user_list_item_id] = {
+                "total_eps": int(row.total_eps_with_rewatch or 0),
+                "earliest": row.earliest_watched_at
+            }
+            if row.earliest_watched_at:
+                dt = row.earliest_watched_at
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt < earliest_ep_date:
+                    earliest_ep_date = dt
+
+        num_months = 12 if period in ("year", "all") else 6
+        timeline_start = now - timedelta(days=num_months * 31)
+        ep_timeline_sql = text("""
+            SELECT 
+                TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM') AS month_key,
+                SUM(1 + COALESCE(uep.rewatch_count, 0)) AS ep_count,
+                SUM((1 + COALESCE(uep.rewatch_count, 0)) * COALESCE(m.runtime, 0)) AS ep_minutes
+            FROM user_episode_progress uep
+            JOIN user_list_items uli ON uli.id = uep.user_list_item_id
+            JOIN media m ON m.id = uli.media_id
+            WHERE uli.user_id = :user_uuid
+              AND COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at) >= :timeline_start
+            GROUP BY TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM')
+        """)
+        res_ep_tl = await db.execute(ep_timeline_sql, {"user_uuid": user_uuid, "timeline_start": timeline_start})
+        for row in res_ep_tl.fetchall():
+            ep_timeline_map[row.month_key] = {
+                "count": int(row.ep_count or 0),
+                "minutes": int(row.ep_minutes or 0)
+            }
+
+    # 3. Inicializa Timeline de Atividade Mensal
+    num_months = 12 if period in ("year", "all") else 6
+    activity_months = {}
+    for i in range(num_months - 1, -1, -1):
+        m_date = now - timedelta(days=i * 30)
+        key = f"{m_date.year:04d}-{m_date.month:02d}"
+        tl_data = ep_timeline_map.get(key, {"count": 0, "minutes": 0})
+        activity_months[key] = {
+            "minutes": tl_data["minutes"],
+            "count": tl_data["count"],
+            "label": f"{MONTH_NAMES_PT[m_date.month - 1]}/{str(m_date.year)[2:]}"
+        }
 
     total_movies_watched = 0
     total_episodes_watched = 0
@@ -1895,19 +1943,7 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
     genres_stats = {}
     cast_stats = {}
     directors_stats = {}
-
-    activity_months = {}
-    num_months = 12 if period in ("year", "all") else 6
-    for i in range(num_months - 1, -1, -1):
-        m_date = now - timedelta(days=i * 30)
-        key = f"{m_date.year:04d}-{m_date.month:02d}"
-        activity_months[key] = {
-            "minutes": 0,
-            "count": 0,
-            "label": f"{MONTH_NAMES_PT[m_date.month - 1]}/{str(m_date.year)[2:]}"
-        }
-
-    earliest_date = now
+    earliest_date = min(now, earliest_ep_date)
 
     for item in items:
         m = item.media
@@ -1955,24 +1991,8 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
                             activity_months[m_key]["count"] += factor
 
         elif m.media_type == "tv":
-            eps = progress_map.get(item.id, [])
-            ep_count_in_period = 0
-            for ep in eps:
-                ep_date = ep.watched_at or item_date
-                if ep_date and ep_date.tzinfo is None:
-                    ep_date = ep_date.replace(tzinfo=timezone.utc)
-                if ep_date and ep_date < earliest_date:
-                    earliest_date = ep_date
-
-                if cutoff is None or (ep_date and ep_date >= cutoff):
-                    ep_factor = 1 + (getattr(ep, "rewatch_count", 0) or 0)
-                    ep_count_in_period += ep_factor
-                    if ep_date:
-                        m_key = f"{ep_date.year:04d}-{ep_date.month:02d}"
-                        if m_key in activity_months:
-                            activity_months[m_key]["minutes"] += runtime * ep_factor
-                            activity_months[m_key]["count"] += ep_factor
-
+            ep_info = ep_agg_map.get(item.id)
+            ep_count_in_period = ep_info["total_eps"] if ep_info else 0
             if ep_count_in_period > 0 or (cutoff is None and item.status in ("completed", "watching")):
                 is_watched_in_period = True
                 total_episodes_watched += ep_count_in_period
@@ -2205,6 +2225,7 @@ async def _compute_user_media_ranking(
     clean_search = (search or "").strip().lower()
     page = max(1, int(page))
     page_size = max(1, min(50, int(page_size)))
+    offset = (page - 1) * page_size
 
     cache_key = f"stats:{user_id}:rankings:{media_type}:{sort_by}:{period}:{page}:{page_size}:{clean_search}"
 
@@ -2217,197 +2238,173 @@ async def _compute_user_media_ranking(
     elif period == "year":
         cutoff = now - timedelta(days=365)
 
-    items_query = (
-        select(UserListItem)
-        .join(UserListItem.media)
-        .where(
-            UserListItem.user_id == user_uuid,
-            Media.media_type == media_type
-        )
-        .options(
-            load_only(
-                UserListItem.id,
-                UserListItem.user_id,
-                UserListItem.media_id,
-                UserListItem.status,
-                UserListItem.rating,
-                UserListItem.rewatch_count,
-                UserListItem.last_watched_at,
-                UserListItem.created_at,
-                UserListItem.updated_at
-            ),
-            selectinload(UserListItem.media).options(
-                load_only(
-                    Media.id,
-                    Media.tmdb_id,
-                    Media.media_type,
-                    Media.title,
-                    Media.poster_path,
-                    Media.release_date,
-                    Media.genres,
-                    Media.runtime
-                )
-            )
-        )
-    )
+    params = {
+        "user_uuid": user_uuid,
+        "limit": page_size,
+        "offset": offset
+    }
 
-    if clean_search:
-        items_query = items_query.where(Media.title.ilike(f"%{clean_search}%"))
-
-    result = await db.execute(items_query)
-    user_items = result.scalars().all()
-
-    progress_map = {}
-    if media_type == "tv" and user_items:
-        prog_query = (
-            select(
-                UserEpisodeProgress.user_list_item_id,
-                UserEpisodeProgress.season_number,
-                UserEpisodeProgress.episode_number,
-                UserEpisodeProgress.rating,
-                UserEpisodeProgress.rewatch_count,
-                UserEpisodeProgress.watched_at
-            )
-            .join(UserListItem, UserEpisodeProgress.user_list_item_id == UserListItem.id)
-            .where(UserListItem.user_id == user_uuid)
-        )
+    if media_type == "movie":
+        where_conditions = ["uli.user_id = :user_uuid", "m.media_type = 'movie'"]
         if cutoff is not None:
-            prog_query = prog_query.where(UserEpisodeProgress.watched_at >= cutoff)
+            where_conditions.append("uli.status IN ('completed', 'watching')")
+            where_conditions.append("COALESCE(uli.last_watched_at, uli.updated_at, uli.created_at) >= :cutoff")
+            params["cutoff"] = cutoff
+        else:
+            where_conditions.append("(uli.status IN ('completed', 'watching') OR COALESCE(uli.rewatch_count, 0) > 0 OR uli.rating IS NOT NULL)")
 
-        prog_result = await db.execute(prog_query)
-        for p in prog_result.all():
-            progress_map.setdefault(p.user_list_item_id, []).append(p)
+        if clean_search:
+            where_conditions.append("m.title ILIKE :search_pattern")
+            params["search_pattern"] = f"%{clean_search}%"
 
-    candidates = []
-    for item in user_items:
-        m = item.media
-        if not m:
-            continue
+        where_clause = " AND ".join(where_conditions)
 
-        runtime = m.runtime or 0
-        item_date = item.last_watched_at or item.updated_at or item.created_at
-        if item_date and item_date.tzinfo is None:
-            item_date = item_date.replace(tzinfo=timezone.utc)
+        if sort_by == "rating":
+            order_clause = "CASE WHEN uli.rating IS NOT NULL THEN 1 ELSE 0 END DESC, uli.rating DESC NULLS LAST, (COALESCE(m.runtime, 0) * (1 + COALESCE(uli.rewatch_count, 0))) DESC, uli.id ASC"
+        elif sort_by == "rewatch":
+            order_clause = "COALESCE(uli.rewatch_count, 0) DESC, (COALESCE(m.runtime, 0) * (1 + COALESCE(uli.rewatch_count, 0))) DESC, uli.rating DESC NULLS LAST, uli.id ASC"
+        elif sort_by == "episodes":
+            order_clause = "(CASE WHEN uli.status = 'completed' THEN 1 ELSE 0 END) DESC, (COALESCE(m.runtime, 0) * (1 + COALESCE(uli.rewatch_count, 0))) DESC, uli.id ASC"
+        elif sort_by == "recent":
+            order_clause = "COALESCE(uli.last_watched_at, uli.updated_at, uli.created_at) DESC NULLS LAST, (COALESCE(m.runtime, 0) * (1 + COALESCE(uli.rewatch_count, 0))) DESC, uli.id ASC"
+        elif sort_by == "title":
+            order_clause = "LOWER(m.title) ASC, uli.id ASC"
+        else:  # time
+            order_clause = "(COALESCE(m.runtime, 0) * (1 + COALESCE(uli.rewatch_count, 0))) DESC, uli.rating DESC NULLS LAST, uli.id ASC"
 
-        raw_genres = m.genres or []
+        query_sql = text(f"""
+            SELECT 
+                uli.id AS item_id,
+                m.id AS media_id,
+                m.tmdb_id,
+                m.title,
+                m.media_type,
+                m.poster_path,
+                m.release_date,
+                COALESCE(m.runtime, 0) AS runtime,
+                m.genres,
+                uli.rating,
+                COALESCE(uli.rewatch_count, 0) AS rewatch_count,
+                (COALESCE(m.runtime, 0) * (1 + COALESCE(uli.rewatch_count, 0))) AS total_time_minutes,
+                CASE WHEN uli.status = 'completed' THEN 1 ELSE 0 END AS episodes_watched,
+                uli.status,
+                COALESCE(uli.last_watched_at, uli.updated_at, uli.created_at) AS last_watched_at,
+                COUNT(*) OVER() AS total_items_count
+            FROM user_list_items uli
+            JOIN media m ON m.id = uli.media_id
+            WHERE {where_clause}
+            ORDER BY {order_clause}
+            LIMIT :limit OFFSET :offset
+        """)
+
+    else:  # tv
+        ep_cutoff_clause = ""
+        if cutoff is not None:
+            ep_cutoff_clause = "AND uep.watched_at >= :cutoff"
+            params["cutoff"] = cutoff
+
+        tv_filter = "COALESCE(ea.ep_count, 0) > 0" if cutoff is not None else "(COALESCE(ea.ep_count, 0) > 0 OR uli.status IN ('completed', 'watching') OR uli.rating IS NOT NULL)"
+        search_filter = ""
+        if clean_search:
+            search_filter = "AND m.title ILIKE :search_pattern"
+            params["search_pattern"] = f"%{clean_search}%"
+
+        if sort_by == "rating":
+            order_clause = "CASE WHEN rating IS NOT NULL THEN 1 ELSE 0 END DESC, rating DESC NULLS LAST, total_time_minutes DESC, item_id ASC"
+        elif sort_by == "rewatch":
+            order_clause = "rewatch_count DESC, total_time_minutes DESC, rating DESC NULLS LAST, item_id ASC"
+        elif sort_by == "episodes":
+            order_clause = "episodes_watched DESC, total_time_minutes DESC, rating DESC NULLS LAST, item_id ASC"
+        elif sort_by == "recent":
+            order_clause = "last_watched_at DESC NULLS LAST, total_time_minutes DESC, item_id ASC"
+        elif sort_by == "title":
+            order_clause = "LOWER(title) ASC, item_id ASC"
+        else:  # time
+            order_clause = "total_time_minutes DESC, rating DESC NULLS LAST, item_id ASC"
+
+        query_sql = text(f"""
+            WITH ep_agg AS (
+                SELECT 
+                    uep.user_list_item_id,
+                    SUM(1 + COALESCE(uep.rewatch_count, 0)) AS ep_count,
+                    MAX(uep.watched_at) AS max_ep_watched_at,
+                    AVG(uep.rating) FILTER (WHERE uep.rating IS NOT NULL AND uep.rating > 0) AS avg_ep_rating
+                FROM user_episode_progress uep
+                JOIN user_list_items uli ON uli.id = uep.user_list_item_id
+                WHERE uli.user_id = :user_uuid
+                  {ep_cutoff_clause}
+                GROUP BY uep.user_list_item_id
+            ),
+            tv_candidates AS (
+                SELECT 
+                    uli.id AS item_id,
+                    m.id AS media_id,
+                    m.tmdb_id,
+                    m.title,
+                    m.media_type,
+                    m.poster_path,
+                    m.release_date,
+                    COALESCE(m.runtime, 0) AS runtime,
+                    m.genres,
+                    COALESCE(uli.rating, ROUND(CAST(ea.avg_ep_rating AS numeric), 1)) AS rating,
+                    COALESCE(uli.rewatch_count, 0) AS rewatch_count,
+                    (COALESCE(m.runtime, 0) * COALESCE(ea.ep_count, 0)) AS total_time_minutes,
+                    COALESCE(ea.ep_count, 0) AS episodes_watched,
+                    uli.status,
+                    GREATEST(
+                        COALESCE(ea.max_ep_watched_at, '1970-01-01'::timestamptz),
+                        COALESCE(uli.last_watched_at, uli.updated_at, uli.created_at, '1970-01-01'::timestamptz)
+                    ) AS last_watched_at
+                FROM user_list_items uli
+                JOIN media m ON m.id = uli.media_id
+                LEFT JOIN ep_agg ea ON ea.user_list_item_id = uli.id
+                WHERE uli.user_id = :user_uuid
+                  AND m.media_type = 'tv'
+                  AND {tv_filter}
+                  {search_filter}
+            )
+            SELECT 
+                *,
+                COUNT(*) OVER() AS total_items_count
+            FROM tv_candidates
+            ORDER BY {order_clause}
+            LIMIT :limit OFFSET :offset
+        """)
+
+    res = await db.execute(query_sql, params)
+    rows = res.fetchall()
+
+    total_items = rows[0].total_items_count if rows else 0
+    total_pages = max(1, (total_items + page_size - 1) // page_size) if total_items > 0 else 0
+
+    page_items = []
+    start = (page - 1) * page_size
+    for idx, row in enumerate(rows):
+        raw_genres = row.genres or []
         genres_list = []
         for g in raw_genres:
             g_name = g.get("name") if isinstance(g, dict) else str(g)
             if g_name:
                 genres_list.append(normalize_genre(g_name))
 
-        if media_type == "movie":
-            is_valid = False
-            if cutoff is not None:
-                if item_date and item_date >= cutoff and item.status in ("completed", "watching"):
-                    is_valid = True
-            else:
-                if item.status in ("completed", "watching") or (item.rewatch_count and item.rewatch_count > 0) or item.rating is not None:
-                    is_valid = True
-
-            if not is_valid:
-                continue
-
-            factor = 1 + (item.rewatch_count or 0)
-            total_time = runtime * factor
-            episodes_watched = 1 if item.status == "completed" else 0
-
-            candidates.append({
-                "id": item.id,
-                "media_id": m.id,
-                "tmdb_id": m.tmdb_id,
-                "title": m.title,
-                "media_type": "movie",
-                "poster_path": m.poster_path,
-                "release_date": m.release_date,
-                "runtime": runtime,
-                "genres": genres_list[:3],
-                "rating": item.rating,
-                "rewatch_count": item.rewatch_count or 0,
-                "total_time_minutes": total_time,
-                "episodes_watched": episodes_watched,
-                "status": item.status,
-                "last_watched_at": item_date
-            })
-
-        elif media_type == "tv":
-            eps = progress_map.get(item.id, [])
-            ep_count = sum(1 + (getattr(ep, "rewatch_count", 0) or 0) for ep in eps)
-
-            is_valid = False
-            if cutoff is not None:
-                if ep_count > 0:
-                    is_valid = True
-            else:
-                if ep_count > 0 or item.status in ("completed", "watching") or item.rating is not None:
-                    is_valid = True
-
-            if not is_valid:
-                continue
-
-            total_time = runtime * ep_count
-            last_date = item_date
-            for ep in eps:
-                ep_dt = ep.watched_at
-                if ep_dt:
-                    if ep_dt.tzinfo is None:
-                        ep_dt = ep_dt.replace(tzinfo=timezone.utc)
-                    if not last_date or ep_dt > last_date:
-                        last_date = ep_dt
-
-            final_rating = item.rating
-            if final_rating is None:
-                ep_ratings = [ep.rating for ep in eps if ep.rating is not None and ep.rating > 0]
-                if ep_ratings:
-                    final_rating = round(sum(ep_ratings) / len(ep_ratings), 1)
-
-            candidates.append({
-                "id": item.id,
-                "media_id": m.id,
-                "tmdb_id": m.tmdb_id,
-                "title": m.title,
-                "media_type": "tv",
-                "poster_path": m.poster_path,
-                "release_date": m.release_date,
-                "runtime": runtime,
-                "genres": genres_list[:3],
-                "rating": final_rating,
-                "rewatch_count": item.rewatch_count or 0,
-                "total_time_minutes": total_time,
-                "episodes_watched": ep_count,
-                "status": item.status,
-                "last_watched_at": last_date
-            })
-
-    def sort_key(x):
-        r_val = x["rating"] if x["rating"] is not None else -1.0
-        t_val = x["total_time_minutes"]
-        time_key = x["last_watched_at"].timestamp() if x["last_watched_at"] else 0
-
-        if sort_by == "rating":
-            return (x["rating"] is not None, r_val, t_val)
-        elif sort_by == "rewatch":
-            return (x["rewatch_count"], t_val, r_val)
-        elif sort_by == "episodes":
-            return (x["episodes_watched"], t_val, r_val)
-        elif sort_by == "recent":
-            return (time_key, t_val)
-        elif sort_by == "title":
-            return x["title"].lower()
-        else: # "time" (default)
-            return (t_val, r_val)
-
-    reverse_sort = (sort_by != "title")
-    candidates.sort(key=sort_key, reverse=reverse_sort)
-
-    total_items = len(candidates)
-    total_pages = max(1, (total_items + page_size - 1) // page_size) if total_items > 0 else 0
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_items = candidates[start:end]
-
-    for idx, obj in enumerate(page_items):
-        obj["rank"] = start + idx + 1
+        page_items.append({
+            "id": row.item_id,
+            "media_id": row.media_id,
+            "tmdb_id": row.tmdb_id,
+            "title": row.title,
+            "media_type": row.media_type,
+            "poster_path": row.poster_path,
+            "release_date": row.release_date,
+            "runtime": row.runtime,
+            "genres": genres_list[:3],
+            "rating": float(row.rating) if row.rating is not None else None,
+            "rewatch_count": row.rewatch_count,
+            "total_time_minutes": row.total_time_minutes,
+            "episodes_watched": row.episodes_watched,
+            "status": row.status,
+            "last_watched_at": row.last_watched_at,
+            "rank": start + idx + 1
+        })
 
     output = {
         "items": page_items,
