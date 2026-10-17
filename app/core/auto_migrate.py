@@ -351,6 +351,149 @@ async def run_auto_migrations():
             """))
             await session.commit()
             logger.info("✅ [AutoMigrate] Índices compostos de estatísticas e rankings validados no banco de dados.")
+
+            # 11. Garantia idempotente para Nível 3: Contadores desnormalizados e user_stats_summary
+            await session.execute(text("""
+                ALTER TABLE user_list_items 
+                ADD COLUMN IF NOT EXISTS episodes_watched_count INTEGER NOT NULL DEFAULT 0;
+            """))
+            await session.execute(text("""
+                ALTER TABLE user_list_items 
+                ADD COLUMN IF NOT EXISTS total_time_minutes INTEGER NOT NULL DEFAULT 0;
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_list_items_user_time 
+                ON user_list_items (user_id, total_time_minutes DESC);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_list_items_user_episodes 
+                ON user_list_items (user_id, episodes_watched_count DESC);
+            """))
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_stats_summary (
+                    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    total_time_movies INTEGER NOT NULL DEFAULT 0,
+                    total_time_tv INTEGER NOT NULL DEFAULT 0,
+                    total_movies_watched INTEGER NOT NULL DEFAULT 0,
+                    total_episodes_watched INTEGER NOT NULL DEFAULT 0,
+                    average_rating NUMERIC(3, 2),
+                    total_rated INTEGER NOT NULL DEFAULT 0,
+                    rating_distribution JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    top_genres JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    rankings JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    timeline JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    kpis JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """))
+
+            # Triggers de atualização automática
+            await session.execute(text("""
+                CREATE OR REPLACE FUNCTION update_user_list_item_counters()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    target_item_id UUID;
+                    v_runtime INT;
+                BEGIN
+                    IF (TG_OP = 'DELETE') THEN
+                        target_item_id := OLD.user_list_item_id;
+                    ELSE
+                        target_item_id := NEW.user_list_item_id;
+                    END IF;
+
+                    SELECT COALESCE(m.runtime, 0) INTO v_runtime
+                    FROM user_list_items uli
+                    JOIN media m ON m.id = uli.media_id
+                    WHERE uli.id = target_item_id;
+
+                    UPDATE user_list_items
+                    SET 
+                        episodes_watched_count = COALESCE((
+                            SELECT SUM(1 + COALESCE(rewatch_count, 0))
+                            FROM user_episode_progress
+                            WHERE user_list_item_id = target_item_id
+                        ), 0),
+                        total_time_minutes = COALESCE((
+                            SELECT SUM(1 + COALESCE(rewatch_count, 0)) * COALESCE(v_runtime, 0)
+                            FROM user_episode_progress
+                            WHERE user_list_item_id = target_item_id
+                        ), 0)
+                    WHERE id = target_item_id;
+
+                    RETURN NULL;
+                END;
+                $$ LANGUAGE plpgsql;
+            """))
+            await session.execute(text("DROP TRIGGER IF EXISTS trg_user_episode_progress_counters ON user_episode_progress;"))
+            await session.execute(text("""
+                CREATE TRIGGER trg_user_episode_progress_counters
+                AFTER INSERT OR UPDATE OR DELETE ON user_episode_progress
+                FOR EACH ROW EXECUTE FUNCTION update_user_list_item_counters();
+            """))
+
+            await session.execute(text("""
+                CREATE OR REPLACE FUNCTION update_user_movie_item_counters()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    v_runtime INT;
+                    v_media_type TEXT;
+                BEGIN
+                    SELECT m.media_type, COALESCE(m.runtime, 0) INTO v_media_type, v_runtime
+                    FROM media m
+                    WHERE m.id = NEW.media_id;
+
+                    IF v_media_type = 'movie' THEN
+                        IF NEW.status IN ('completed', 'watching') THEN
+                            NEW.episodes_watched_count := 1;
+                            NEW.total_time_minutes := (1 + COALESCE(NEW.rewatch_count, 0)) * v_runtime;
+                        ELSE
+                            NEW.episodes_watched_count := 0;
+                            NEW.total_time_minutes := 0;
+                        END IF;
+                    END IF;
+
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+            """))
+            await session.execute(text("DROP TRIGGER IF EXISTS trg_user_movie_item_counters ON user_list_items;"))
+            await session.execute(text("""
+                CREATE TRIGGER trg_user_movie_item_counters
+                BEFORE INSERT OR UPDATE OF status, rewatch_count ON user_list_items
+                FOR EACH ROW EXECUTE FUNCTION update_user_movie_item_counters();
+            """))
+
+            # Backfill idempotente
+            await session.execute(text("""
+                WITH ep_counts AS (
+                    SELECT user_list_item_id, SUM(1 + COALESCE(rewatch_count, 0)) AS ep_count
+                    FROM user_episode_progress
+                    GROUP BY user_list_item_id
+                )
+                UPDATE user_list_items uli
+                SET 
+                    episodes_watched_count = COALESCE(ec.ep_count, 0),
+                    total_time_minutes = COALESCE(ec.ep_count, 0) * COALESCE(m.runtime, 0)
+                FROM media m, ep_counts ec
+                WHERE m.id = uli.media_id 
+                  AND m.media_type = 'tv' 
+                  AND ec.user_list_item_id = uli.id
+                  AND (uli.episodes_watched_count = 0 OR uli.total_time_minutes = 0);
+            """))
+
+            await session.execute(text("""
+                UPDATE user_list_items uli
+                SET 
+                    episodes_watched_count = CASE WHEN uli.status IN ('completed', 'watching') THEN 1 ELSE 0 END,
+                    total_time_minutes = CASE WHEN uli.status IN ('completed', 'watching') THEN (1 + COALESCE(uli.rewatch_count, 0)) * COALESCE(m.runtime, 0) ELSE 0 END
+                FROM media m
+                WHERE m.id = uli.media_id 
+                  AND m.media_type = 'movie'
+                  AND uli.status IN ('completed', 'watching')
+                  AND (uli.episodes_watched_count = 0 OR uli.total_time_minutes = 0);
+            """))
+            await session.commit()
+            logger.info("✅ [AutoMigrate] Nível 3 (Contadores desnormalizados, triggers e user_stats_summary) validados.")
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
 

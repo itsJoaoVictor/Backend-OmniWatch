@@ -1,6 +1,6 @@
 import uuid
 from sqlalchemy import Column, String, DateTime, Integer, Float, Boolean, ForeignKey, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -15,6 +15,8 @@ class UserListItem(Base):
     rating = Column(Float, nullable=True)
     rewatch_count = Column(Integer, default=0, nullable=False)
     is_favorite = Column(Boolean, default=False, nullable=False, index=True)
+    episodes_watched_count = Column(Integer, default=0, nullable=False, server_default="0")
+    total_time_minutes = Column(Integer, default=0, nullable=False, server_default="0")
     last_watched_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -39,3 +41,23 @@ class UserEpisodeProgress(Base):
     watched_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user_list_item = relationship("UserListItem", back_populates="episodes")
+
+class UserStatsSummary(Base):
+    __tablename__ = "user_stats_summary"
+
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    total_time_movies = Column(Integer, default=0, nullable=False, server_default="0")
+    total_time_tv = Column(Integer, default=0, nullable=False, server_default="0")
+    total_movies_watched = Column(Integer, default=0, nullable=False, server_default="0")
+    total_episodes_watched = Column(Integer, default=0, nullable=False, server_default="0")
+    average_rating = Column(Float, nullable=True)
+    total_rated = Column(Integer, default=0, nullable=False, server_default="0")
+    rating_distribution = Column(JSONB, nullable=False, server_default="{}")
+    top_genres = Column(JSONB, nullable=False, server_default="[]")
+    rankings = Column(JSONB, nullable=False, server_default="{}")
+    timeline = Column(JSONB, nullable=False, server_default="[]")
+    kpis = Column(JSONB, nullable=False, server_default="{}")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User")
+

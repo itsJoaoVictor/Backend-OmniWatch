@@ -2141,6 +2141,46 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
         "timeline": timeline
     }
 
+    # Nível 3: Persistência em tabela de sumarização pré-calculada para leituras ultra-rápidas
+    if period == "all" and media_type == "all":
+        try:
+            from sqlalchemy.dialects.postgresql import insert
+            from app.tracking.models import UserStatsSummary
+            stmt = insert(UserStatsSummary).values(
+                user_id=user_uuid,
+                total_time_movies=output["totalTimeMovies"],
+                total_time_tv=output["totalTimeTv"],
+                total_movies_watched=output["totalMovies"],
+                total_episodes_watched=output["totalEpisodes"],
+                average_rating=output["kpis"]["averageRating"],
+                total_rated=output["kpis"]["totalRated"],
+                rating_distribution=output["ratingDistribution"],
+                top_genres=output["topGenres"],
+                rankings=output["rankings"],
+                timeline=output["timeline"],
+                kpis=output["kpis"]
+            ).on_conflict_do_update(
+                index_elements=[UserStatsSummary.user_id],
+                set_={
+                    "total_time_movies": output["totalTimeMovies"],
+                    "total_time_tv": output["totalTimeTv"],
+                    "total_movies_watched": output["totalMovies"],
+                    "total_episodes_watched": output["totalEpisodes"],
+                    "average_rating": output["kpis"]["averageRating"],
+                    "total_rated": output["kpis"]["totalRated"],
+                    "rating_distribution": output["ratingDistribution"],
+                    "top_genres": output["topGenres"],
+                    "rankings": output["rankings"],
+                    "timeline": output["timeline"],
+                    "kpis": output["kpis"],
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            )
+            await db.execute(stmt)
+            await db.commit()
+        except Exception as e:
+            logger.warning("Não foi possível persistir user_stats_summary: %s", e)
+
     stats_cache.set(cache_key, output)
     return output
 
@@ -2172,6 +2212,32 @@ async def get_user_statistics(
             else:
                 asyncio.create_task(recompute_and_cache_stats(user_id, period, media_type))
         return cached_data
+
+    # Nível 3: Leitura direta e instantânea (<1ms) de user_stats_summary para o resumo global
+    if period == "all" and media_type == "all":
+        try:
+            from app.tracking.models import UserStatsSummary
+            res_summary = await db.execute(
+                select(UserStatsSummary).where(UserStatsSummary.user_id == user_uuid)
+            )
+            summary_row = res_summary.scalar_one_or_none()
+            if summary_row:
+                output = {
+                    "totalTime": summary_row.total_time_movies + summary_row.total_time_tv,
+                    "totalTimeMovies": summary_row.total_time_movies,
+                    "totalTimeTv": summary_row.total_time_tv,
+                    "totalMovies": summary_row.total_movies_watched,
+                    "totalEpisodes": summary_row.total_episodes_watched,
+                    "ratingDistribution": summary_row.rating_distribution,
+                    "topGenres": summary_row.top_genres,
+                    "kpis": summary_row.kpis,
+                    "rankings": summary_row.rankings,
+                    "timeline": summary_row.timeline
+                }
+                stats_cache.set(cache_key, output)
+                return output
+        except Exception as e:
+            logger.warning("Falha ao buscar user_stats_summary: %s", e)
 
     return await _compute_user_statistics(db, user_id, period=period, media_type=media_type)
 
@@ -2322,20 +2388,9 @@ async def _compute_user_media_ranking(
         else:  # time
             order_clause = "total_time_minutes DESC, rating DESC NULLS LAST, item_id ASC"
 
-        query_sql = text(f"""
-            WITH ep_agg AS (
-                SELECT 
-                    uep.user_list_item_id,
-                    SUM(1 + COALESCE(uep.rewatch_count, 0)) AS ep_count,
-                    MAX(uep.watched_at) AS max_ep_watched_at,
-                    AVG(uep.rating) FILTER (WHERE uep.rating IS NOT NULL AND uep.rating > 0) AS avg_ep_rating
-                FROM user_episode_progress uep
-                JOIN user_list_items uli ON uli.id = uep.user_list_item_id
-                WHERE uli.user_id = :user_uuid
-                  {ep_cutoff_clause}
-                GROUP BY uep.user_list_item_id
-            ),
-            tv_candidates AS (
+        if cutoff is None:
+            # Nível 3: Fast-path O(1) usando contadores desnormalizados de UserListItem sem CTE
+            query_sql = text(f"""
                 SELECT 
                     uli.id AS item_id,
                     m.id AS media_id,
@@ -2346,30 +2401,71 @@ async def _compute_user_media_ranking(
                     m.release_date,
                     COALESCE(m.runtime, 0) AS runtime,
                     m.genres,
-                    COALESCE(uli.rating, ROUND(CAST(ea.avg_ep_rating AS numeric), 1)) AS rating,
+                    uli.rating,
                     COALESCE(uli.rewatch_count, 0) AS rewatch_count,
-                    (COALESCE(m.runtime, 0) * COALESCE(ea.ep_count, 0)) AS total_time_minutes,
-                    COALESCE(ea.ep_count, 0) AS episodes_watched,
+                    uli.total_time_minutes,
+                    uli.episodes_watched_count AS episodes_watched,
                     uli.status,
-                    GREATEST(
-                        COALESCE(ea.max_ep_watched_at, '1970-01-01'::timestamptz),
-                        COALESCE(uli.last_watched_at, uli.updated_at, uli.created_at, '1970-01-01'::timestamptz)
-                    ) AS last_watched_at
+                    COALESCE(uli.last_watched_at, uli.updated_at, uli.created_at) AS last_watched_at,
+                    COUNT(*) OVER() AS total_items_count
                 FROM user_list_items uli
                 JOIN media m ON m.id = uli.media_id
-                LEFT JOIN ep_agg ea ON ea.user_list_item_id = uli.id
                 WHERE uli.user_id = :user_uuid
                   AND m.media_type = 'tv'
-                  AND {tv_filter}
+                  AND (uli.episodes_watched_count > 0 OR uli.status IN ('completed', 'watching') OR uli.rating IS NOT NULL)
                   {search_filter}
-            )
-            SELECT 
-                *,
-                COUNT(*) OVER() AS total_items_count
-            FROM tv_candidates
-            ORDER BY {order_clause}
-            LIMIT :limit OFFSET :offset
-        """)
+                ORDER BY {order_clause}
+                LIMIT :limit OFFSET :offset
+            """)
+        else:
+            query_sql = text(f"""
+                WITH ep_agg AS (
+                    SELECT 
+                        uep.user_list_item_id,
+                        SUM(1 + COALESCE(uep.rewatch_count, 0)) AS ep_count,
+                        MAX(uep.watched_at) AS max_ep_watched_at,
+                        AVG(uep.rating) FILTER (WHERE uep.rating IS NOT NULL AND uep.rating > 0) AS avg_ep_rating
+                    FROM user_episode_progress uep
+                    JOIN user_list_items uli ON uli.id = uep.user_list_item_id
+                    WHERE uli.user_id = :user_uuid
+                      {ep_cutoff_clause}
+                    GROUP BY uep.user_list_item_id
+                ),
+                tv_candidates AS (
+                    SELECT 
+                        uli.id AS item_id,
+                        m.id AS media_id,
+                        m.tmdb_id,
+                        m.title,
+                        m.media_type,
+                        m.poster_path,
+                        m.release_date,
+                        COALESCE(m.runtime, 0) AS runtime,
+                        m.genres,
+                        COALESCE(uli.rating, ROUND(CAST(ea.avg_ep_rating AS numeric), 1)) AS rating,
+                        COALESCE(uli.rewatch_count, 0) AS rewatch_count,
+                        (COALESCE(m.runtime, 0) * COALESCE(ea.ep_count, 0)) AS total_time_minutes,
+                        COALESCE(ea.ep_count, 0) AS episodes_watched,
+                        uli.status,
+                        GREATEST(
+                            COALESCE(ea.max_ep_watched_at, '1970-01-01'::timestamptz),
+                            COALESCE(uli.last_watched_at, uli.updated_at, uli.created_at, '1970-01-01'::timestamptz)
+                        ) AS last_watched_at
+                    FROM user_list_items uli
+                    JOIN media m ON m.id = uli.media_id
+                    LEFT JOIN ep_agg ea ON ea.user_list_item_id = uli.id
+                    WHERE uli.user_id = :user_uuid
+                      AND m.media_type = 'tv'
+                      AND {tv_filter}
+                      {search_filter}
+                )
+                SELECT 
+                    *,
+                    COUNT(*) OVER() AS total_items_count
+                FROM tv_candidates
+                ORDER BY {order_clause}
+                LIMIT :limit OFFSET :offset
+            """)
 
     res = await db.execute(query_sql, params)
     rows = res.fetchall()
