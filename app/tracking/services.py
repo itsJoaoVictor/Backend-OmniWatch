@@ -2024,29 +2024,39 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
             if item.rating:
                 g_entry["ratings"].append(item.rating)
 
-        # Mapeamento rápido de person_id via cast_ids e crew_ids salvos no Media
+        # Mapeamento rápido de person_id e profile_path via cast_ids e crew_ids salvos no Media
         cast_person_map = {}
+        cast_profile_map = {}
         if m.cast_ids and isinstance(m.cast_ids, list):
             for c_info in m.cast_ids:
-                if isinstance(c_info, dict) and c_info.get("name") and c_info.get("person_id"):
-                    cast_person_map[c_info["name"]] = c_info["person_id"]
+                if isinstance(c_info, dict) and c_info.get("name"):
+                    if c_info.get("person_id"):
+                        cast_person_map[c_info["name"]] = c_info["person_id"]
+                    if c_info.get("profile_path"):
+                        cast_profile_map[c_info["name"]] = c_info["profile_path"]
 
         crew_person_map = {}
+        crew_profile_map = {}
         if m.crew_ids and isinstance(m.crew_ids, list):
             for c_info in m.crew_ids:
-                if isinstance(c_info, dict) and c_info.get("name") and c_info.get("person_id"):
-                    crew_person_map[c_info["name"]] = c_info["person_id"]
+                if isinstance(c_info, dict) and c_info.get("name"):
+                    if c_info.get("person_id"):
+                        crew_person_map[c_info["name"]] = c_info["person_id"]
+                    if c_info.get("profile_path"):
+                        crew_profile_map[c_info["name"]] = c_info["profile_path"]
 
         raw_cast = m.main_cast or []
         if isinstance(raw_cast, list):
             for actor in raw_cast[:5]:
                 a_name = actor.get("name") if isinstance(actor, dict) else str(actor).strip()
                 if a_name:
-                    c_entry = cast_stats.setdefault(a_name, {"count": 0, "totalTime": 0, "ratings": [], "person_id": None})
+                    c_entry = cast_stats.setdefault(a_name, {"count": 0, "totalTime": 0, "ratings": [], "person_id": None, "profile_path": None})
                     c_entry["count"] += 1
                     c_entry["totalTime"] += item_time_minutes
                     if not c_entry.get("person_id") and a_name in cast_person_map:
                         c_entry["person_id"] = cast_person_map[a_name]
+                    if not c_entry.get("profile_path") and a_name in cast_profile_map:
+                        c_entry["profile_path"] = cast_profile_map[a_name]
                     if item.rating:
                         c_entry["ratings"].append(item.rating)
 
@@ -2055,11 +2065,13 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
             for director in raw_dirs:
                 d_name = director.get("name") if isinstance(director, dict) else str(director).strip()
                 if d_name:
-                    d_entry = directors_stats.setdefault(d_name, {"count": 0, "totalTime": 0, "ratings": [], "person_id": None})
+                    d_entry = directors_stats.setdefault(d_name, {"count": 0, "totalTime": 0, "ratings": [], "person_id": None, "profile_path": None})
                     d_entry["count"] += 1
                     d_entry["totalTime"] += item_time_minutes
                     if not d_entry.get("person_id") and d_name in crew_person_map:
                         d_entry["person_id"] = crew_person_map[d_name]
+                    if not d_entry.get("profile_path") and d_name in crew_profile_map:
+                        d_entry["profile_path"] = crew_profile_map[d_name]
                     if item.rating:
                         d_entry["ratings"].append(item.rating)
 
@@ -2124,6 +2136,7 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
             res.append({
                 "name": name,
                 "person_id": data.get("person_id"),
+                "profile_path": data.get("profile_path"),
                 "count": data["count"],
                 "totalTime": data["totalTime"],
                 "avgRating": round(sum(data["ratings"]) / len(data["ratings"]), 1) if data["ratings"] else None,
@@ -2712,9 +2725,11 @@ async def _compute_user_people_ranking(
 
         if role == "directors":
             person_id_map = {c["name"]: c.get("person_id") for c in (r.crew_ids or []) if isinstance(c, dict) and c.get("name")}
+            profile_path_map = {c["name"]: c.get("profile_path") for c in (r.crew_ids or []) if isinstance(c, dict) and c.get("name")}
             people_list = r.directors or []
         else:  # cast
             person_id_map = {c["name"]: c.get("person_id") for c in (r.cast_ids or []) if isinstance(c, dict) and c.get("name")}
+            profile_path_map = {c["name"]: c.get("profile_path") for c in (r.cast_ids or []) if isinstance(c, dict) and c.get("name")}
             people_list = (r.main_cast or [])[:5]
 
         for p in people_list:
@@ -2728,6 +2743,7 @@ async def _compute_user_people_ranking(
             entry = people_map.setdefault(name, {
                 "name": name,
                 "person_id": None,
+                "profile_path": None,
                 "role": role,
                 "count": 0,
                 "totalTime": 0,
@@ -2738,6 +2754,8 @@ async def _compute_user_people_ranking(
             entry["totalTime"] += item_time
             if not entry["person_id"] and name in person_id_map:
                 entry["person_id"] = person_id_map[name]
+            if not entry["profile_path"] and name in profile_path_map:
+                entry["profile_path"] = profile_path_map[name]
             if r.rating and r.rating > 0:
                 entry["ratings"].append(r.rating)
             if len(entry["sample_titles"]) < 3 and r.title not in entry["sample_titles"]:
@@ -2767,6 +2785,7 @@ async def _compute_user_people_ranking(
             "rank": start + idx + 1,
             "name": p["name"],
             "person_id": p.get("person_id"),
+            "profile_path": p.get("profile_path"),
             "role": p["role"],
             "count": p["count"],
             "totalTime": p["totalTime"],

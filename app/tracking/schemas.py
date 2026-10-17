@@ -104,6 +104,7 @@ class PeopleRankingItem(BaseModel):
     rank: int
     name: str
     person_id: Optional[int] = None
+    profile_path: Optional[str] = None
     role: str
     count: int
     totalTime: int

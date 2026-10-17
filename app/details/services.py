@@ -120,14 +120,14 @@ async def fetch_movie_details(movie_id: int) -> MovieDetailsResponse:
     ]
     credits_response = CreditsResponse(cast=cast, crew=crew)
 
-    # Fase 4: person_id TMDB — estruturado para discover filtering
+    # Fase 4: person_id TMDB — estruturado para discover filtering e fotos
     cast_ids = [
-        {"name": c.get("name"), "person_id": c.get("id")}
+        {"name": c.get("name"), "person_id": c.get("id"), "profile_path": c.get("profile_path")}
         for c in credits_data.get("cast", [])[:15]
         if c.get("id") and c.get("name")
     ]
     crew_ids = [
-        {"name": c.get("name"), "person_id": c.get("id")}
+        {"name": c.get("name"), "person_id": c.get("id"), "profile_path": c.get("profile_path")}
         for c in credits_data.get("crew", [])
         if c.get("job") == "Director" and c.get("id") and c.get("name")
     ]
@@ -289,23 +289,23 @@ async def fetch_tv_details(series_id: int) -> TvSeriesDetailsResponse:
     ]
     credits_response = CreditsResponse(cast=cast, crew=crew)
 
-    # Fase 4: person_id TMDB — estruturado para discover filtering
+    # Fase 4: person_id TMDB — estruturado para discover filtering e fotos
     cast_ids = [
-        {"name": c.get("name"), "person_id": c.get("id")}
+        {"name": c.get("name"), "person_id": c.get("id"), "profile_path": c.get("profile_path")}
         for c in credits_data.get("cast", [])[:15]
         if c.get("id") and c.get("name")
     ]
     # Para TV, criadores vêm de 'created_by'; também incluímos diretores do crew
     crew_ids = [
-        {"name": c.get("name"), "person_id": c.get("id")}
+        {"name": c.get("name"), "person_id": c.get("id"), "profile_path": c.get("profile_path")}
         for c in data.get("created_by", [])
         if c.get("id") and c.get("name")
     ]
     # Complementa com diretores do crew (Directors of TV episodes, etc.)
     for c in credits_data.get("crew", []):
         if c.get("job") in ("Director", "Series Director") and c.get("id") and c.get("name"):
-            entry = {"name": c.get("name"), "person_id": c.get("id")}
-            if entry not in crew_ids:
+            entry = {"name": c.get("name"), "person_id": c.get("id"), "profile_path": c.get("profile_path")}
+            if not any(x.get("person_id") == c.get("id") for x in crew_ids):
                 crew_ids.append(entry)
 
     videos_data = data.get("videos", {}).get("results", [])
