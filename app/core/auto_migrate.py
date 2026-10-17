@@ -183,6 +183,158 @@ async def run_auto_migrations():
             """))
             await session.commit()
             logger.info("✅ [AutoMigrate] Tabela 'friendships', 'last_seen_release_id', 'rewatch_count' e índices validados no banco de dados.")
+
+            # 9. Garantia idempotente para Universos (universes, universe_items, user_universes, user_universe_suggestions e colunas em media)
+            await session.execute(text("""
+                ALTER TABLE media 
+                ADD COLUMN IF NOT EXISTS universe_key VARCHAR;
+            """))
+            await session.execute(text("""
+                ALTER TABLE media 
+                ADD COLUMN IF NOT EXISTS universe_name VARCHAR;
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_media_universe_key 
+                ON media (universe_key);
+            """))
+
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS universes (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    universe_key VARCHAR NOT NULL UNIQUE,
+                    name VARCHAR NOT NULL,
+                    overview TEXT,
+                    poster_path VARCHAR,
+                    backdrop_path VARCHAR,
+                    items_count INTEGER NOT NULL DEFAULT 0,
+                    movies_count INTEGER NOT NULL DEFAULT 0,
+                    tv_count INTEGER NOT NULL DEFAULT 0,
+                    collections_count INTEGER NOT NULL DEFAULT 0,
+                    last_synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_universes_universe_key ON universes (universe_key);
+            """))
+
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS universe_items (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    universe_id UUID NOT NULL REFERENCES universes(id) ON DELETE CASCADE,
+                    media_id UUID REFERENCES media(id) ON DELETE SET NULL,
+                    tmdb_id INTEGER NOT NULL,
+                    media_type VARCHAR(20) NOT NULL DEFAULT 'movie',
+                    title VARCHAR NOT NULL,
+                    release_date VARCHAR,
+                    poster_path VARCHAR,
+                    backdrop_path VARCHAR,
+                    collection_name VARCHAR,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    CONSTRAINT uq_universe_item_universe_tmdb_type UNIQUE (universe_id, tmdb_id, media_type)
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_universe_items_universe_id ON universe_items (universe_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_universe_items_tmdb_id ON universe_items (tmdb_id);
+            """))
+
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_universes (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    universe_id UUID NOT NULL REFERENCES universes(id) ON DELETE CASCADE,
+                    auto_add BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    CONSTRAINT uq_user_universe UNIQUE (user_id, universe_id)
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universes_user_id ON user_universes (user_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universes_universe_id ON user_universes (universe_id);
+            """))
+
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_universe_suggestions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    universe_key VARCHAR NOT NULL,
+                    name VARCHAR NOT NULL,
+                    overview TEXT,
+                    poster_path VARCHAR,
+                    backdrop_path VARCHAR,
+                    total_items INTEGER NOT NULL DEFAULT 0,
+                    movies_count INTEGER NOT NULL DEFAULT 0,
+                    tv_count INTEGER NOT NULL DEFAULT 0,
+                    collections_count INTEGER NOT NULL DEFAULT 0,
+                    items_in_list INTEGER NOT NULL DEFAULT 0,
+                    matched_titles JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    discovered_members JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    is_dismissed BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    CONSTRAINT uq_user_universe_suggestion UNIQUE (user_id, universe_key)
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universe_suggestions_user_id ON user_universe_suggestions (user_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universe_suggestions_universe_key ON user_universe_suggestions (universe_key);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universe_suggestions_is_dismissed ON user_universe_suggestions (is_dismissed);
+            """))
+            await session.execute(text("""
+                ALTER TABLE user_universe_suggestions
+                ADD COLUMN IF NOT EXISTS dismissed_items_count INTEGER DEFAULT 0;
+            """))
+            await session.execute(text("""
+                ALTER TABLE user_universe_suggestions
+                ADD COLUMN IF NOT EXISTS dismissed_media_types JSONB DEFAULT '[]'::jsonb;
+            """))
+            await session.execute(text("""
+                ALTER TABLE user_universe_suggestions
+                ADD COLUMN IF NOT EXISTS dismissed_collection_ids JSONB DEFAULT '[]'::jsonb;
+            """))
+            await session.execute(text("""
+                ALTER TABLE user_universe_suggestions
+                ADD COLUMN IF NOT EXISTS is_reactivated BOOLEAN DEFAULT FALSE;
+            """))
+            await session.execute(text("""
+                ALTER TABLE user_universe_suggestions
+                ADD COLUMN IF NOT EXISTS reactivation_reason VARCHAR;
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universe_suggestions_is_reactivated ON user_universe_suggestions (is_reactivated);
+            """))
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_universe_ignored_items (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    universe_id UUID NOT NULL REFERENCES universes(id) ON DELETE CASCADE,
+                    tmdb_id INTEGER NOT NULL,
+                    media_type VARCHAR NOT NULL DEFAULT 'movie',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    CONSTRAINT uq_user_universe_ignored_item UNIQUE (user_id, universe_id, tmdb_id, media_type)
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universe_ignored_items_user_id ON user_universe_ignored_items (user_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universe_ignored_items_universe_id ON user_universe_ignored_items (universe_id);
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_universe_ignored_items_tmdb_id ON user_universe_ignored_items (tmdb_id);
+            """))
+            await session.commit()
+            logger.info("✅ [AutoMigrate] Tabelas de Universos e colunas validadas no banco de dados.")
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
 

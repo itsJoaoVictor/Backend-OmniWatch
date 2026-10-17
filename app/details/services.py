@@ -30,6 +30,20 @@ from app.details.schemas import (
     CollectionResponse
 )
 
+def _is_non_latin(s: str) -> bool:
+    """Verifica se uma string possui caracteres CJK (japonês/chinês/coreano)."""
+    if not s:
+        return False
+    cjk = sum(
+        1
+        for ch in s
+        if "\u4e00" <= ch <= "\u9fff"
+        or "\u3040" <= ch <= "\u30ff"
+        or "\uac00" <= ch <= "\ud7af"
+        or "\u3000" <= ch <= "\u303f"
+    )
+    return cjk >= 2 or cjk > len(s) * 0.15
+
 async def fetch_movie_details(movie_id: int) -> MovieDetailsResponse:
     if not settings.TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="TMDB API key not configured")
@@ -58,6 +72,18 @@ async def fetch_movie_details(movie_id: int) -> MovieDetailsResponse:
             raise HTTPException(status_code=404, detail="Filme não encontrado.")
         response.raise_for_status()
         data = response.json()
+        if not data.get("title") or _is_non_latin(data.get("title", "")):
+            try:
+                en_resp = await client.get(url, headers=headers, params={**params, "language": "en-US"}, timeout=6.0)
+                if en_resp.status_code == 200:
+                    en_data = en_resp.json()
+                    en_title = en_data.get("title")
+                    if en_title and not _is_non_latin(en_title):
+                        data["title"] = en_title
+                    if (not data.get("overview") or _is_non_latin(data.get("overview", ""))) and en_data.get("overview"):
+                        data["overview"] = en_data.get("overview")
+            except Exception:
+                pass
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Filme não encontrado.")
@@ -216,6 +242,18 @@ async def fetch_tv_details(series_id: int) -> TvSeriesDetailsResponse:
             raise HTTPException(status_code=404, detail="Série não encontrada.")
         response.raise_for_status()
         data = response.json()
+        if not data.get("name") or _is_non_latin(data.get("name", "")):
+            try:
+                en_resp = await client.get(url, headers=headers, params={**params, "language": "en-US"}, timeout=6.0)
+                if en_resp.status_code == 200:
+                    en_data = en_resp.json()
+                    en_name = en_data.get("name")
+                    if en_name and not _is_non_latin(en_name):
+                        data["name"] = en_name
+                    if (not data.get("overview") or _is_non_latin(data.get("overview", ""))) and en_data.get("overview"):
+                        data["overview"] = en_data.get("overview")
+            except Exception:
+                pass
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Série não encontrada.")
@@ -537,6 +575,31 @@ async def fetch_collection_details(collection_id: int) -> CollectionResponse:
             raise HTTPException(status_code=404, detail="Coleção não encontrada.")
         response.raise_for_status()
         data = response.json()
+        if not data.get("name") or _is_non_latin(data.get("name", "")):
+            try:
+                en_resp = await client.get(url, headers=headers, params={**params, "language": "en-US"}, timeout=6.0)
+                if en_resp.status_code == 200:
+                    en_data = en_resp.json()
+                    en_name = en_data.get("name")
+                    if en_name and not _is_non_latin(en_name):
+                        data["name"] = en_name
+                    if (not data.get("overview") or _is_non_latin(data.get("overview", ""))) and en_data.get("overview"):
+                        data["overview"] = en_data.get("overview")
+            except Exception:
+                pass
+
+        has_non_latin_parts = any(_is_non_latin(p.get("title", "")) for p in data.get("parts", []))
+        en_parts_by_id = {}
+        if has_non_latin_parts:
+            try:
+                en_col_resp = await client.get(url, headers=headers, params={**params, "language": "en-US"}, timeout=6.0)
+                if en_col_resp.status_code == 200:
+                    for ep in en_col_resp.json().get("parts", []):
+                        if ep.get("id") and ep.get("title") and not _is_non_latin(ep["title"]):
+                            en_parts_by_id[ep["id"]] = ep["title"]
+            except Exception:
+                pass
+
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Coleção não encontrada.")
@@ -550,9 +613,12 @@ async def fetch_collection_details(collection_id: int) -> CollectionResponse:
 
     parts = []
     for part in data.get("parts", []):
+        p_title = part.get("title", "")
+        if _is_non_latin(p_title) and part.get("id") in en_parts_by_id:
+            p_title = en_parts_by_id[part["id"]]
         parts.append({
             "id": part.get("id"),
-            "title": part.get("title", ""),
+            "title": p_title,
             "overview": part.get("overview", ""),
             "poster_path": part.get("poster_path"),
             "backdrop_path": part.get("backdrop_path"),

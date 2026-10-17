@@ -24,6 +24,8 @@ class MediaBase(BaseModel):
     runtime: Optional[int] = 0
     collection_tmdb_id: Optional[int] = None
     collection_name: Optional[str] = None
+    universe_key: Optional[str] = None
+    universe_name: Optional[str] = None
 
 class MediaCreate(MediaBase):
     pass
@@ -43,6 +45,8 @@ class MediaResponse(BaseModel):
     runtime: Optional[int] = 0
     collection_tmdb_id: Optional[int] = None
     collection_name: Optional[str] = None
+    universe_key: Optional[str] = None
+    universe_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -50,6 +54,13 @@ class MediaResponse(BaseModel):
     @classmethod
     def clean_collection_tmdb_id(cls, v):
         if v is not None and isinstance(v, int) and v <= 0:
+            return None
+        return v
+
+    @field_validator('universe_key', mode='before')
+    @classmethod
+    def clean_universe_key(cls, v):
+        if v is not None and isinstance(v, str) and v.strip().lower() in ("", "none"):
             return None
         return v
 

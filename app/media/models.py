@@ -28,6 +28,8 @@ class Media(Base):
     runtime = Column(Integer, nullable=True, default=0)
     collection_tmdb_id = Column(Integer, nullable=True, index=True)
     collection_name = Column(String, nullable=True)
+    universe_key = Column(String, nullable=True, index=True)
+    universe_name = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

@@ -67,6 +67,10 @@ class CollectionResponse(BaseModel):
     backdrop_path: Optional[str] = None
     parts: List[CollectionPartItem]
 
+class UniverseRef(BaseModel):
+    universe_key: str
+    name: str
+
 class MovieDetailsResponse(BaseModel):
     id: int
     title: str
@@ -83,6 +87,7 @@ class MovieDetailsResponse(BaseModel):
     genres: List[GenreItem]
     production_companies: List[ProductionCompanyItem] = []
     belongs_to_collection: Optional[CollectionItem] = None
+    universe: Optional[UniverseRef] = None
     credits: CreditsResponse
     videos: List[VideoItem]
     watch_providers: List[WatchProviderItem] = []
@@ -146,6 +151,8 @@ class TvSeriesDetailsResponse(BaseModel):
     networks: List[NetworkItem] = []
     last_episode_to_air: Optional[EpisodeItem] = None
     next_episode_to_air: Optional[EpisodeItem] = None
+    belongs_to_collection: Optional[CollectionItem] = None
+    universe: Optional[UniverseRef] = None
     seasons: List[SeasonItem]
     credits: CreditsResponse
     videos: List[VideoItem]

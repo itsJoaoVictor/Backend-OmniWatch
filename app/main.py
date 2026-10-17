@@ -19,11 +19,17 @@ from app.recommendation.router import router as recommendation_router
 from app.recommendation.ranker import run_ranker_training_loop
 from app.notifications.router import router as notifications_router
 from app.media_collections.router import router as collections_router
+from app.universes.router import router as universes_router
 from app.custom_lists.router import router as custom_lists_router
 from app.media_collections.services import (
     run_collection_sync_loop,
     run_collection_suggestions_loop,
     scan_all_users_collection_suggestions
+)
+from app.universes.services import (
+    run_universe_sync_loop,
+    run_universe_suggestions_loop,
+    scan_all_users_universe_suggestions
 )
 from app.calendar.sync import run_calendar_sync_loop, migrate_existing_future_media
 from app.images.router import router as images_router
@@ -41,23 +47,37 @@ async def lifespan(app: FastAPI):
     # Sincroniza e migra títulos futuros para 'upcoming' automaticamente no startup
     await migrate_existing_future_media()
 
-    # Executa scan de sugestões de coleções em background logo no startup
+    # Executa scan de sugestões de coleções e universos em background logo no startup
     asyncio.create_task(scan_all_users_collection_suggestions())
+    asyncio.create_task(scan_all_users_universe_suggestions())
 
     # Start background tasks
     sync_task = asyncio.create_task(run_collection_sync_loop(interval_hours=24))
     col_sugg_task = asyncio.create_task(run_collection_suggestions_loop(interval_hours=24))
+    univ_sync_task = asyncio.create_task(run_universe_sync_loop(interval_hours=24))
+    univ_sugg_task = asyncio.create_task(run_universe_suggestions_loop(interval_hours=24))
     ranker_task = asyncio.create_task(run_ranker_training_loop(interval_hours=24))
     cal_sync_task = asyncio.create_task(run_calendar_sync_loop(interval_hours=24))
     recs_sync_task = asyncio.create_task(run_recommendations_daily_sync_loop(interval_hours=24))
     yield
     sync_task.cancel()
     col_sugg_task.cancel()
+    univ_sync_task.cancel()
+    univ_sugg_task.cancel()
     ranker_task.cancel()
     cal_sync_task.cancel()
     recs_sync_task.cancel()
     try:
-        await asyncio.gather(sync_task, col_sugg_task, ranker_task, cal_sync_task, recs_sync_task, return_exceptions=True)
+        await asyncio.gather(
+            sync_task,
+            col_sugg_task,
+            univ_sync_task,
+            univ_sugg_task,
+            ranker_task,
+            cal_sync_task,
+            recs_sync_task,
+            return_exceptions=True
+        )
     except Exception:
         pass
 
@@ -85,6 +105,7 @@ app.include_router(users_router, prefix="/api/users", tags=["users"])
 app.include_router(trending_router, prefix="/api/trending", tags=["trending"])
 app.include_router(search_router, prefix="/api/search", tags=["search"])
 app.include_router(collections_router, prefix="/api")
+app.include_router(universes_router, prefix="/api")
 app.include_router(custom_lists_router, prefix="/api")
 app.include_router(details_router, prefix="/api")
 app.include_router(tracking_router, prefix="/api", tags=["tracking"])

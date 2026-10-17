@@ -347,9 +347,10 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
         final_status = "plan_to_watch"
 
     # Check if already in list
+    user_uuid = uuid.UUID(str(user_id))
     result = await db.execute(
         select(UserListItem)
-        .where(UserListItem.user_id == uuid.UUID(user_id), UserListItem.media_id == media.id)
+        .where(UserListItem.user_id == user_uuid, UserListItem.media_id == media.id)
         .options(selectinload(UserListItem.media))
     )
     existing_item = result.scalars().first()
@@ -392,7 +393,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
 
     initial_fav = bool(item.is_favorite) if final_status in ["watching", "completed"] else False
     new_item = UserListItem(
-        user_id=uuid.UUID(user_id),
+        user_id=user_uuid,
         media_id=media.id,
         status=final_status,
         rating=item.rating,
@@ -432,6 +433,14 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
         try:
             from app.media_collections.services import schedule_collection_suggestions_scan
             schedule_collection_suggestions_scan(str(user_id))
+        except Exception:
+            pass
+
+    # Dispara sugestões de universos em segundo plano (filmes e séries)
+    if saved_item and saved_item.media:
+        try:
+            from app.universes.services import schedule_universe_suggestions_scan
+            schedule_universe_suggestions_scan(str(user_id))
         except Exception:
             pass
 
@@ -778,6 +787,11 @@ async def remove_from_list(db: AsyncSession, user_id: str, item_id: str):
                 schedule_collection_suggestions_scan(str(user_id))
             except Exception:
                 pass
+        try:
+            from app.universes.services import schedule_universe_suggestions_scan
+            schedule_universe_suggestions_scan(str(user_id))
+        except Exception:
+            pass
         return True
     return False
 
