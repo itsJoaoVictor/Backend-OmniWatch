@@ -99,3 +99,25 @@ class MediaRankingResponse(BaseModel):
     media_type: str
     sort_by: str
     period: str
+
+class PeopleRankingItem(BaseModel):
+    rank: int
+    name: str
+    person_id: Optional[int] = None
+    role: str
+    count: int
+    totalTime: int
+    avgRating: Optional[float] = None
+    sample_titles: List[str] = []
+
+class PeopleRankingResponse(BaseModel):
+    items: List[PeopleRankingItem]
+    total_items: int
+    page: int
+    page_size: int
+    total_pages: int
+    role: str
+    sort_by: str
+    period: str
+    search: Optional[str] = None
+

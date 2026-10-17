@@ -7,7 +7,7 @@ from app.auth.dependencies import get_current_user_id
 from app.tracking.schemas import (
     UserListItemCreate, UserListItemUpdate, UserListItemResponse,
     UserEpisodeProgressCreate, UserEpisodeProgressResponse, UserEpisodeRatingUpdate,
-    UserEpisodeRewatchUpdate, MediaRankingResponse
+    UserEpisodeRewatchUpdate, MediaRankingResponse, PeopleRankingResponse
 )
 from app.tracking.services import (
     get_user_list, add_to_list, update_list_item, remove_from_list, add_episode_progress
@@ -238,4 +238,30 @@ async def get_media_ranking(
         search=search,
         background_tasks=background_tasks
     )
+
+@router.get("/statistics/rankings/people", response_model=PeopleRankingResponse)
+async def get_people_ranking(
+    background_tasks: BackgroundTasks,
+    role: str = "cast",
+    sort_by: str = "count",
+    period: str = "all",
+    page: int = 1,
+    page_size: int = 10,
+    search: Optional[str] = None,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.tracking.services import get_user_people_ranking
+    return await get_user_people_ranking(
+        db=db,
+        user_id=user_id,
+        role=role,
+        sort_by=sort_by,
+        period=period,
+        page=page,
+        page_size=page_size,
+        search=search,
+        background_tasks=background_tasks
+    )
+
 

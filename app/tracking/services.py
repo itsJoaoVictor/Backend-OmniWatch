@@ -2612,3 +2612,239 @@ async def get_user_media_ranking(
     )
 
 
+_revalidating_people_keys: set = set()
+
+async def recompute_and_cache_people_ranking(
+    user_id: str,
+    role: str,
+    sort_by: str,
+    period: str,
+    page: int,
+    page_size: int,
+    search: Optional[str]
+):
+    """Recomputa o ranking de pessoas (elenco/diretores) em background e atualiza o cache."""
+    clean_search = (search or "").strip().lower()
+    cache_key = f"stats:{user_id}:people:{role}:{sort_by}:{period}:{page}:{page_size}:{clean_search}"
+    try:
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await _compute_user_people_ranking(session, user_id, role, sort_by, period, page, page_size, search)
+    except Exception as e:
+        logger.error("Erro ao revalidar people ranking em background para usuário %s: %s", user_id, e)
+    finally:
+        _revalidating_people_keys.discard(cache_key)
+
+async def _compute_user_people_ranking(
+    db: AsyncSession,
+    user_id: str,
+    role: str = "cast",
+    sort_by: str = "count",
+    period: str = "all",
+    page: int = 1,
+    page_size: int = 10,
+    search: Optional[str] = None
+):
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return {
+            "items": [],
+            "total_items": 0,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+            "role": role,
+            "sort_by": sort_by,
+            "period": period,
+            "search": search
+        }
+
+    clean_search = (search or "").strip().lower()
+    page = max(1, int(page))
+    page_size = max(1, min(50, int(page_size)))
+    cache_key = f"stats:{user_id}:people:{role}:{sort_by}:{period}:{page}:{page_size}:{clean_search}"
+
+    now = datetime.now(timezone.utc)
+    cutoff = None
+    if period == "30days":
+        cutoff = now - timedelta(days=30)
+    elif period == "6months":
+        cutoff = now - timedelta(days=180)
+    elif period == "year":
+        cutoff = now - timedelta(days=365)
+
+    params = {"user_uuid": user_uuid}
+    cutoff_filter = ""
+    if cutoff is not None:
+        params["cutoff"] = cutoff
+        cutoff_filter = "AND COALESCE(uli.last_watched_at, uli.updated_at, uli.created_at) >= :cutoff"
+
+    query = text(f"""
+        SELECT 
+            uli.id AS item_id,
+            uli.status,
+            uli.rating,
+            COALESCE(uli.rewatch_count, 0) AS rewatch_count,
+            uli.total_time_minutes,
+            uli.episodes_watched_count,
+            m.title,
+            m.media_type,
+            COALESCE(m.runtime, 0) AS runtime,
+            m.main_cast,
+            m.directors,
+            m.cast_ids,
+            m.crew_ids
+        FROM user_list_items uli
+        JOIN media m ON m.id = uli.media_id
+        WHERE uli.user_id = :user_uuid
+          AND (uli.episodes_watched_count > 0 OR uli.status IN ('completed', 'watching') OR uli.rating IS NOT NULL)
+          {cutoff_filter}
+    """)
+    res = await db.execute(query, params)
+    rows = res.fetchall()
+
+    people_map = {}
+    for r in rows:
+        item_time = r.total_time_minutes or 0
+        if item_time == 0 and r.media_type == "movie":
+            item_time = (r.runtime or 0) * (1 + (r.rewatch_count or 0))
+
+        if role == "directors":
+            person_id_map = {c["name"]: c.get("person_id") for c in (r.crew_ids or []) if isinstance(c, dict) and c.get("name")}
+            people_list = r.directors or []
+        else:  # cast
+            person_id_map = {c["name"]: c.get("person_id") for c in (r.cast_ids or []) if isinstance(c, dict) and c.get("name")}
+            people_list = (r.main_cast or [])[:5]
+
+        for p in people_list:
+            name = p.get("name") if isinstance(p, dict) else str(p).strip()
+            if not name:
+                continue
+
+            if clean_search and clean_search not in name.lower():
+                continue
+
+            entry = people_map.setdefault(name, {
+                "name": name,
+                "person_id": None,
+                "role": role,
+                "count": 0,
+                "totalTime": 0,
+                "ratings": [],
+                "sample_titles": []
+            })
+            entry["count"] += 1
+            entry["totalTime"] += item_time
+            if not entry["person_id"] and name in person_id_map:
+                entry["person_id"] = person_id_map[name]
+            if r.rating and r.rating > 0:
+                entry["ratings"].append(r.rating)
+            if len(entry["sample_titles"]) < 3 and r.title not in entry["sample_titles"]:
+                entry["sample_titles"].append(r.title)
+
+    all_people = list(people_map.values())
+    for p in all_people:
+        p["avgRating"] = round(sum(p["ratings"]) / len(p["ratings"]), 1) if p["ratings"] else None
+
+    if sort_by == "time":
+        all_people.sort(key=lambda x: (x["totalTime"], x["count"], x["avgRating"] or 0), reverse=True)
+    elif sort_by == "rating":
+        all_people.sort(key=lambda x: (x["avgRating"] is not None, x["avgRating"] or 0, x["count"], x["totalTime"]), reverse=True)
+    elif sort_by == "name":
+        all_people.sort(key=lambda x: x["name"].lower())
+    else:  # count (default)
+        all_people.sort(key=lambda x: (x["count"], x["totalTime"], x["avgRating"] or 0), reverse=True)
+
+    total_items = len(all_people)
+    total_pages = max(1, (total_items + page_size - 1) // page_size) if total_items > 0 else 0
+    start = (page - 1) * page_size
+    sliced = all_people[start : start + page_size]
+
+    page_items = []
+    for idx, p in enumerate(sliced):
+        page_items.append({
+            "rank": start + idx + 1,
+            "name": p["name"],
+            "person_id": p.get("person_id"),
+            "role": p["role"],
+            "count": p["count"],
+            "totalTime": p["totalTime"],
+            "avgRating": p["avgRating"],
+            "sample_titles": p["sample_titles"]
+        })
+
+    output = {
+        "items": page_items,
+        "total_items": total_items,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "role": role,
+        "sort_by": sort_by,
+        "period": period,
+        "search": search
+    }
+
+    stats_cache.set(cache_key, output)
+    return output
+
+
+async def get_user_people_ranking(
+    db: AsyncSession,
+    user_id: str,
+    role: str = "cast",
+    sort_by: str = "count",
+    period: str = "all",
+    page: int = 1,
+    page_size: int = 10,
+    search: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None
+):
+    """
+    Retorna o ranking paginado de elenco/diretores com suporte a Stale-While-Revalidate (SWR).
+    """
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        return {
+            "items": [],
+            "total_items": 0,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+            "role": role,
+            "sort_by": sort_by,
+            "period": period,
+            "search": search
+        }
+
+    clean_search = (search or "").strip().lower()
+    page = max(1, int(page))
+    page_size = max(1, min(50, int(page_size)))
+
+    cache_key = f"stats:{user_id}:people:{role}:{sort_by}:{period}:{page}:{page_size}:{clean_search}"
+    cached_data, is_stale = stats_cache.get_with_status(cache_key)
+
+    if cached_data is not None:
+        if is_stale and cache_key not in _revalidating_people_keys:
+            _revalidating_people_keys.add(cache_key)
+            if background_tasks is not None:
+                background_tasks.add_task(
+                    recompute_and_cache_people_ranking,
+                    user_id, role, sort_by, period, page, page_size, search
+                )
+            else:
+                asyncio.create_task(
+                    recompute_and_cache_people_ranking(
+                        user_id, role, sort_by, period, page, page_size, search
+                    )
+                )
+        return cached_data
+
+    return await _compute_user_people_ranking(
+        db, user_id, role=role, sort_by=sort_by, period=period, page=page, page_size=page_size, search=search
+    )
+
+
+
