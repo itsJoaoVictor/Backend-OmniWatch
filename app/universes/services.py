@@ -30,7 +30,8 @@ from app.universes.schemas import (
 from app.media.models import Media
 from app.tracking.models import UserListItem
 from app.tracking.schemas import UserListItemCreate
-from app.tracking.services import add_to_list
+from app.tracking.services import add_to_list, invalidate_user_stats_cache
+from app.core.utils import is_date_released
 from app.details.services import get_tmdb_client
 
 logger = logging.getLogger(__name__)
@@ -415,7 +416,7 @@ async def _enrich_universe_members(
     """
     members_map: Dict[Tuple[int, str], Dict[str, Any]] = dict(cand.get("members", {}))
     child_col_ids: Set[int] = set(cand.get("child_collection_ids", set()))
-    semaphore = asyncio.Semaphore(8)
+    semaphore = asyncio.Semaphore(16)
 
     # 1. Preencher dados já existentes na tabela local Media (evita chamadas HTTP desnecessárias)
     all_tmdb_ids = [tid for (tid, _) in members_map.keys()]
@@ -1061,21 +1062,21 @@ async def _discover_single_universe_by_key(
       }}
     }}
     """
-    label_rows = await _sparql_post(label_query)
-    name = universe_key
-    overview = None
-    if label_rows:
-        name = label_rows[0].get("universeLabel", {}).get("value", universe_key)
-        overview = label_rows[0].get("universeDesc", {}).get("value")
-
     cand = {
         "universe_key": universe_key,
-        "name": name,
-        "overview": overview,
+        "name": universe_key,
+        "overview": None,
         "members": {},
         "child_collection_ids": set(),
     }
-    await _wikidata_step2_expand_members({universe_key: cand})
+    label_task = _sparql_post(label_query, timeout=12.0)
+    expand_task = _wikidata_step2_expand_members({universe_key: cand})
+    label_rows, _ = await asyncio.gather(label_task, expand_task)
+
+    if label_rows:
+        cand["name"] = label_rows[0].get("universeLabel", {}).get("value", universe_key)
+        cand["overview"] = label_rows[0].get("universeDesc", {}).get("value")
+
     enriched = await _enrich_universe_members(db, cand)
     cand["enriched_members"] = enriched
     return cand
@@ -1194,6 +1195,115 @@ async def get_or_create_universe(
     return res.scalars().first()
 
 
+async def _background_enrich_universe_follow(user_id_str: str, media_ids: List[UUID]):
+    """
+    Executa em background para não bloquear a resposta HTTP do usuário:
+    1. Enriquece metadados TMDB detalhados (elenco, diretores, gêneros, keywords, runtime, collections).
+    2. Gera embeddings semânticos para o sistema de recomendação.
+    3. Atualiza o perfil de preferências do usuário.
+    4. Garante cache de imagem local.
+    5. Dispara recomputação de sugestões.
+    """
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.details.services import fetch_movie_details, fetch_tv_details
+        from app.recommendation.embeddings import build_text_for_embedding, generate_embedding
+        from app.recommendation.profile_manager import update_user_profile
+        from app.images.router import ensure_image_cached
+        from app.media_collections.services import schedule_collection_suggestions_scan
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(Media).where(Media.id.in_(media_ids))
+            res = await session.execute(stmt)
+            medias = res.scalars().all()
+
+            for media in medias:
+                try:
+                    # Enriquecimento de metadados se faltar dados
+                    if not media.genres or not media.directors or not media.main_cast or not media.runtime:
+                        if media.media_type == "movie":
+                            tmdb_data = await fetch_movie_details(media.tmdb_id)
+                            if tmdb_data:
+                                media.runtime = tmdb_data.runtime or media.runtime or 0
+                                media.original_language = tmdb_data.original_language or media.original_language
+                                if not media.genres and tmdb_data.genres:
+                                    media.genres = [{"id": g.id, "name": g.name} for g in tmdb_data.genres]
+                                if not media.directors and tmdb_data.credits and tmdb_data.credits.crew:
+                                    media.directors = [c.name for c in tmdb_data.credits.crew]
+                                if not media.main_cast and tmdb_data.credits and tmdb_data.credits.cast:
+                                    media.main_cast = [c.name for c in tmdb_data.credits.cast]
+                                if hasattr(tmdb_data, "keywords") and tmdb_data.keywords:
+                                    media.keywords = tmdb_data.keywords
+                                media.cast_ids = tmdb_data.cast_ids or []
+                                media.crew_ids = tmdb_data.crew_ids or []
+                                if hasattr(tmdb_data, "belongs_to_collection") and tmdb_data.belongs_to_collection:
+                                    media.collection_tmdb_id = tmdb_data.belongs_to_collection.id
+                                    media.collection_name = tmdb_data.belongs_to_collection.name
+                        else:
+                            tmdb_data = await fetch_tv_details(media.tmdb_id)
+                            if tmdb_data:
+                                if tmdb_data.episode_run_time and len(tmdb_data.episode_run_time) > 0:
+                                    media.runtime = tmdb_data.episode_run_time[0]
+                                else:
+                                    media.runtime = 45
+                                media.original_language = tmdb_data.original_language or media.original_language
+                                if not media.genres and tmdb_data.genres:
+                                    media.genres = [{"id": g.id, "name": g.name} for g in tmdb_data.genres]
+                                if not media.directors and tmdb_data.credits and tmdb_data.credits.crew:
+                                    media.directors = [c.name for c in tmdb_data.credits.crew]
+                                if not media.main_cast and tmdb_data.credits and tmdb_data.credits.cast:
+                                    media.main_cast = [c.name for c in tmdb_data.credits.cast]
+                                if hasattr(tmdb_data, "keywords") and tmdb_data.keywords:
+                                    media.keywords = tmdb_data.keywords
+                                media.cast_ids = tmdb_data.cast_ids or []
+                                media.crew_ids = tmdb_data.crew_ids or []
+
+                    # Embedding semântico em background se ainda não possuir
+                    if not media.embedding:
+                        dummy_dict = {
+                            "title": media.title,
+                            "media_type": media.media_type,
+                            "genres": media.genres,
+                            "crew": media.directors,
+                            "cast": media.main_cast,
+                            "keywords": media.keywords,
+                        }
+                        emb_text = build_text_for_embedding(dummy_dict)
+                        media.embedding = await generate_embedding(emb_text)
+
+                    # Poster local cache
+                    if media.poster_path:
+                        asyncio.create_task(ensure_image_cached(media.poster_path, "w342"))
+
+                except Exception as ex:
+                    logger.warning(f"Erro ao enriquecer media {media.tmdb_id} em background: {ex}")
+
+            await session.commit()
+
+            # Atualiza perfil do usuário para recomendações
+            try:
+                user_uuid = UUID(user_id_str)
+                for media in medias:
+                    uli_res = await session.execute(
+                        select(UserListItem).where(
+                            UserListItem.user_id == user_uuid,
+                            UserListItem.media_id == media.id,
+                        )
+                    )
+                    uli = uli_res.scalars().first()
+                    if uli:
+                        await update_user_profile(session, user_id_str, uli, media)
+            except Exception as ex:
+                logger.warning(f"Erro ao atualizar perfil do usuário {user_id_str} em background: {ex}")
+
+        # Agenda scans de coleções e universos com debounce
+        schedule_collection_suggestions_scan(user_id_str, debounce_seconds=4)
+        schedule_universe_suggestions_scan(user_id_str, debounce_seconds=4.0)
+
+    except Exception as e:
+        logger.error(f"Erro geral no background enrich do follow_universe para {user_id_str}: {e}")
+
+
 async def follow_universe(
     db: AsyncSession,
     user_id: UUID,
@@ -1274,6 +1384,7 @@ async def follow_universe(
 
     items_added = 0
     items_already_in_list = 0
+    items_to_add: List[UniverseItem] = []
 
     sorted_items = sorted(universe.items, key=lambda x: x.release_date or "9999-12-31")
     for item in sorted_items:
@@ -1283,37 +1394,76 @@ async def follow_universe(
             media_obj = existing_user_pairs[pair]
             if not item.media_id:
                 item.media_id = media_obj.id
-            media_obj.universe_key = universe.universe_key
-            media_obj.universe_name = universe.name
+            if not media_obj.universe_key:
+                media_obj.universe_key = universe.universe_key
+                media_obj.universe_name = universe.name
             continue
 
         if pair in ignored_set:
             # Não auto-adiciona obras desmarcadas/ignoradas pelo usuário
             continue
 
-        try:
-            item_schema = UserListItemCreate(
-                tmdb_id=item.tmdb_id,
-                media_type=item.media_type,
-                title=item.title,
-                poster_path=item.poster_path,
-                backdrop_path=item.backdrop_path,
-                release_date=item.release_date,
-                status="plan_to_watch",
+        items_to_add.append(item)
+
+    new_media_ids_to_enrich: List[UUID] = []
+    if items_to_add:
+        tmdbs = [it.tmdb_id for it in items_to_add]
+        m_stmt = select(Media).where(Media.tmdb_id.in_(tmdbs))
+        m_res = await db.execute(m_stmt)
+        existing_medias: Dict[Tuple[int, str], Media] = {
+            (m.tmdb_id, m.media_type): m for m in m_res.scalars().all()
+        }
+
+        new_medias: List[Media] = []
+        for it in items_to_add:
+            pair = (it.tmdb_id, it.media_type)
+            media_obj = existing_medias.get(pair)
+            if not media_obj:
+                media_obj = Media(
+                    tmdb_id=it.tmdb_id,
+                    media_type=it.media_type,
+                    title=it.title,
+                    poster_path=it.poster_path,
+                    backdrop_path=it.backdrop_path,
+                    release_date=it.release_date,
+                    collection_name=it.collection_name,
+                    universe_key=universe.universe_key,
+                    universe_name=universe.name,
+                )
+                db.add(media_obj)
+                existing_medias[pair] = media_obj
+                new_medias.append(media_obj)
+            else:
+                if not media_obj.universe_key:
+                    media_obj.universe_key = universe.universe_key
+                    media_obj.universe_name = universe.name
+
+        if new_medias:
+            await db.flush()
+
+        for it in items_to_add:
+            pair = (it.tmdb_id, it.media_type)
+            media_obj = existing_medias[pair]
+            if not it.media_id:
+                it.media_id = media_obj.id
+
+            is_rel = is_date_released(it.release_date)
+            final_status = "plan_to_watch" if is_rel else "upcoming"
+
+            user_list_item = UserListItem(
+                user_id=user_id,
+                media_id=media_obj.id,
+                status=final_status,
             )
-            created_item = await add_to_list(db, str(user_id), item_schema)
-            if created_item and created_item.media_id:
-                item.media_id = created_item.media_id
-                m_res = await db.execute(select(Media).where(Media.id == created_item.media_id))
-                m_obj = m_res.scalars().first()
-                if m_obj:
-                    m_obj.universe_key = universe.universe_key
-                    m_obj.universe_name = universe.name
+            db.add(user_list_item)
             items_added += 1
-        except Exception as e:
-            logger.warning(f"Erro ao auto-adicionar item {item.tmdb_id} ({item.media_type}) do universo {universe.name}: {e}")
+            new_media_ids_to_enrich.append(media_obj.id)
 
     await db.commit()
+    invalidate_user_stats_cache(str(user_id))
+
+    if new_media_ids_to_enrich:
+        asyncio.create_task(_background_enrich_universe_follow(str(user_id), new_media_ids_to_enrich))
 
     return UniverseFollowResponse(
         success=True,
@@ -1761,23 +1911,66 @@ async def sync_universe_from_sources(
                 .where(UserListItem.user_id == fid)
             )
             u_existing_pairs = {(r[0], r[1]) for r in u_list_res.all()}
-            for item in items_to_ensure:
-                pair = (item.tmdb_id, item.media_type)
-                if pair in u_existing_pairs or pair in u_ignored_pairs:
-                    continue
-                try:
-                    schema = UserListItemCreate(
-                        tmdb_id=item.tmdb_id,
-                        media_type=item.media_type,
-                        title=item.title,
-                        poster_path=item.poster_path,
-                        backdrop_path=item.backdrop_path,
-                        release_date=item.release_date,
-                        status="plan_to_watch",
+            u_to_add = [
+                it for it in items_to_ensure
+                if (it.tmdb_id, it.media_type) not in u_existing_pairs
+                and (it.tmdb_id, it.media_type) not in u_ignored_pairs
+            ]
+            if u_to_add:
+                tmdbs = [it.tmdb_id for it in u_to_add]
+                m_stmt = select(Media).where(Media.tmdb_id.in_(tmdbs))
+                m_res = await db.execute(m_stmt)
+                existing_medias = {(m.tmdb_id, m.media_type): m for m in m_res.scalars().all()}
+
+                new_medias = []
+                for it in u_to_add:
+                    pair = (it.tmdb_id, it.media_type)
+                    media_obj = existing_medias.get(pair)
+                    if not media_obj:
+                        media_obj = Media(
+                            tmdb_id=it.tmdb_id,
+                            media_type=it.media_type,
+                            title=it.title,
+                            poster_path=it.poster_path,
+                            backdrop_path=it.backdrop_path,
+                            release_date=it.release_date,
+                            collection_name=it.collection_name,
+                            universe_key=universe.universe_key,
+                            universe_name=universe.name,
+                        )
+                        db.add(media_obj)
+                        existing_medias[pair] = media_obj
+                        new_medias.append(media_obj)
+                    else:
+                        if not media_obj.universe_key:
+                            media_obj.universe_key = universe.universe_key
+                            media_obj.universe_name = universe.name
+
+                if new_medias:
+                    await db.flush()
+
+                enriched_ids = []
+                for it in u_to_add:
+                    pair = (it.tmdb_id, it.media_type)
+                    media_obj = existing_medias[pair]
+                    if not it.media_id:
+                        it.media_id = media_obj.id
+
+                    is_rel = is_date_released(it.release_date)
+                    final_status = "plan_to_watch" if is_rel else "upcoming"
+
+                    user_list_item = UserListItem(
+                        user_id=fid,
+                        media_id=media_obj.id,
+                        status=final_status,
                     )
-                    await add_to_list(db, str(fid), schema)
-                except Exception as e:
-                    logger.warning(f"Erro ao sincronizar item {item.tmdb_id} do universo para usuário {fid}: {e}")
+                    db.add(user_list_item)
+                    enriched_ids.append(media_obj.id)
+
+                await db.commit()
+                invalidate_user_stats_cache(str(fid))
+                if enriched_ids:
+                    asyncio.create_task(_background_enrich_universe_follow(str(fid), enriched_ids))
 
     return universe
 

@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from typing import List, Optional, Dict, Any, Union
 import httpx
 import numpy as np
@@ -88,7 +88,7 @@ async def generate_embedding(text: str) -> Optional[List[float]]:
 
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=payload, timeout=30.0)
+            response = await client.post(url, headers=headers, json=payload, timeout=5.0)
             if response.status_code == 200:
                 data = response.json()
                 embedding = data["data"][0]["embedding"]
