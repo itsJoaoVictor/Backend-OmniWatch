@@ -2081,9 +2081,26 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
 
     avg_rating = round(sum(all_ratings) / len(all_ratings), 1) if all_ratings else 0.0
 
-    def format_ranking(stats_dict, limit=15):
+    def format_ranking(stats_dict, limit=15, sort_by_count=False):
         res = []
-        sorted_items = sorted(stats_dict.items(), key=lambda x: (x[1]["totalTime"], x[1]["count"]), reverse=True)[:limit]
+        if sort_by_count:
+            # Ranking inteligente: prioriza presença em obras distintas, desempatando por tempo assistido e nota
+            sorted_items = sorted(
+                stats_dict.items(),
+                key=lambda x: (
+                    x[1]["count"],
+                    x[1]["totalTime"],
+                    sum(x[1]["ratings"]) / len(x[1]["ratings"]) if x[1]["ratings"] else 0
+                ),
+                reverse=True
+            )[:limit]
+        else:
+            sorted_items = sorted(
+                stats_dict.items(),
+                key=lambda x: (x[1]["totalTime"], x[1]["count"]),
+                reverse=True
+            )[:limit]
+
         for name, data in sorted_items:
             res.append({
                 "name": name,
@@ -2095,8 +2112,8 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
         return res
 
     genres_ranking = format_ranking(genres_stats, limit=20)
-    cast_ranking = format_ranking(cast_stats, limit=15)
-    directors_ranking = format_ranking(directors_stats, limit=15)
+    cast_ranking = format_ranking(cast_stats, limit=50, sort_by_count=True)
+    directors_ranking = format_ranking(directors_stats, limit=50, sort_by_count=True)
 
     timeline = []
     for k in sorted(activity_months.keys()):
