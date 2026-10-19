@@ -2000,9 +2000,12 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
                 total_episodes_watched += ep_count_in_period
                 item_time_minutes = runtime * ep_count_in_period
                 total_time_tv_minutes += item_time_minutes
-
-        if not is_watched_in_period and cutoff is not None:
-            continue
+        if cutoff is not None:
+            if not is_watched_in_period:
+                continue
+        else:
+            if not is_watched_in_period and not (item.rating and item.rating > 0):
+                continue
 
         if item.rating and item.rating > 0:
             r_key = str(min(5, max(1, int(round(item.rating)))))
