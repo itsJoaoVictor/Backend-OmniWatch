@@ -1836,6 +1836,8 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
                 UserListItem.status,
                 UserListItem.rating,
                 UserListItem.rewatch_count,
+                UserListItem.episodes_watched_count,
+                UserListItem.total_time_minutes,
                 UserListItem.last_watched_at,
                 UserListItem.created_at,
                 UserListItem.updated_at
@@ -1843,6 +1845,7 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
             selectinload(UserListItem.media).options(
                 load_only(
                     Media.id,
+                    Media.tmdb_id,
                     Media.media_type,
                     Media.title,
                     Media.genres,
@@ -2160,6 +2163,54 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
             "count": val["count"]
         })
 
+    # 5. Cálculo do Backlog Pendente (Filmes Quero Ver, Séries Quero Ver e Séries em Andamento)
+    include_movies = media_type in ("all", "movie")
+    include_tv = media_type in ("all", "tv")
+
+    movies_plan_items = [i for i in items if i.media and i.media.media_type == "movie" and i.status == "plan_to_watch"] if include_movies else []
+    movies_plan_mins = sum(i.media.runtime or 100 for i in movies_plan_items)
+
+    tv_plan_items = [i for i in items if i.media and i.media.media_type == "tv" and i.status == "plan_to_watch"] if include_tv else []
+    tv_plan_mins = 0
+    tv_plan_eps = 0
+    for i in tv_plan_items:
+        cached_det, _ = details_cache.get_with_status(f"tv_details:{i.media.tmdb_id}")
+        total_eps = cached_det.get("number_of_episodes", 0) if cached_det else 0
+        eps = total_eps if total_eps > 0 else 12
+        runtime = i.media.runtime or 45
+        tv_plan_eps += eps
+        tv_plan_mins += eps * runtime
+
+    tv_watching_items = [i for i in items if i.media and i.media.media_type == "tv" and i.status == "watching"] if include_tv else []
+    tv_watching_remaining_mins = 0
+    tv_watching_remaining_eps = 0
+    for i in tv_watching_items:
+        watched = i.episodes_watched_count or 0
+        runtime = i.media.runtime or 45
+        cached_det, _ = details_cache.get_with_status(f"tv_details:{i.media.tmdb_id}")
+        total_eps = cached_det.get("number_of_episodes", 0) if cached_det else 0
+        if total_eps > watched:
+            rem = total_eps - watched
+        else:
+            rem = 6
+        tv_watching_remaining_eps += rem
+        tv_watching_remaining_mins += rem * runtime
+
+    total_backlog_mins = movies_plan_mins + tv_plan_mins + tv_watching_remaining_mins
+
+    backlog_data = {
+        "totalMinutes": total_backlog_mins,
+        "totalItems": len(movies_plan_items) + len(tv_plan_items) + len(tv_watching_items),
+        "moviesPlanCount": len(movies_plan_items),
+        "moviesPlanMinutes": movies_plan_mins,
+        "tvPlanCount": len(tv_plan_items),
+        "tvPlanEpisodes": tv_plan_eps,
+        "tvPlanMinutes": tv_plan_mins,
+        "tvWatchingCount": len(tv_watching_items),
+        "tvWatchingRemainingEpisodes": tv_watching_remaining_eps,
+        "tvWatchingRemainingMinutes": tv_watching_remaining_mins,
+    }
+
     output = {
         "totalTime": total_time,
         "totalTimeMovies": total_time_movies_minutes,
@@ -2185,13 +2236,15 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
             "moviesCompletionRate": movies_completion_rate,
             "dailyAverageMinutes": daily_avg_mins,
             "weeklyAverageMinutes": weekly_avg_mins,
+            "backlog": backlog_data,
         },
         "rankings": {
             "genres": genres_ranking,
             "cast": cast_ranking,
             "directors": directors_ranking
         },
-        "timeline": timeline
+        "timeline": timeline,
+        "backlog": backlog_data
     }
 
     # Nível 3: Persistência em tabela de sumarização pré-calculada para leituras ultra-rápidas
@@ -2285,7 +2338,8 @@ async def get_user_statistics(
                     "topGenres": summary_row.top_genres,
                     "kpis": summary_row.kpis,
                     "rankings": summary_row.rankings,
-                    "timeline": summary_row.timeline
+                    "timeline": summary_row.timeline,
+                    "backlog": (summary_row.kpis or {}).get("backlog")
                 }
                 stats_cache.set(cache_key, output)
                 if cache_key not in _revalidating_stats_keys:
