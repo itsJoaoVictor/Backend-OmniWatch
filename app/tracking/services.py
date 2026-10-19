@@ -2288,6 +2288,12 @@ async def get_user_statistics(
                     "timeline": summary_row.timeline
                 }
                 stats_cache.set(cache_key, output)
+                if cache_key not in _revalidating_stats_keys:
+                    _revalidating_stats_keys.add(cache_key)
+                    if background_tasks is not None:
+                        background_tasks.add_task(recompute_and_cache_stats, user_id, period, media_type)
+                    else:
+                        asyncio.create_task(recompute_and_cache_stats(user_id, period, media_type))
                 return output
         except Exception as e:
             logger.warning("Falha ao buscar user_stats_summary: %s", e)
