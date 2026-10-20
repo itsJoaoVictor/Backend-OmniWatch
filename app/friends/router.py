@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, status, HTTPException, Response
 from sqlalchemy import func
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, Optional
 import uuid
 
 from app.core.database import get_db
@@ -60,12 +60,13 @@ async def get_feed_endpoint(
     response: Response,
     page: int = Query(1, ge=1, description="Número da página"),
     limit: int = Query(20, ge=1, le=50, description="Itens por página"),
+    media_type: Optional[str] = Query(None, description="Filtrar por 'movie' ou 'tv'"),
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
     response.headers["Cache-Control"] = "private, max-age=20, stale-while-revalidate=40"
     u_uuid = parse_uuid(current_user_id)
-    return await get_friend_feed(db, u_uuid, page=page, limit=limit)
+    return await get_friend_feed(db, u_uuid, page=page, limit=limit, media_type=media_type)
 
 get_feed = get_feed_endpoint
 

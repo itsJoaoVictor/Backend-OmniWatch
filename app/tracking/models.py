@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer, Float, Boolean, ForeignKey, func
+from sqlalchemy import Column, String, DateTime, Integer, Float, Boolean, ForeignKey, func, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -25,6 +25,10 @@ class UserListItem(Base):
     media = relationship("Media")
     episodes = relationship("UserEpisodeProgress", back_populates="user_list_item", cascade="all, delete-orphan")
 
+    __table_args__ = (
+        Index("idx_user_list_items_user_watched", "user_id", "last_watched_at"),
+    )
+
     # Atributos voláteis calculados em tempo de execução
     is_up_to_date: bool = None
     next_episode: dict = None
@@ -41,6 +45,11 @@ class UserEpisodeProgress(Base):
     watched_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user_list_item = relationship("UserListItem", back_populates="episodes")
+
+    __table_args__ = (
+        Index("idx_user_episodes_watched_at", "watched_at"),
+        Index("idx_user_episodes_item_watched", "user_list_item_id", "watched_at"),
+    )
 
 class UserStatsSummary(Base):
     __tablename__ = "user_stats_summary"
