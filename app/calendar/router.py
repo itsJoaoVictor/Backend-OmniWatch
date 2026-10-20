@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload
@@ -38,12 +38,15 @@ class ReleaseEventSchema(BaseModel):
 
 @router.get("/my-releases", response_model=List[ReleaseEventSchema])
 async def get_my_releases(
+    response: Response,
     month: Optional[str] = Query(None, description="Format YYYY-MM. If not provided, gets all upcoming releases"),
     limit: Optional[int] = Query(None, ge=1, le=200, description="Max releases to return (default 100 for agenda)"),
     offset: Optional[int] = Query(0, ge=0, description="Offset for pagination"),
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
+    # Cache HTTP privado no navegador do usuário por 3 minutos, com stale-while-revalidate de 5 minutos
+    response.headers["Cache-Control"] = "private, max-age=180, stale-while-revalidate=300"
     from datetime import timezone
     
     start_date = None

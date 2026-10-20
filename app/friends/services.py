@@ -459,15 +459,28 @@ async def get_friend_feed(
     # 2. Buscar episódios recentes assistidos pelos amigos
     ep_query = (
         select(
-            UserEpisodeProgress,
-            UserListItem,
-            Media,
-            User
+            UserEpisodeProgress.season_number,
+            UserEpisodeProgress.episode_number,
+            UserEpisodeProgress.rating.label("ep_rating"),
+            UserEpisodeProgress.watched_at,
+            UserListItem.rating.label("uli_rating"),
+            Media.id.label("media_id"),
+            Media.tmdb_id,
+            Media.media_type,
+            Media.title,
+            Media.poster_path,
+            Media.backdrop_path,
+            User.id.label("user_id"),
+            User.name.label("user_name"),
+            User.username,
         )
         .join(UserListItem, UserEpisodeProgress.user_list_item_id == UserListItem.id)
         .join(Media, UserListItem.media_id == Media.id)
         .join(User, UserListItem.user_id == User.id)
-        .where(UserListItem.user_id.in_(friend_ids))
+        .where(
+            UserListItem.user_id.in_(friend_ids),
+            UserEpisodeProgress.watched_at.is_not(None)
+        )
         .order_by(UserEpisodeProgress.watched_at.desc())
         .limit(300)
     )
@@ -477,37 +490,50 @@ async def get_friend_feed(
     # Agrupar episódios assistidos da mesma série na mesma data pelo mesmo amigo
     # chave: (user_id, media_id, season_number, date_str)
     ep_groups = {}
-    for ep, uli, media, user in ep_records:
-        if not ep.watched_at:
+    for row in ep_records:
+        if not row.watched_at:
             continue
-        date_str = ep.watched_at.strftime("%Y-%m-%d")
-        key = (user.id, media.id, ep.season_number, date_str)
+        date_str = row.watched_at.strftime("%Y-%m-%d")
+        key = (row.user_id, row.media_id, row.season_number, date_str)
         if key not in ep_groups:
             ep_groups[key] = {
-                "user": user,
-                "media": media,
-                "uli": uli,
-                "season_number": ep.season_number,
+                "user_id": row.user_id,
+                "user_name": row.user_name,
+                "username": row.username,
+                "media_id": row.media_id,
+                "tmdb_id": row.tmdb_id,
+                "media_type": row.media_type,
+                "title": row.title,
+                "poster_path": row.poster_path,
+                "backdrop_path": row.backdrop_path,
+                "uli_rating": row.uli_rating,
+                "season_number": row.season_number,
                 "episodes": [],
                 "ratings": []
             }
-        ep_groups[key]["episodes"].append((ep.episode_number, ep.watched_at))
-        if ep.rating is not None:
-            ep_groups[key]["ratings"].append(ep.rating)
+        ep_groups[key]["episodes"].append((row.episode_number, row.watched_at))
+        if row.ep_rating is not None:
+            ep_groups[key]["ratings"].append(row.ep_rating)
 
     feed_items = []
 
     for key, group in ep_groups.items():
-        user = group["user"]
-        media = group["media"]
-        uli = group["uli"]
+        user_id = group["user_id"]
+        user_name = group["user_name"]
+        username = group["username"]
+        media_id = group["media_id"]
+        tmdb_id = group["tmdb_id"]
+        media_type = group["media_type"]
+        title = group["title"]
+        poster_path = group["poster_path"]
+        backdrop_path = group["backdrop_path"]
         season_num = group["season_number"]
         ep_data = group["episodes"]
         ep_numbers = sorted(list(set(e[0] for e in ep_data)))
         latest_watched_at = max(e[1] for e in ep_data)
 
         # Determina o rating: rating dos episódios ou da série na lista
-        user_rating = group["ratings"][0] if group["ratings"] else uli.rating
+        user_rating = group["ratings"][0] if group["ratings"] else group["uli_rating"]
 
         if len(ep_numbers) == 1:
             episodes_label = f"T{season_num} E{ep_numbers[0]}"
@@ -521,20 +547,20 @@ async def get_friend_feed(
                 episodes_label = f"T{season_num}: Eps. {', '.join(str(x) for x in ep_numbers)}"
             action_type = "binge_watched"
 
-        item_id = f"ep_{user.id}_{media.id}_{season_num}_{min(ep_numbers)}_{max(ep_numbers)}_{int(latest_watched_at.timestamp())}"
+        item_id = f"ep_{user_id}_{media_id}_{season_num}_{min(ep_numbers)}_{max(ep_numbers)}_{int(latest_watched_at.timestamp())}"
 
         feed_items.append(
             FriendFeedItem(
                 id=item_id,
-                user_id=user.id,
-                user_name=user.name,
-                username=user.username,
-                media_id=media.id,
-                tmdb_id=media.tmdb_id,
-                media_type=media.media_type,
-                title=media.title,
-                poster_path=media.poster_path,
-                backdrop_path=media.backdrop_path,
+                user_id=user_id,
+                user_name=user_name,
+                username=username,
+                media_id=media_id,
+                tmdb_id=tmdb_id,
+                media_type=media_type,
+                title=title,
+                poster_path=poster_path,
+                backdrop_path=backdrop_path,
                 rating=user_rating,
                 season_number=season_num,
                 episode_numbers=ep_numbers,
@@ -547,9 +573,18 @@ async def get_friend_feed(
     # 3. Buscar filmes recentes assistidos pelos amigos
     movie_query = (
         select(
-            UserListItem,
-            Media,
-            User
+            UserListItem.rating.label("uli_rating"),
+            UserListItem.last_watched_at,
+            UserListItem.updated_at,
+            UserListItem.created_at,
+            Media.id.label("media_id"),
+            Media.tmdb_id,
+            Media.title,
+            Media.poster_path,
+            Media.backdrop_path,
+            User.id.label("user_id"),
+            User.name.label("user_name"),
+            User.username,
         )
         .join(Media, UserListItem.media_id == Media.id)
         .join(User, UserListItem.user_id == User.id)
@@ -562,32 +597,36 @@ async def get_friend_feed(
             )
         )
         .order_by(
-            func.coalesce(UserListItem.last_watched_at, UserListItem.updated_at).desc()
+            func.coalesce(
+                UserListItem.last_watched_at,
+                UserListItem.updated_at,
+                UserListItem.created_at
+            ).desc()
         )
         .limit(100)
     )
     movie_res = await db.execute(movie_query)
     movie_records = movie_res.all()
 
-    for uli, media, user in movie_records:
-        watched_at = uli.last_watched_at or uli.updated_at or uli.created_at
+    for row in movie_records:
+        watched_at = row.last_watched_at or row.updated_at or row.created_at
         if not watched_at:
             continue
 
-        item_id = f"mov_{user.id}_{media.id}_{int(watched_at.timestamp())}"
+        item_id = f"mov_{row.user_id}_{row.media_id}_{int(watched_at.timestamp())}"
         feed_items.append(
             FriendFeedItem(
                 id=item_id,
-                user_id=user.id,
-                user_name=user.name,
-                username=user.username,
-                media_id=media.id,
-                tmdb_id=media.tmdb_id,
+                user_id=row.user_id,
+                user_name=row.user_name,
+                username=row.username,
+                media_id=row.media_id,
+                tmdb_id=row.tmdb_id,
                 media_type="movie",
-                title=media.title,
-                poster_path=media.poster_path,
-                backdrop_path=media.backdrop_path,
-                rating=uli.rating,
+                title=row.title,
+                poster_path=row.poster_path,
+                backdrop_path=row.backdrop_path,
+                rating=row.uli_rating,
                 season_number=None,
                 episode_numbers=[],
                 episodes_label=None,

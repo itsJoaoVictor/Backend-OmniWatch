@@ -1,10 +1,13 @@
-from fastapi import APIRouter, Depends, Query, status, HTTPException
+from fastapi import APIRouter, Depends, Query, status, HTTPException, Response
+from sqlalchemy import func
+from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
 import uuid
 
 from app.core.database import get_db
 from app.auth.dependencies import get_current_user_id
+from app.friends.models import Friendship
 from app.friends.schemas import (
     UserSearchResult,
     FriendUserResponse,
@@ -26,21 +29,21 @@ from app.friends.services import (
 
 router = APIRouter(prefix="/friends", tags=["friends"])
 
+
 def parse_uuid(uid_str: str) -> uuid.UUID:
     try:
         return uuid.UUID(uid_str) if isinstance(uid_str, str) else uid_str
     except ValueError:
         raise HTTPException(status_code=400, detail="ID de usuário inválido.")
 
-from sqlalchemy import func
-from sqlalchemy.future import select
-from app.friends.models import Friendship
 
 @router.get("/pending-count")
 async def get_pending_count(
+    response: Response,
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    response.headers["Cache-Control"] = "private, max-age=30, stale-while-revalidate=60"
     u_uuid = parse_uuid(current_user_id)
     res = await db.execute(
         select(func.count(Friendship.id)).where(
@@ -51,15 +54,21 @@ async def get_pending_count(
     count = res.scalar() or 0
     return {"count": count}
 
+
 @router.get("/feed", response_model=FriendFeedResponse)
 async def get_feed_endpoint(
+    response: Response,
     page: int = Query(1, ge=1, description="Número da página"),
     limit: int = Query(20, ge=1, le=50, description="Itens por página"),
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    response.headers["Cache-Control"] = "private, max-age=20, stale-while-revalidate=40"
     u_uuid = parse_uuid(current_user_id)
     return await get_friend_feed(db, u_uuid, page=page, limit=limit)
+
+get_feed = get_feed_endpoint
+
 
 @router.get("", response_model=List[FriendUserResponse])
 async def list_friends(
