@@ -70,3 +70,20 @@ class UserStatsSummary(Base):
 
     user = relationship("User")
 
+class UserMonthlyActivity(Base):
+    __tablename__ = "user_monthly_activity"
+
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    year_month = Column(String(7), primary_key=True)  # Formato 'YYYY-MM'
+    episodes_watched = Column(Integer, default=0, nullable=False, server_default="0")
+    episodes_time_minutes = Column(Integer, default=0, nullable=False, server_default="0")
+    movies_watched = Column(Integer, default=0, nullable=False, server_default="0")
+    movies_time_minutes = Column(Integer, default=0, nullable=False, server_default="0")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User")
+
+    __table_args__ = (
+        Index("ix_user_monthly_activity_user_date", "user_id", "year_month"),
+    )
+

@@ -1791,6 +1791,33 @@ def normalize_genre(name: str) -> str:
     return GENRE_NORMALIZATION.get(clean.lower(), clean)
 
 _revalidating_stats_keys: set = set()
+_prewarming_tasks: set = set()
+
+async def prewarm_period_stats_cache(user_id: str, media_type: str = "all"):
+    """
+    Pré-aquece os filtros comuns de período ('30days', 'year') em background.
+    Executa sequencialmente para não sobrecarregar o hardware do dispositivo host.
+    """
+    prewarm_key = f"prewarm:{user_id}:{media_type}"
+    if prewarm_key in _prewarming_tasks:
+        return
+    _prewarming_tasks.add(prewarm_key)
+    try:
+        for p in ("30days", "year"):
+            cache_key = f"stats:{user_id}:{p}:{media_type}"
+            cached, is_stale = stats_cache.get_with_status(cache_key)
+            if (cached is None or is_stale) and cache_key not in _revalidating_stats_keys:
+                _revalidating_stats_keys.add(cache_key)
+                try:
+                    from app.core.database import AsyncSessionLocal
+                    async with AsyncSessionLocal() as session:
+                        await _compute_user_statistics(session, user_id, period=p, media_type=media_type)
+                except Exception as e:
+                    logger.warning("Erro ao pré-aquecer cache de estatísticas (%s, %s): %s", p, media_type, e)
+                finally:
+                    _revalidating_stats_keys.discard(cache_key)
+    finally:
+        _prewarming_tasks.discard(prewarm_key)
 
 async def recompute_and_cache_stats(user_id: str, period: str, media_type: str):
     """Recomputa as estatísticas do usuário em background e atualiza o cache."""
@@ -1902,24 +1929,42 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
 
         num_months = 12 if period in ("year", "all") else 6
         timeline_start = now - timedelta(days=num_months * 31)
-        ep_timeline_sql = text("""
-            SELECT 
-                TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM') AS month_key,
-                SUM(1 + COALESCE(uep.rewatch_count, 0)) AS ep_count,
-                SUM((1 + COALESCE(uep.rewatch_count, 0)) * COALESCE(m.runtime, 0)) AS ep_minutes
-            FROM user_episode_progress uep
-            JOIN user_list_items uli ON uli.id = uep.user_list_item_id
-            JOIN media m ON m.id = uli.media_id
-            WHERE uli.user_id = :user_uuid
-              AND COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at) >= :timeline_start
-            GROUP BY TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM')
-        """)
-        res_ep_tl = await db.execute(ep_timeline_sql, {"user_uuid": user_uuid, "timeline_start": timeline_start})
-        for row in res_ep_tl.fetchall():
-            ep_timeline_map[row.month_key] = {
-                "count": int(row.ep_count or 0),
-                "minutes": int(row.ep_minutes or 0)
-            }
+        start_year_month = f"{timeline_start.year:04d}-{timeline_start.month:02d}"
+
+        # Nível 3: Leitura instantânea (<1ms) via tabela materializada user_monthly_activity
+        from app.tracking.models import UserMonthlyActivity
+        res_activity = await db.execute(
+            select(UserMonthlyActivity).where(
+                UserMonthlyActivity.user_id == user_uuid,
+                UserMonthlyActivity.year_month >= start_year_month
+            )
+        )
+        activity_rows = res_activity.scalars().all()
+        if activity_rows:
+            for row in activity_rows:
+                ep_timeline_map[row.year_month] = {
+                    "count": int(row.episodes_watched or 0),
+                    "minutes": int(row.episodes_time_minutes or 0)
+                }
+        else:
+            ep_timeline_sql = text("""
+                SELECT 
+                    TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM') AS month_key,
+                    SUM(1 + COALESCE(uep.rewatch_count, 0)) AS ep_count,
+                    SUM((1 + COALESCE(uep.rewatch_count, 0)) * COALESCE(m.runtime, 0)) AS ep_minutes
+                FROM user_episode_progress uep
+                JOIN user_list_items uli ON uli.id = uep.user_list_item_id
+                JOIN media m ON m.id = uli.media_id
+                WHERE uli.user_id = :user_uuid
+                  AND COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at) >= :timeline_start
+                GROUP BY TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM')
+            """)
+            res_ep_tl = await db.execute(ep_timeline_sql, {"user_uuid": user_uuid, "timeline_start": timeline_start})
+            for row in res_ep_tl.fetchall():
+                ep_timeline_map[row.month_key] = {
+                    "count": int(row.ep_count or 0),
+                    "minutes": int(row.ep_minutes or 0)
+                }
 
     # 3. Inicializa Timeline de Atividade Mensal
     num_months = 12 if period in ("year", "all") else 6
@@ -2174,7 +2219,7 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
     tv_plan_mins = 0
     tv_plan_eps = 0
     for i in tv_plan_items:
-        cached_det, _ = details_cache.get_with_status(f"tv_details:{i.media.tmdb_id}")
+        cached_det, _ = details_cache.get_with_status(f"details:tv:{i.media.tmdb_id}")
         total_eps = cached_det.get("number_of_episodes", 0) if cached_det else 0
         eps = total_eps if total_eps > 0 else 12
         runtime = i.media.runtime or 45
@@ -2187,7 +2232,7 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
     for i in tv_watching_items:
         watched = i.episodes_watched_count or 0
         runtime = i.media.runtime or 45
-        cached_det, _ = details_cache.get_with_status(f"tv_details:{i.media.tmdb_id}")
+        cached_det, _ = details_cache.get_with_status(f"details:tv:{i.media.tmdb_id}")
         total_eps = cached_det.get("number_of_episodes", 0) if cached_det else 0
         if total_eps > watched:
             rem = total_eps - watched
@@ -2317,6 +2362,11 @@ async def get_user_statistics(
                 background_tasks.add_task(recompute_and_cache_stats, user_id, period, media_type)
             else:
                 asyncio.create_task(recompute_and_cache_stats(user_id, period, media_type))
+        if period == "all":
+            if background_tasks is not None:
+                background_tasks.add_task(prewarm_period_stats_cache, user_id, media_type)
+            else:
+                asyncio.create_task(prewarm_period_stats_cache(user_id, media_type))
         return cached_data
 
     # Nível 3: Leitura direta e instantânea (<1ms) de user_stats_summary para o resumo global
@@ -2348,11 +2398,21 @@ async def get_user_statistics(
                         background_tasks.add_task(recompute_and_cache_stats, user_id, period, media_type)
                     else:
                         asyncio.create_task(recompute_and_cache_stats(user_id, period, media_type))
+                if background_tasks is not None:
+                    background_tasks.add_task(prewarm_period_stats_cache, user_id, media_type)
+                else:
+                    asyncio.create_task(prewarm_period_stats_cache(user_id, media_type))
                 return output
         except Exception as e:
             logger.warning("Falha ao buscar user_stats_summary: %s", e)
 
-    return await _compute_user_statistics(db, user_id, period=period, media_type=media_type)
+    output = await _compute_user_statistics(db, user_id, period=period, media_type=media_type)
+    if period == "all":
+        if background_tasks is not None:
+            background_tasks.add_task(prewarm_period_stats_cache, user_id, media_type)
+        else:
+            asyncio.create_task(prewarm_period_stats_cache(user_id, media_type))
+    return output
 
 _revalidating_ranking_keys: set = set()
 

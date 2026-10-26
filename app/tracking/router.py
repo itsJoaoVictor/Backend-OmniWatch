@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 
@@ -202,12 +202,14 @@ async def rewatch_episode(
 
 @router.get("/statistics")
 async def get_statistics(
+    response: Response,
     background_tasks: BackgroundTasks,
     period: str = "all",
     media_type: str = "all",
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    response.headers["Cache-Control"] = "private, max-age=60, stale-while-revalidate=300"
     from app.tracking.services import get_user_statistics
     stats = await get_user_statistics(
         db, user_id, period=period, media_type=media_type, background_tasks=background_tasks
@@ -216,6 +218,7 @@ async def get_statistics(
 
 @router.get("/statistics/rankings/media", response_model=MediaRankingResponse)
 async def get_media_ranking(
+    response: Response,
     background_tasks: BackgroundTasks,
     media_type: str = "movie",
     sort_by: str = "time",
@@ -226,6 +229,7 @@ async def get_media_ranking(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    response.headers["Cache-Control"] = "private, max-age=60, stale-while-revalidate=300"
     from app.tracking.services import get_user_media_ranking
     return await get_user_media_ranking(
         db=db,
@@ -241,6 +245,7 @@ async def get_media_ranking(
 
 @router.get("/statistics/rankings/people", response_model=PeopleRankingResponse)
 async def get_people_ranking(
+    response: Response,
     background_tasks: BackgroundTasks,
     role: str = "cast",
     sort_by: str = "count",
@@ -251,6 +256,7 @@ async def get_people_ranking(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    response.headers["Cache-Control"] = "private, max-age=60, stale-while-revalidate=300"
     from app.tracking.services import get_user_people_ranking
     return await get_user_people_ranking(
         db=db,

@@ -494,6 +494,98 @@ async def run_auto_migrations():
             """))
             await session.commit()
             logger.info("✅ [AutoMigrate] Nível 3 (Contadores desnormalizados, triggers e user_stats_summary) validados.")
+
+            # 4. Tabela materializada de atividade mensal (user_monthly_activity)
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_monthly_activity (
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    year_month VARCHAR(7) NOT NULL,
+                    episodes_watched INTEGER NOT NULL DEFAULT 0,
+                    episodes_time_minutes INTEGER NOT NULL DEFAULT 0,
+                    movies_watched INTEGER NOT NULL DEFAULT 0,
+                    movies_time_minutes INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (user_id, year_month)
+                );
+            """))
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_user_monthly_activity_user_date 
+                ON user_monthly_activity (user_id, year_month DESC);
+            """))
+            await session.execute(text("""
+                CREATE OR REPLACE FUNCTION update_user_monthly_activity()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    v_user_id UUID;
+                    v_watched_at TIMESTAMPTZ;
+                    v_year_month VARCHAR(7);
+                BEGIN
+                    IF (TG_OP = 'DELETE') THEN
+                        SELECT uli.user_id, COALESCE(OLD.watched_at, now())
+                        INTO v_user_id, v_watched_at
+                        FROM user_list_items uli
+                        WHERE uli.id = OLD.user_list_item_id;
+                    ELSE
+                        SELECT uli.user_id, COALESCE(NEW.watched_at, now())
+                        INTO v_user_id, v_watched_at
+                        FROM user_list_items uli
+                        WHERE uli.id = NEW.user_list_item_id;
+                    END IF;
+
+                    IF v_user_id IS NOT NULL THEN
+                        v_year_month := TO_CHAR(v_watched_at, 'YYYY-MM');
+
+                        INSERT INTO user_monthly_activity (user_id, year_month, episodes_watched, episodes_time_minutes, updated_at)
+                        SELECT 
+                            v_user_id,
+                            v_year_month,
+                            COALESCE(SUM(1 + COALESCE(uep.rewatch_count, 0)), 0),
+                            COALESCE(SUM((1 + COALESCE(uep.rewatch_count, 0)) * COALESCE(m.runtime, 0)), 0),
+                            now()
+                        FROM user_episode_progress uep
+                        JOIN user_list_items uli ON uli.id = uep.user_list_item_id
+                        JOIN media m ON m.id = uli.media_id
+                        WHERE uli.user_id = v_user_id
+                          AND TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM') = v_year_month
+                        ON CONFLICT (user_id, year_month) DO UPDATE
+                        SET 
+                            episodes_watched = EXCLUDED.episodes_watched,
+                            episodes_time_minutes = EXCLUDED.episodes_time_minutes,
+                            updated_at = now();
+                    END IF;
+
+                    RETURN NULL;
+                END;
+                $$ LANGUAGE plpgsql;
+            """))
+            await session.execute(text("DROP TRIGGER IF EXISTS trg_user_monthly_activity ON user_episode_progress;"))
+            await session.execute(text("""
+                CREATE TRIGGER trg_user_monthly_activity
+                AFTER INSERT OR UPDATE OR DELETE ON user_episode_progress
+                FOR EACH ROW EXECUTE FUNCTION update_user_monthly_activity();
+            """))
+
+            # Backfill idempotente
+            await session.execute(text("""
+                INSERT INTO user_monthly_activity (user_id, year_month, episodes_watched, episodes_time_minutes, updated_at)
+                SELECT 
+                    uli.user_id,
+                    TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM') AS year_month,
+                    SUM(1 + COALESCE(uep.rewatch_count, 0)) AS episodes_watched,
+                    SUM((1 + COALESCE(uep.rewatch_count, 0)) * COALESCE(m.runtime, 0)) AS episodes_time_minutes,
+                    now()
+                FROM user_episode_progress uep
+                JOIN user_list_items uli ON uli.id = uep.user_list_item_id
+                JOIN media m ON m.id = uli.media_id
+                GROUP BY uli.user_id, TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM')
+                ON CONFLICT (user_id, year_month) DO UPDATE
+                SET 
+                    episodes_watched = EXCLUDED.episodes_watched,
+                    episodes_time_minutes = EXCLUDED.episodes_time_minutes,
+                    updated_at = now();
+            """))
+            await session.commit()
+            logger.info("✅ [AutoMigrate] Tabela materializada user_monthly_activity validada.")
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
 
