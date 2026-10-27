@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, load_only
 from datetime import datetime, date
 from typing import List, Optional
 import calendar
@@ -22,6 +22,9 @@ class MediaSimple(BaseModel):
     title: str
     poster_path: Optional[str] = None
     media_type: str
+
+    class Config:
+        from_attributes = True
 
 class ReleaseEventSchema(BaseModel):
     id: UUID4
@@ -62,11 +65,19 @@ async def get_my_releases(
             from fastapi import HTTPException
             raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM.")
 
-    # Consulta única otimizada com JOIN indexado direto entre MediaRelease e UserListItem.
-    # Elimina o duplo round-trip e a cláusula IN (...) com centenas de IDs em memória.
+    # Consulta única otimizada com JOIN indexado direto entre MediaRelease e UserListItem
+    # e projeção restrita aos campos necessários de Media (eliminando colunas pesadas de embedding e JSON).
     stmt_releases = (
         select(MediaRelease)
-        .options(joinedload(MediaRelease.media))
+        .options(
+            joinedload(MediaRelease.media).load_only(
+                Media.id,
+                Media.tmdb_id,
+                Media.title,
+                Media.poster_path,
+                Media.media_type
+            )
+        )
         .join(
             UserListItem,
             UserListItem.media_id == MediaRelease.media_id

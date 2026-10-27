@@ -61,22 +61,57 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
                     
                     await db.execute(delete(MediaRelease).where(MediaRelease.media_id == media.id))
 
-                    if next_episode and next_episode.get("air_date"):
-                        r_date = datetime.strptime(next_episode.get("air_date"), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                        ep_title = next_episode.get("name", "Novo Episodio")
-                        ep_desc = next_episode.get("overview", "")
+                    synced_season_episodes = False
+                    if next_episode and next_episode.get("season_number") is not None:
                         s_num = next_episode.get("season_number")
-                        e_num = next_episode.get("episode_number")
-                        
-                        new_release = MediaRelease(
-                            media_id=media.id,
-                            title=f"T{s_num}E{e_num} - {ep_title}",
-                            description=ep_desc,
-                            release_date=r_date,
-                            season_number=s_num,
-                            episode_number=e_num
-                        )
-                        db.add(new_release)
+                        # Busca os episódios completos da temporada para registrar todos os episódios futuros confirmados
+                        url_season = f"{settings.TMDB_BASE_URL}/tv/{media.tmdb_id}/season/{s_num}"
+                        res_season = await client.get(url_season, headers=headers, params=params, timeout=10.0)
+                        if res_season.status_code == 200:
+                            s_data = res_season.json()
+                            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                            for ep in s_data.get("episodes", []):
+                                ep_air_date = ep.get("air_date")
+                                if ep_air_date and ep_air_date >= today_str:
+                                    try:
+                                        r_date = datetime.strptime(ep_air_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                                        e_num = ep.get("episode_number")
+                                        ep_title = ep.get("name") or f"Episódio {e_num}"
+                                        ep_desc = ep.get("overview", "")
+                                        
+                                        new_release = MediaRelease(
+                                            media_id=media.id,
+                                            title=f"T{s_num}E{e_num} - {ep_title}",
+                                            description=ep_desc,
+                                            release_date=r_date,
+                                            season_number=s_num,
+                                            episode_number=e_num
+                                        )
+                                        db.add(new_release)
+                                        synced_season_episodes = True
+                                    except ValueError:
+                                        pass
+
+                    # Fallback de segurança se a busca da temporada não trouxer episódios futuros
+                    if not synced_season_episodes and next_episode and next_episode.get("air_date"):
+                        try:
+                            r_date = datetime.strptime(next_episode.get("air_date"), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                            ep_title = next_episode.get("name", "Novo Episodio")
+                            ep_desc = next_episode.get("overview", "")
+                            s_num = next_episode.get("season_number")
+                            e_num = next_episode.get("episode_number")
+                            
+                            new_release = MediaRelease(
+                                media_id=media.id,
+                                title=f"T{s_num}E{e_num} - {ep_title}",
+                                description=ep_desc,
+                                release_date=r_date,
+                                season_number=s_num,
+                                episode_number=e_num
+                            )
+                            db.add(new_release)
+                        except ValueError:
+                            pass
         except Exception as e:
             print(f"Error syncing media {media.id}: {e}")
             
