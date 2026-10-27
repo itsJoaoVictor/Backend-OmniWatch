@@ -1,12 +1,25 @@
 import os
+import time
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Configuração do fuso horário padrão do servidor (Brasil - Horário de Brasília)
+SERVER_TIMEZONE = "America/Sao_Paulo"
+os.environ["TZ"] = SERVER_TIMEZONE
+if hasattr(time, "tzset"):
+    time.tzset()
+
 class Settings:
     DEBUG: bool = os.getenv("DEBUG", "True").lower() in ("true", "1", "t")
+    SERVER_TIMEZONE: str = SERVER_TIMEZONE
     TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "")
     TMDB_BASE_URL: str = "https://api.themoviedb.org/3"
+    
+    @property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.SERVER_TIMEZONE)
     
     # Fase 6: Embeddings Semânticos via OpenRouter / OpenAI API
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")

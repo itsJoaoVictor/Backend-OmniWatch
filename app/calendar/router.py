@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload, load_only
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import List, Optional
 import calendar
 
@@ -43,6 +43,7 @@ class ReleaseEventSchema(BaseModel):
 async def get_my_releases(
     response: Response,
     month: Optional[str] = Query(None, description="Format YYYY-MM. If not provided, gets all upcoming releases"),
+    from_date: Optional[str] = Query(None, description="Format YYYY-MM-DD. Start date for releases (defaults to current date)"),
     limit: Optional[int] = Query(None, ge=1, le=200, description="Max releases to return (default 100 for agenda)"),
     offset: Optional[int] = Query(0, ge=0, description="Offset for pagination"),
     db: AsyncSession = Depends(get_db),
@@ -64,6 +65,18 @@ async def get_my_releases(
         except ValueError:
             from fastapi import HTTPException
             raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM.")
+    elif from_date:
+        try:
+            # Data inicial informada pelo cliente no fuso horário do usuário (00:00:00 UTC)
+            start_date = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="Invalid from_date format. Use YYYY-MM-DD.")
+    else:
+        # Fallback padrão: início do dia de hoje no fuso horário oficial do servidor (America/Sao_Paulo)
+        from app.core.utils import get_server_today
+        today_server = get_server_today()
+        start_date = datetime(today_server.year, today_server.month, today_server.day, tzinfo=timezone.utc)
 
     # Consulta única otimizada com JOIN indexado direto entre MediaRelease e UserListItem
     # e projeção restrita aos campos necessários de Media (eliminando colunas pesadas de embedding e JSON).
@@ -93,10 +106,9 @@ async def get_my_releases(
             MediaRelease.release_date >= start_date,
             MediaRelease.release_date <= end_date
         )
-    else:
-        # Default: apenas lançamentos futuros
+    elif start_date:
         stmt_releases = stmt_releases.where(
-            MediaRelease.release_date >= datetime.now(timezone.utc)
+            MediaRelease.release_date >= start_date
         )
         
     stmt_releases = stmt_releases.order_by(MediaRelease.release_date.asc())

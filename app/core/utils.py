@@ -1,9 +1,23 @@
-from datetime import datetime, timezone
+from datetime import datetime, date
 from typing import Optional
+from zoneinfo import ZoneInfo
+from app.core.config import settings
+
+def get_server_tz() -> ZoneInfo:
+    """Retorna o ZoneInfo oficial do servidor (America/Sao_Paulo)."""
+    return settings.tz
+
+def get_server_now() -> datetime:
+    """Retorna o datetime atual considerando o fuso horário oficial do servidor (Brasil - Horário de Brasília)."""
+    return datetime.now(settings.tz)
+
+def get_server_today() -> date:
+    """Retorna a data civil atual do servidor no Brasil (YYYY-MM-DD)."""
+    return datetime.now(settings.tz).date()
 
 def is_date_released(date_str: Optional[str]) -> bool:
     """
-    Verifica se uma data (no formato 'YYYY-MM-DD') é válida e já ocorreu (ou seja, <= hoje em UTC).
+    Verifica se uma data (no formato 'YYYY-MM-DD') é válida e já ocorreu (ou seja, <= hoje no horário do servidor).
     Retorna False caso a data seja nula, vazia, inválida ou futura.
     """
     if not date_str or not isinstance(date_str, str):
@@ -15,7 +29,7 @@ def is_date_released(date_str: Optional[str]) -> bool:
         
     try:
         release_date = datetime.strptime(clean_date[:10], "%Y-%m-%d").date()
-        today_date = datetime.now(timezone.utc).date()
+        today_date = get_server_today()
         return release_date <= today_date
     except (ValueError, TypeError):
         return False

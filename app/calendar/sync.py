@@ -69,7 +69,8 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
                         res_season = await client.get(url_season, headers=headers, params=params, timeout=10.0)
                         if res_season.status_code == 200:
                             s_data = res_season.json()
-                            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                            from app.core.utils import get_server_today
+                            today_str = get_server_today().strftime("%Y-%m-%d")
                             for ep in s_data.get("episodes", []):
                                 ep_air_date = ep.get("air_date")
                                 if ep_air_date and ep_air_date >= today_str:
