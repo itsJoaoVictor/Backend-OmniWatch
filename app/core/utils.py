@@ -1,19 +1,27 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from typing import Optional
-from zoneinfo import ZoneInfo
-from app.core.config import settings
+from app.core.config import settings, BRASILIA_TZ
 
-def get_server_tz() -> ZoneInfo:
-    """Retorna o ZoneInfo oficial do servidor (America/Sao_Paulo)."""
-    return settings.tz
+def get_server_tz():
+    """Retorna o ZoneInfo oficial do servidor (America/Sao_Paulo) com fallback para UTC-3."""
+    try:
+        return settings.tz
+    except Exception:
+        return BRASILIA_TZ
 
 def get_server_now() -> datetime:
     """Retorna o datetime atual considerando o fuso horário oficial do servidor (Brasil - Horário de Brasília)."""
-    return datetime.now(settings.tz)
+    try:
+        return datetime.now(get_server_tz())
+    except Exception:
+        return datetime.now(timezone.utc)
 
 def get_server_today() -> date:
     """Retorna a data civil atual do servidor no Brasil (YYYY-MM-DD)."""
-    return datetime.now(settings.tz).date()
+    try:
+        return datetime.now(get_server_tz()).date()
+    except Exception:
+        return datetime.now(timezone.utc).date()
 
 def is_date_released(date_str: Optional[str]) -> bool:
     """
@@ -31,5 +39,5 @@ def is_date_released(date_str: Optional[str]) -> bool:
         release_date = datetime.strptime(clean_date[:10], "%Y-%m-%d").date()
         today_date = get_server_today()
         return release_date <= today_date
-    except (ValueError, TypeError):
+    except Exception:
         return False
