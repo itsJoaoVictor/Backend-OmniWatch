@@ -590,6 +590,14 @@ async def run_auto_migrations():
             """))
             await session.commit()
             logger.info("✅ [AutoMigrate] Tabela materializada user_monthly_activity validada.")
+            # Suporte a múltiplos dispositivos e Grace Period em refresh_tokens
+            await session.execute(text("""
+                ALTER TABLE refresh_tokens 
+                ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+            """))
+            await session.commit()
+            logger.info("✅ [AutoMigrate] Coluna 'revoked_at' em refresh_tokens validada.")
+            
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")
 

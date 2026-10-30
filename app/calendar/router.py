@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload, load_only
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import List, Optional
 import calendar
 
@@ -11,8 +11,7 @@ from app.auth.dependencies import get_current_user_id
 from app.users.models import User
 from app.media.models import MediaRelease, Media
 from app.tracking.models import UserListItem
-from pydantic import BaseModel
-from pydantic import UUID4
+from pydantic import BaseModel, UUID4, field_serializer
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
 
@@ -38,6 +37,14 @@ class ReleaseEventSchema(BaseModel):
 
     class Config:
         from_attributes = True
+
+    @field_serializer("release_date")
+    def serialize_release_date(self, dt: datetime, _info) -> str:
+        # Garante que a data seja sempre serializada em UTC (ex: 2026-10-30T00:00:00Z)
+        # evitando shifts de dia causados pelo fuso do servidor local (ex: America/Sao_Paulo UTC-3)
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
 @router.get("/my-releases", response_model=List[ReleaseEventSchema])
 async def get_my_releases(
