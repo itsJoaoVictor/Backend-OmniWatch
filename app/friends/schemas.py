@@ -71,3 +71,4 @@ class FriendFeedResponse(BaseModel):
     page: int
     limit: int
     has_more: bool
+    next_cursor: Optional[str] = None

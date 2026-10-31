@@ -429,7 +429,9 @@ async def get_friend_feed(
     current_user_id: uuid.UUID,
     page: int = 1,
     limit: int = 20,
-    media_type: Optional[str] = None
+    media_type: Optional[str] = None,
+    cursor: Optional[str] = None,
+    friend: Optional[str] = None
 ) -> FriendFeedResponse:
     # 1. Obter IDs de todos os amigos com status 'accepted'
     friendships_res = await db.execute(
@@ -449,7 +451,8 @@ async def get_friend_feed(
             total=0,
             page=page,
             limit=limit,
-            has_more=False
+            has_more=False,
+            next_cursor=None
         )
 
     friend_ids = [
@@ -457,20 +460,70 @@ async def get_friend_feed(
         for f in friendships
     ]
 
+    # Filtrar por amigo específico se fornecido (por username ou UUID)
+    if friend:
+        clean_friend = friend.strip().replace("@", "")
+        target_friend_id = None
+        try:
+            parsed_uuid = uuid.UUID(clean_friend)
+            if parsed_uuid in friend_ids:
+                target_friend_id = parsed_uuid
+        except ValueError:
+            user_res = await db.execute(
+                select(User.id).where(func.lower(User.username) == clean_friend.lower())
+            )
+            found_id = user_res.scalar_one_or_none()
+            if found_id and found_id in friend_ids:
+                target_friend_id = found_id
+
+        if not target_friend_id:
+            # Amigo não existe ou não faz parte do círculo de amizades aceitas
+            return FriendFeedResponse(
+                items=[],
+                total=0,
+                page=page,
+                limit=limit,
+                has_more=False,
+                next_cursor=None
+            )
+        
+        friend_ids = [target_friend_id]
+
     # Normalizar media_type se fornecido
     filter_type = media_type.lower().strip() if media_type else None
     if filter_type not in ("movie", "tv"):
         filter_type = None
 
+    # Parse do cursor temporal (before_timestamp) se fornecido
+    cursor_dt = None
+    if cursor:
+        try:
+            clean_cursor = cursor.strip().replace("Z", "+00:00")
+            cursor_dt = datetime.fromisoformat(clean_cursor)
+        except Exception:
+            cursor_dt = None
+
     feed_items = []
 
-    # Escala dinâmica dos limites de busca por página para evitar hard-cap de 300 itens
-    needed_count = page * limit
-    ep_limit = max(300, needed_count * 8)
-    movie_limit = max(100, needed_count * 4)
+    # Se houver cursor, usamos limites fixos e enxutos O(limit), sem crescer com a profundidade da página
+    if cursor_dt:
+        ep_limit = max(40, limit * 3)
+        movie_limit = max(20, limit * 2)
+    else:
+        # Modo legado (sem cursor): escala dinâmica proporcional
+        needed_count = page * limit
+        ep_limit = min(300, max(60, needed_count * 4))
+        movie_limit = min(100, max(30, needed_count * 2))
 
     # 2. Buscar episódios recentes assistidos pelos amigos (ignorado se filtro for apenas filme)
     if filter_type != "movie":
+        ep_conditions = [
+            UserListItem.user_id.in_(friend_ids),
+            UserEpisodeProgress.watched_at.is_not(None)
+        ]
+        if cursor_dt:
+            ep_conditions.append(UserEpisodeProgress.watched_at < cursor_dt)
+
         ep_query = (
             select(
                 UserEpisodeProgress.season_number,
@@ -491,10 +544,7 @@ async def get_friend_feed(
             .join(UserListItem, UserEpisodeProgress.user_list_item_id == UserListItem.id)
             .join(Media, UserListItem.media_id == Media.id)
             .join(User, UserListItem.user_id == User.id)
-            .where(
-                UserListItem.user_id.in_(friend_ids),
-                UserEpisodeProgress.watched_at.is_not(None)
-            )
+            .where(*ep_conditions)
             .order_by(UserEpisodeProgress.watched_at.desc())
             .limit(ep_limit)
         )
@@ -601,20 +651,30 @@ async def get_friend_feed(
             )
             .join(Media, UserListItem.media_id == Media.id)
             .join(User, UserListItem.user_id == User.id)
-            .where(
-                UserListItem.user_id.in_(friend_ids),
-                Media.media_type == "movie",
+        )
+
+        movie_conditions = [
+            UserListItem.user_id.in_(friend_ids),
+            Media.media_type == "movie",
+            or_(
+                UserListItem.status == "completed",
+                UserListItem.last_watched_at.is_not(None)
+            )
+        ]
+        if cursor_dt:
+            movie_conditions.append(
                 or_(
-                    UserListItem.status == "completed",
-                    UserListItem.last_watched_at.is_not(None)
+                    UserListItem.last_watched_at < cursor_dt,
+                    and_(UserListItem.last_watched_at.is_(None), UserListItem.updated_at < cursor_dt)
                 )
             )
+
+        movie_query = (
+            movie_query
+            .where(*movie_conditions)
             .order_by(
-                func.coalesce(
-                    UserListItem.last_watched_at,
-                    UserListItem.updated_at,
-                    UserListItem.created_at
-                ).desc()
+                UserListItem.last_watched_at.desc().nulls_last(),
+                UserListItem.updated_at.desc().nulls_last()
             )
             .limit(movie_limit)
         )
@@ -651,17 +711,31 @@ async def get_friend_feed(
     # 4. Ordenar todos os itens por watched_at decrescente
     feed_items.sort(key=lambda x: x.watched_at, reverse=True)
 
-    # 5. Aplicar paginação
-    total = len(feed_items)
-    start = (page - 1) * limit
-    end = start + limit
-    paginated_items = feed_items[start:end]
-    has_more = end < total
+    # 5. Aplicar paginação (por Cursor ou Offset legado)
+    if cursor_dt:
+        paginated_items = feed_items[:limit]
+        has_more = len(feed_items) > limit
+        total = len(paginated_items)
+    else:
+        total = len(feed_items)
+        start = (page - 1) * limit
+        end = start + limit
+        paginated_items = feed_items[start:end]
+        has_more = end < total
+
+    next_cursor = None
+    if paginated_items and has_more:
+        last_watched = paginated_items[-1].watched_at
+        if hasattr(last_watched, "isoformat"):
+            next_cursor = last_watched.isoformat()
+        else:
+            next_cursor = str(last_watched)
 
     return FriendFeedResponse(
         items=paginated_items,
         total=total,
         page=page,
         limit=limit,
-        has_more=has_more
+        has_more=has_more,
+        next_cursor=next_cursor
     )
