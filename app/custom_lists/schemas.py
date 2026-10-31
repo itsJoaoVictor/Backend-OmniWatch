@@ -14,6 +14,9 @@ class CustomListItemCreate(BaseModel):
     note: Optional[str] = None
     position: Optional[int] = None
 
+class CustomListItemsBulkCreate(BaseModel):
+    items: List[CustomListItemCreate] = Field(..., min_length=1, max_length=100)
+
 class CustomListItemUpdate(BaseModel):
     note: Optional[str] = None
     position: Optional[int] = None
@@ -69,6 +72,12 @@ class CustomListDetailOut(CustomListSummaryOut):
     items: List[CustomListItemOut] = []
     total_runtime_minutes: int = 0
     is_owner: bool = True
+
+class CustomListItemsPagedOut(BaseModel):
+    items: List[CustomListItemOut]
+    next_cursor: Optional[int] = None
+    has_more: bool
+    total_count: int
 
 class ReorderItemsRequest(BaseModel):
     item_ids: List[UUID]

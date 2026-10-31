@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from typing import Optional, List
 from sqlalchemy import select, func, desc, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +15,7 @@ from app.custom_lists.schemas import (
     CustomListSummaryOut,
     CustomListDetailOut,
     CustomListItemOut,
+    CustomListItemsPagedOut,
     MediaListMembership
 )
 from app.media.models import Media
@@ -53,6 +55,16 @@ async def create_custom_list(db: AsyncSession, user_id: uuid.UUID, data: CustomL
         updated_at=new_list.updated_at
     )
 
+async def get_my_custom_lists_etag(db: AsyncSession, user_id: uuid.UUID) -> str:
+    res = await db.execute(
+        select(func.max(CustomList.updated_at), func.count(CustomList.id))
+        .where(CustomList.user_id == user_id)
+    )
+    row = res.first()
+    max_updated, count = row if row else (None, 0)
+    ts = int(max_updated.timestamp()) if max_updated else 0
+    return f'W/"{str(user_id)[:8]}-{count}-{ts}"'
+
 async def get_my_custom_lists(db: AsyncSession, user_id: uuid.UUID) -> List[CustomListSummaryOut]:
     query = (
         select(CustomList, User.name.label("user_name"))
@@ -63,16 +75,41 @@ async def get_my_custom_lists(db: AsyncSession, user_id: uuid.UUID) -> List[Cust
     res = await db.execute(query)
     rows = res.all()
 
+    if not rows:
+        return []
+
+    # Otimização N+1: Buscar os primeiros 4 pôsteres de todas as listas em lote usando Window Function
+    list_ids = [list_obj.id for list_obj, _ in rows]
+    subq = (
+        select(
+            CustomListItem.list_id,
+            CustomListItem.poster_path,
+            func.row_number().over(
+                partition_by=CustomListItem.list_id,
+                order_by=CustomListItem.position
+            ).label("rn")
+        )
+        .where(
+            CustomListItem.list_id.in_(list_ids),
+            CustomListItem.poster_path.isnot(None)
+        )
+        .subquery()
+    )
+
+    posters_query = (
+        select(subq.c.list_id, subq.c.poster_path)
+        .where(subq.c.rn <= 4)
+        .order_by(subq.c.list_id, subq.c.rn)
+    )
+    posters_res = await db.execute(posters_query)
+
+    posters_map = {}
+    for lid, poster in posters_res.all():
+        posters_map.setdefault(lid, []).append(poster)
+
     output = []
     for list_obj, user_name in rows:
-        # Obter os primeiros 4 pôsteres para preview
-        posters_res = await db.execute(
-            select(CustomListItem.poster_path)
-            .where(CustomListItem.list_id == list_obj.id, CustomListItem.poster_path.isnot(None))
-            .order_by(CustomListItem.position)
-            .limit(4)
-        )
-        preview_posters = [p for p in posters_res.scalars().all() if p]
+        preview_posters = posters_map.get(list_obj.id, [])
 
         output.append(
             CustomListSummaryOut(
@@ -154,6 +191,59 @@ async def get_custom_list_detail(
         items=items_out,
         total_runtime_minutes=total_runtime,
         is_owner=True
+    )
+
+async def get_custom_list_items_paged(
+    db: AsyncSession,
+    list_id: uuid.UUID,
+    user_id: uuid.UUID,
+    cursor: Optional[int] = None,
+    limit: int = 20
+) -> CustomListItemsPagedOut:
+    list_res = await db.execute(
+        select(CustomList.user_id, CustomList.items_count).where(CustomList.id == list_id)
+    )
+    row = list_res.first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lista não encontrada")
+    owner_id, total_count = row
+    if str(owner_id) != str(user_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permissão negada")
+
+    stmt = select(CustomListItem).where(CustomListItem.list_id == list_id)
+    if cursor is not None:
+        stmt = stmt.where(CustomListItem.position > cursor)
+
+    stmt = stmt.order_by(CustomListItem.position.asc()).limit(limit + 1)
+    res = await db.execute(stmt)
+    rows = res.scalars().all()
+
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    next_cursor = page_rows[-1].position if (has_more and page_rows) else None
+
+    return CustomListItemsPagedOut(
+        items=[
+            CustomListItemOut(
+                id=it.id,
+                list_id=it.list_id,
+                media_id=it.media_id,
+                tmdb_id=it.tmdb_id,
+                media_type=it.media_type,
+                title=it.title,
+                poster_path=it.poster_path,
+                backdrop_path=it.backdrop_path,
+                release_date=it.release_date,
+                runtime=it.runtime or 0,
+                position=it.position,
+                note=it.note,
+                created_at=it.created_at
+            )
+            for it in page_rows
+        ],
+        next_cursor=next_cursor,
+        has_more=has_more,
+        total_count=total_count
     )
 
 async def update_custom_list(
@@ -297,6 +387,117 @@ async def add_item_to_custom_list(
         created_at=new_item.created_at
     )
 
+async def add_items_bulk_to_custom_list(
+    db: AsyncSession,
+    list_id: uuid.UUID,
+    user_id: uuid.UUID,
+    items_in: List[CustomListItemCreate]
+) -> List[CustomListItemOut]:
+    res = await db.execute(select(CustomList).where(CustomList.id == list_id))
+    list_obj = res.scalar_one_or_none()
+    if not list_obj:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lista não encontrada")
+    if str(list_obj.user_id) != str(user_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permissão negada")
+
+    if not items_in:
+        return []
+
+    # 1. Deduplicar itens recebidos no próprio payload
+    unique_incoming: List[CustomListItemCreate] = []
+    seen = set()
+    for item in items_in:
+        key = (item.tmdb_id, item.media_type)
+        if key not in seen:
+            seen.add(key)
+            unique_incoming.append(item)
+
+    # 2. Consultar itens já existentes na lista para não tentar duplicar
+    incoming_tmdb_ids = [it.tmdb_id for it in unique_incoming]
+    existing_res = await db.execute(
+        select(CustomListItem.tmdb_id, CustomListItem.media_type).where(
+            CustomListItem.list_id == list_id,
+            CustomListItem.tmdb_id.in_(incoming_tmdb_ids)
+        )
+    )
+    existing_keys = {(r[0], r[1]) for r in existing_res.all()}
+
+    to_insert = [it for it in unique_incoming if (it.tmdb_id, it.media_type) not in existing_keys]
+    if not to_insert:
+        return []
+
+    # 3. Buscar correspondência na tabela media para reaproveitar media_id e runtime
+    media_res = await db.execute(
+        select(Media.id, Media.tmdb_id, Media.media_type, Media.runtime).where(
+            Media.tmdb_id.in_([it.tmdb_id for it in to_insert])
+        )
+    )
+    media_map = {(row[1], row[2]): (row[0], row[3]) for row in media_res.all()}
+
+    # 4. Determinar próxima position
+    max_pos_res = await db.execute(
+        select(func.coalesce(func.max(CustomListItem.position), -1)).where(
+            CustomListItem.list_id == list_id
+        )
+    )
+    curr_pos = max_pos_res.scalar_one() or -1
+
+    now = datetime.now(timezone.utc)
+    new_items: List[CustomListItem] = []
+    for it in to_insert:
+        curr_pos += 1
+        m_info = media_map.get((it.tmdb_id, it.media_type))
+        media_id = m_info[0] if m_info else None
+        runtime = it.runtime or (m_info[1] if m_info and m_info[1] else 0)
+
+        new_item = CustomListItem(
+            id=uuid.uuid4(),
+            list_id=list_id,
+            media_id=media_id,
+            tmdb_id=it.tmdb_id,
+            media_type=it.media_type,
+            title=it.title,
+            poster_path=it.poster_path,
+            backdrop_path=it.backdrop_path,
+            release_date=it.release_date,
+            runtime=runtime,
+            position=it.position if it.position is not None else curr_pos,
+            note=it.note,
+            created_at=now
+        )
+        new_items.append(new_item)
+
+    db.add_all(new_items)
+
+    # 5. Atualizar contador e capas da lista se vazias
+    list_obj.items_count = list_obj.items_count + len(new_items)
+    for it in new_items:
+        if not list_obj.cover_backdrop_path and it.backdrop_path:
+            list_obj.cover_backdrop_path = it.backdrop_path
+        if not list_obj.cover_poster_path and it.poster_path:
+            list_obj.cover_poster_path = it.poster_path
+
+    await db.commit()
+
+    return [
+        CustomListItemOut(
+            id=item.id,
+            list_id=item.list_id,
+            media_id=item.media_id,
+            tmdb_id=item.tmdb_id,
+            media_type=item.media_type,
+            title=item.title,
+            poster_path=item.poster_path,
+            backdrop_path=item.backdrop_path,
+            release_date=item.release_date,
+            runtime=item.runtime or 0,
+            position=item.position,
+            note=item.note,
+            created_at=item.created_at
+        )
+        for item in new_items
+    ]
+
 async def remove_item_from_custom_list(
     db: AsyncSession,
     list_id: uuid.UUID,
@@ -320,18 +521,19 @@ async def remove_item_from_custom_list(
     if not item_obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item não encontrado na lista")
 
+    removed_pos = item_obj.position
     await db.delete(item_obj)
     list_obj.items_count = max(0, list_obj.items_count - 1)
 
-    # Reindexar posições dos itens restantes
-    remaining = await db.execute(
-        select(CustomListItem)
-        .where(CustomListItem.list_id == list_id)
-        .order_by(CustomListItem.position)
+    # Reindexar posições dos itens restantes em O(1) via SQL UPDATE direto
+    await db.execute(
+        update(CustomListItem)
+        .where(
+            CustomListItem.list_id == list_id,
+            CustomListItem.position > removed_pos
+        )
+        .values(position=CustomListItem.position - 1)
     )
-    items = remaining.scalars().all()
-    for idx, it in enumerate(items):
-        it.position = idx
 
     await db.commit()
     return True

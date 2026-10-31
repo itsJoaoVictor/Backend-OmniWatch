@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer, Boolean, ForeignKey, UniqueConstraint, func, Text
+from sqlalchemy import Column, String, DateTime, Integer, Boolean, ForeignKey, UniqueConstraint, Index, func, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -51,4 +51,5 @@ class CustomListItem(Base):
 
     __table_args__ = (
         UniqueConstraint("list_id", "tmdb_id", "media_type", name="uq_custom_list_item"),
+        Index("idx_custom_list_items_list_pos", "list_id", "position"),
     )
