@@ -8,6 +8,7 @@ import uuid
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 import asyncio
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -2019,15 +2020,19 @@ def _process_statistics_cpu(
 
         if m_type == "movie":
             if status in ("completed", "watching"):
-                if cutoff is None or (item_date and item_date >= cutoff):
+                movie_watch_date = r.last_watched_at or (r.created_at if status == "completed" else None)
+                if movie_watch_date and movie_watch_date.tzinfo is None:
+                    movie_watch_date = movie_watch_date.replace(tzinfo=timezone.utc)
+                if cutoff is None or (movie_watch_date and movie_watch_date >= cutoff):
                     is_watched_in_period = True
                     factor = 1 + rewatch_count
                     total_movies_watched += factor
                     item_time_minutes = runtime * factor
                     total_time_movies_minutes += item_time_minutes
 
-                    if item_date:
-                        m_key = f"{item_date.year:04d}-{item_date.month:02d}"
+                    date_for_activity = movie_watch_date or item_date
+                    if date_for_activity:
+                        m_key = f"{date_for_activity.year:04d}-{date_for_activity.month:02d}"
                         if m_key in activity_months:
                             activity_months[m_key]["minutes"] += item_time_minutes
                             activity_months[m_key]["count"] += factor
@@ -2140,10 +2145,12 @@ def _process_statistics_cpu(
 
     if period == "all":
         delta_days = (now - earliest_date).days
-        days_span = max(30, delta_days)
+        min_realistic_days = max(30, math.ceil(total_time / (4 * 60)))
+        days_span = max(min_realistic_days, delta_days)
 
     daily_avg_mins = round(total_time / days_span) if days_span > 0 else 0
-    weekly_avg_mins = round((total_time / days_span) * 7) if days_span > 0 else 0
+    daily_avg_mins = min(daily_avg_mins, 1440)
+    weekly_avg_mins = daily_avg_mins * 7
 
     active_series = series_counts["completed"] + series_counts["watching"] + series_counts["plan_to_watch"]
     series_completion_rate = round((series_counts["completed"] / active_series) * 100, 1) if active_series > 0 else 0.0
@@ -2401,11 +2408,11 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
                 SELECT 
                     uep.user_list_item_id,
                     SUM(1 + COALESCE(uep.rewatch_count, 0)) AS total_eps_with_rewatch,
-                    MIN(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at)) AS earliest_watched_at
+                    MIN(COALESCE(uep.watched_at, uli.last_watched_at)) AS earliest_watched_at
                 FROM user_episode_progress uep
                 JOIN user_list_items uli ON uli.id = uep.user_list_item_id
                 WHERE uli.user_id = :user_uuid
-                  AND COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at) >= :cutoff
+                  AND COALESCE(uep.watched_at, uli.last_watched_at) >= :cutoff
                 GROUP BY uep.user_list_item_id
             """)
             res_ep_agg = await db.execute(ep_agg_sql, {"user_uuid": user_uuid, "cutoff": cutoff})
@@ -2459,15 +2466,15 @@ async def _compute_user_statistics(db: AsyncSession, user_id: str, period: str =
         else:
             ep_timeline_sql = text("""
                 SELECT 
-                    TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM') AS month_key,
+                    TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at), 'YYYY-MM') AS month_key,
                     SUM(1 + COALESCE(uep.rewatch_count, 0)) AS ep_count,
                     SUM((1 + COALESCE(uep.rewatch_count, 0)) * COALESCE(m.runtime, 0)) AS ep_minutes
                 FROM user_episode_progress uep
                 JOIN user_list_items uli ON uli.id = uep.user_list_item_id
                 JOIN media m ON m.id = uli.media_id
                 WHERE uli.user_id = :user_uuid
-                  AND COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at) >= :timeline_start
-                GROUP BY TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at, uli.updated_at, uli.created_at), 'YYYY-MM')
+                  AND COALESCE(uep.watched_at, uli.last_watched_at) >= :timeline_start
+                GROUP BY TO_CHAR(COALESCE(uep.watched_at, uli.last_watched_at), 'YYYY-MM')
             """)
             res_ep_tl = await db.execute(ep_timeline_sql, {"user_uuid": user_uuid, "timeline_start": timeline_start})
             for row in res_ep_tl.fetchall():
