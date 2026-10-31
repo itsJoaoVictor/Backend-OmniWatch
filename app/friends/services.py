@@ -2,6 +2,7 @@ import uuid
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import load_only
 from sqlalchemy import or_, and_, func
 from fastapi import HTTPException, status
 
@@ -33,6 +34,7 @@ async def search_users(
     # Busca usuários cujo username ou nome correspondam à busca (excluindo o usuário logado)
     user_query = (
         select(User)
+        .options(load_only(User.id, User.name, User.username))
         .where(
             User.id != current_user_id,
             or_(
@@ -215,7 +217,11 @@ async def get_friends_list(
         for f in friendships
     ]
 
-    users_res = await db.execute(select(User).where(User.id.in_(other_ids)))
+    users_res = await db.execute(
+        select(User)
+        .options(load_only(User.id, User.name, User.username, User.email))
+        .where(User.id.in_(other_ids))
+    )
     users_dict = {u.id: u for u in users_res.scalars().all()}
 
     friends: List[FriendUserResponse] = []
@@ -240,31 +246,25 @@ async def get_friend_requests(
     db: AsyncSession,
     current_user_id: uuid.UUID
 ) -> FriendRequestsResponse:
-    # Solicitações recebidas pendentes
-    rec_query = (
+    # Consulta unificada para solicitações pendentes (recebidas e enviadas)
+    query = (
         select(Friendship)
         .where(
-            Friendship.addressee_id == current_user_id,
-            Friendship.status == "pending"
+            Friendship.status == "pending",
+            or_(
+                Friendship.addressee_id == current_user_id,
+                Friendship.requester_id == current_user_id
+            )
         )
         .order_by(Friendship.created_at.desc())
     )
-    rec_res = await db.execute(rec_query)
-    received_friendships = rec_res.scalars().all()
+    res = await db.execute(query)
+    all_pending = res.scalars().all()
 
-    # Solicitações enviadas pendentes
-    sent_query = (
-        select(Friendship)
-        .where(
-            Friendship.requester_id == current_user_id,
-            Friendship.status == "pending"
-        )
-        .order_by(Friendship.created_at.desc())
-    )
-    sent_res = await db.execute(sent_query)
-    sent_friendships = sent_res.scalars().all()
+    received_friendships = [f for f in all_pending if f.addressee_id == current_user_id]
+    sent_friendships = [f for f in all_pending if f.requester_id == current_user_id]
 
-    # Carrega os dados dos usuários envolvidos
+    # Carrega os dados dos usuários envolvidos com load_only
     all_user_ids = set(
         [f.requester_id for f in received_friendships] +
         [f.addressee_id for f in sent_friendships]
@@ -272,7 +272,11 @@ async def get_friend_requests(
 
     users_dict = {}
     if all_user_ids:
-        u_res = await db.execute(select(User).where(User.id.in_(list(all_user_ids))))
+        u_res = await db.execute(
+            select(User)
+            .options(load_only(User.id, User.name, User.username, User.email))
+            .where(User.id.in_(list(all_user_ids)))
+        )
         users_dict = {u.id: u for u in u_res.scalars().all()}
 
     received_items: List[FriendRequestItem] = []

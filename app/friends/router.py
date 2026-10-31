@@ -75,17 +75,21 @@ get_feed = get_feed_endpoint
 
 @router.get("", response_model=List[FriendUserResponse])
 async def list_friends(
+    response: Response,
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    response.headers["Cache-Control"] = "private, max-age=15, stale-while-revalidate=30"
     u_uuid = parse_uuid(current_user_id)
     return await get_friends_list(db, u_uuid)
 
 @router.get("/requests", response_model=FriendRequestsResponse)
 async def list_requests(
+    response: Response,
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    response.headers["Cache-Control"] = "private, max-age=15, stale-while-revalidate=30"
     u_uuid = parse_uuid(current_user_id)
     return await get_friend_requests(db, u_uuid)
 

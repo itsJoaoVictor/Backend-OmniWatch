@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Column, String, DateTime, ForeignKey, UniqueConstraint, Index, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -19,4 +19,6 @@ class Friendship(Base):
 
     __table_args__ = (
         UniqueConstraint("requester_id", "addressee_id", name="uq_friendship_requester_addressee"),
+        Index("ix_friendships_addressee_status", "addressee_id", "status"),
+        Index("ix_friendships_requester_status", "requester_id", "status"),
     )
