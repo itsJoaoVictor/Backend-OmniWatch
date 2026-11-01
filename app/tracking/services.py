@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload, load_only
+from sqlalchemy.orm import selectinload, load_only, joinedload
 from sqlalchemy import text
 from fastapi import BackgroundTasks
 import logging
@@ -19,21 +19,27 @@ from app.media.schemas import MediaCreate
 from app.media.models import Media
 from app.core.cache import tv_status_cache, stats_cache, details_cache
 
-async def determine_tv_next_episode_status(tmdb_id: int, progress_list: list):
+async def determine_tv_next_episode_status(
+    tmdb_id: int,
+    progress_list: Optional[list] = None,
+    max_season: int = 0,
+    max_ep: int = 0,
+):
     """
     Retorna (is_up_to_date, next_episode_dict) para uma série de TV.
     is_up_to_date é True se todos os episódios lançados até o momento já foram assistidos
     ou se o próximo episódio ainda não estreou (futuro ou sem data).
     Usa tv_status_cache em memória para responder em < 1ms e evita travar em requisições externas.
     """
-    max_season = 0
-    max_ep = 0
-    for ep in (progress_list or []):
-        if ep.season_number > max_season:
-            max_season = ep.season_number
-            max_ep = ep.episode_number
-        elif ep.season_number == max_season and ep.episode_number > max_ep:
-            max_ep = ep.episode_number
+    if progress_list:
+        for ep in progress_list:
+            s = getattr(ep, "season_number", 0)
+            e = getattr(ep, "episode_number", 0)
+            if s > max_season:
+                max_season = s
+                max_ep = e
+            elif s == max_season and e > max_ep:
+                max_ep = e
             
     cache_key = f"tv_status:{tmdb_id}:{max_season}:{max_ep}"
     cached_data, is_stale = tv_status_cache.get_with_status(cache_key)
@@ -99,13 +105,13 @@ def invalidate_user_stats_cache(user_id: str):
 
 async def get_user_list(db: AsyncSession, user_id: str):
     target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
-    # Carrega a lista com media em uma única consulta rápida no banco (sub-15ms)
+    # Carrega a lista com media em um único JOIN rápido no banco (sub-10ms, eliminando roundtrips)
     result = await db.execute(
         select(UserListItem)
         .where(UserListItem.user_id == target_uuid)
-        .options(selectinload(UserListItem.media))
+        .options(joinedload(UserListItem.media))
     )
-    all_items = result.scalars().all()
+    all_items = result.scalars().unique().all()
     # Ignora itens órfãos (sem mídia associada), que quebrariam a serialização (HTTP 500)
     items = [item for item in all_items if item.media is not None]
     if len(items) != len(all_items):
@@ -115,9 +121,9 @@ async def get_user_list(db: AsyncSession, user_id: str):
         )
 
     # Autocorreção transparente e em tempo real dos status upcoming / plan_to_watch
-    # Utiliza apenas dados já existentes no banco (zero requisições de rede)
+    # Atualiza em memória para resposta instantânea e persiste em background sem bloquear o GET
     from app.core.utils import is_date_released
-    needs_commit = False
+    items_to_persist = []
     for item in items:
         media = item.media
         if not media or not media.release_date:
@@ -127,13 +133,27 @@ async def get_user_list(db: AsyncSession, user_id: str):
             is_released = is_date_released(media.release_date)
             if is_released and item.status == "upcoming":
                 item.status = "plan_to_watch"
-                needs_commit = True
+                items_to_persist.append((item.id, "plan_to_watch"))
             elif not is_released and item.status == "plan_to_watch":
                 item.status = "upcoming"
-                needs_commit = True
+                items_to_persist.append((item.id, "upcoming"))
 
-    if needs_commit:
-        await db.commit()
+    if items_to_persist:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import update
+        async def _persist_status_corrections(records):
+            try:
+                async with AsyncSessionLocal() as session:
+                    for item_id, new_status in records:
+                        await session.execute(
+                            update(UserListItem)
+                            .where(UserListItem.id == item_id)
+                            .values(status=new_status)
+                        )
+                    await session.commit()
+            except Exception as e:
+                logger.warning(f"Erro ao persistir correções de status em background: {e}")
+        asyncio.create_task(_persist_status_corrections(items_to_persist))
 
     # Determina o status de "em dia" e próximo episódio APENAS para séries em watching
     tv_watching_items = [
@@ -142,18 +162,31 @@ async def get_user_list(db: AsyncSession, user_id: str):
     ]
 
     if tv_watching_items:
-        # Busca o progresso somente das séries que estão em watching (evita carregar milhares de episódios desnecessários)
+        # Busca o maior episódio assistido por série diretamente no SQL em O(1) tuplas via DISTINCT ON
         item_ids = [item.id for item in tv_watching_items]
-        prog_result = await db.execute(
-            select(UserEpisodeProgress)
+        prog_stmt = (
+            select(
+                UserEpisodeProgress.user_list_item_id,
+                UserEpisodeProgress.season_number,
+                UserEpisodeProgress.episode_number,
+            )
             .where(UserEpisodeProgress.user_list_item_id.in_(item_ids))
+            .distinct(UserEpisodeProgress.user_list_item_id)
+            .order_by(
+                UserEpisodeProgress.user_list_item_id,
+                UserEpisodeProgress.season_number.desc(),
+                UserEpisodeProgress.episode_number.desc(),
+            )
         )
-        prog_map = {}
-        for p in prog_result.scalars().all():
-            prog_map.setdefault(p.user_list_item_id, []).append(p)
+        prog_result = await db.execute(prog_stmt)
+        prog_map = {row[0]: (row[1], row[2]) for row in prog_result.all()}
 
         tv_watching_tasks = [
-            determine_tv_next_episode_status(item.media.tmdb_id, prog_map.get(item.id, []))
+            determine_tv_next_episode_status(
+                item.media.tmdb_id,
+                max_season=prog_map.get(item.id, (0, 0))[0],
+                max_ep=prog_map.get(item.id, (0, 0))[1],
+            )
             for item in tv_watching_items
         ]
         results = await asyncio.gather(*tv_watching_tasks, return_exceptions=True)

@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer, Float, Boolean, ForeignKey, func, Index
+from sqlalchemy import Column, String, DateTime, Integer, Float, Boolean, ForeignKey, func, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -27,6 +27,8 @@ class UserListItem(Base):
 
     __table_args__ = (
         Index("idx_user_list_items_user_watched", "user_id", "last_watched_at"),
+        Index("idx_user_list_items_user_status", "user_id", "status"),
+        UniqueConstraint("user_id", "media_id", name="uq_user_list_items_user_media"),
     )
 
     # Atributos voláteis calculados em tempo de execução
@@ -49,6 +51,7 @@ class UserEpisodeProgress(Base):
     __table_args__ = (
         Index("idx_user_episodes_watched_at", "watched_at"),
         Index("idx_user_episodes_item_watched", "user_list_item_id", "watched_at"),
+        Index("idx_user_episodes_item_season_ep", "user_list_item_id", "season_number", "episode_number"),
     )
 
 class UserStatsSummary(Base):

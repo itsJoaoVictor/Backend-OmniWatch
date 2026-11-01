@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, joinedload
 from sqlalchemy import delete
 
 from app.core.database import AsyncSessionLocal
@@ -262,17 +262,27 @@ async def get_user_collections(db: AsyncSession, user_id: str) -> List[Dict[str,
     result = await db.execute(stmt)
     user_collections = result.scalars().all()
 
-    # Preload user's list items to quickly determine status and rating
-    uli_res = await db.execute(
-        select(UserListItem)
-        .where(UserListItem.user_id == user_uuid)
-        .options(selectinload(UserListItem.media))
-    )
-    user_items = uli_res.scalars().all()
+    # Coleta apenas os TMDB IDs pertencentes às coleções acompanhadas (escopo estrito)
+    all_col_tmdb_ids = {
+        item.tmdb_id
+        for uc in user_collections if uc.collection and uc.collection.items
+        for item in uc.collection.items
+    }
+
     user_items_by_tmdb: Dict[int, UserListItem] = {}
-    for ui in user_items:
-        if ui.media and ui.media.tmdb_id:
-            user_items_by_tmdb[ui.media.tmdb_id] = ui
+    if all_col_tmdb_ids:
+        uli_res = await db.execute(
+            select(UserListItem)
+            .join(Media, UserListItem.media_id == Media.id)
+            .where(
+                UserListItem.user_id == user_uuid,
+                Media.tmdb_id.in_(all_col_tmdb_ids),
+            )
+            .options(joinedload(UserListItem.media))
+        )
+        for ui in uli_res.scalars().unique().all():
+            if ui.media and ui.media.tmdb_id:
+                user_items_by_tmdb[ui.media.tmdb_id] = ui
 
     response_list = []
     for uc in user_collections:

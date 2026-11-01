@@ -1642,6 +1642,7 @@ async def _build_universe_detail_response(
     created_at: datetime,
     user_items_by_pair: Optional[Dict[Tuple[int, str], Tuple[UserListItem, Media]]] = None,
     user_universe: Optional[UserUniverse] = None,
+    ignored_pairs: Optional[Set[Tuple[int, str]]] = None,
 ) -> UserUniverseDetailResponse:
     """Monta o payload detalhado de um universo cruzando com status, notas e itens ignorados."""
     if user_items_by_pair is None:
@@ -1655,12 +1656,13 @@ async def _build_universe_detail_response(
             (media.tmdb_id, media.media_type): (uli, media) for uli, media in list_res.all()
         }
 
-    ign_stmt = select(UserUniverseIgnoredItem).where(
-        UserUniverseIgnoredItem.user_id == user_id,
-        UserUniverseIgnoredItem.universe_id == universe.id,
-    )
-    ign_res = await db.execute(ign_stmt)
-    ignored_pairs = {(x.tmdb_id, x.media_type) for x in ign_res.scalars().all()}
+    if ignored_pairs is None:
+        ign_stmt = select(UserUniverseIgnoredItem).where(
+            UserUniverseIgnoredItem.user_id == user_id,
+            UserUniverseIgnoredItem.universe_id == universe.id,
+        )
+        ign_res = await db.execute(ign_stmt)
+        ignored_pairs = {(x.tmdb_id, x.media_type) for x in ign_res.scalars().all()}
 
     if user_universe is not None:
         uu = user_universe
@@ -1798,16 +1800,42 @@ async def get_user_universes(
     if not rows:
         return []
 
-    # Pré-carrega a lista do usuário UMA ÚNICA VEZ para todos os universos (evita N+1 crítico)
-    list_stmt = (
-        select(UserListItem, Media)
-        .join(Media, UserListItem.media_id == Media.id)
-        .where(UserListItem.user_id == user_id)
-    )
-    list_res = await db.execute(list_stmt)
-    preloaded_user_items: Dict[Tuple[int, str], Tuple[UserListItem, Media]] = {
-        (media.tmdb_id, media.media_type): (uli, media) for uli, media in list_res.all()
+    # Coleta todos os TMDB IDs pertencentes aos universos acompanhados (escopo estrito O(I_u))
+    all_universe_pairs = {
+        (item.tmdb_id, item.media_type)
+        for _, universe in rows if universe and universe.items
+        for item in universe.items
     }
+    all_tmdb_ids = {tmdb_id for tmdb_id, _ in all_universe_pairs}
+
+    preloaded_user_items: Dict[Tuple[int, str], Tuple[UserListItem, Media]] = {}
+    if all_tmdb_ids:
+        list_stmt = (
+            select(UserListItem, Media)
+            .join(Media, UserListItem.media_id == Media.id)
+            .where(
+                UserListItem.user_id == user_id,
+                Media.tmdb_id.in_(all_tmdb_ids),
+            )
+        )
+        list_res = await db.execute(list_stmt)
+        preloaded_user_items = {
+            (media.tmdb_id, media.media_type): (uli, media)
+            for uli, media in list_res.all()
+            if (media.tmdb_id, media.media_type) in all_universe_pairs
+        }
+
+    # Pré-carrega itens ignorados de todos os universos acompanhados em 1 única query
+    universe_ids = [universe.id for _, universe in rows if universe]
+    ignored_map: Dict[UUID, Set[Tuple[int, str]]] = {}
+    if universe_ids:
+        ign_stmt = select(UserUniverseIgnoredItem).where(
+            UserUniverseIgnoredItem.user_id == user_id,
+            UserUniverseIgnoredItem.universe_id.in_(universe_ids),
+        )
+        ign_res = await db.execute(ign_stmt)
+        for item in ign_res.scalars().all():
+            ignored_map.setdefault(item.universe_id, set()).add((item.tmdb_id, item.media_type))
 
     results: List[UserUniverseDetailResponse] = []
     for uc, universe in rows:
@@ -1818,6 +1846,7 @@ async def get_user_universes(
             uc.created_at,
             user_items_by_pair=preloaded_user_items,
             user_universe=uc,
+            ignored_pairs=ignored_map.get(universe.id, set()),
         )
         results.append(detail)
     return results

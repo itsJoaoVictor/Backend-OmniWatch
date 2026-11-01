@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer, JSON, func, ForeignKey
+from sqlalchemy import Column, String, DateTime, Integer, JSON, func, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -8,7 +8,7 @@ class Media(Base):
     __tablename__ = "media"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
-    tmdb_id = Column(Integer, unique=True, index=True, nullable=False)
+    tmdb_id = Column(Integer, index=True, nullable=False)
     media_type = Column(String, nullable=False, index=True)
     title = Column(String, nullable=False)
     poster_path = Column(String, nullable=True)
@@ -34,6 +34,10 @@ class Media(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     releases = relationship("MediaRelease", back_populates="media", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("tmdb_id", "media_type", name="uq_media_tmdb_media_type"),
+    )
 
 class MediaRelease(Base):
     __tablename__ = "media_releases"
