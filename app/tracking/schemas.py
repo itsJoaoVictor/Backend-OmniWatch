@@ -48,6 +48,32 @@ class UserListItemResponse(UserListItemBase):
     class Config:
         from_attributes = True
 
+class MediaCompactResponse(BaseModel):
+    id: UUID
+    tmdb_id: int
+    media_type: str
+    title: str
+    poster_path: Optional[str] = None
+    backdrop_path: Optional[str] = None
+    release_date: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class UserListItemCompactResponse(UserListItemBase):
+    id: UUID
+    user_id: UUID
+    media_id: UUID
+    last_watched_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    media: MediaCompactResponse
+    is_up_to_date: Optional[bool] = None
+    next_episode: Optional[NextEpisodeInfo] = None
+
+    class Config:
+        from_attributes = True
+
 class UserEpisodeProgressCreate(BaseModel):
     season_number: int
     episode_number: int

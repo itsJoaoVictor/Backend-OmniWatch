@@ -37,7 +37,7 @@ async def determine_tv_next_episode_status(tmdb_id: int, progress_list: list):
             
     cache_key = f"tv_status:{tmdb_id}:{max_season}:{max_ep}"
     cached_data, is_stale = tv_status_cache.get_with_status(cache_key)
-    if not is_stale and cached_data is not None:
+    if cached_data is not None:
         return cached_data.get("is_up_to_date", False), cached_data.get("next_episode")
 
     next_season = max_season if max_season > 0 else 1

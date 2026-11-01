@@ -1640,17 +1640,20 @@ async def _build_universe_detail_response(
     user_id: UUID,
     universe: Universe,
     created_at: datetime,
+    user_items_by_pair: Optional[Dict[Tuple[int, str], Tuple[UserListItem, Media]]] = None,
+    user_universe: Optional[UserUniverse] = None,
 ) -> UserUniverseDetailResponse:
     """Monta o payload detalhado de um universo cruzando com status, notas e itens ignorados."""
-    list_stmt = (
-        select(UserListItem, Media)
-        .join(Media, UserListItem.media_id == Media.id)
-        .where(UserListItem.user_id == user_id)
-    )
-    list_res = await db.execute(list_stmt)
-    user_items_by_pair: Dict[Tuple[int, str], Tuple[UserListItem, Media]] = {
-        (media.tmdb_id, media.media_type): (uli, media) for uli, media in list_res.all()
-    }
+    if user_items_by_pair is None:
+        list_stmt = (
+            select(UserListItem, Media)
+            .join(Media, UserListItem.media_id == Media.id)
+            .where(UserListItem.user_id == user_id)
+        )
+        list_res = await db.execute(list_stmt)
+        user_items_by_pair = {
+            (media.tmdb_id, media.media_type): (uli, media) for uli, media in list_res.all()
+        }
 
     ign_stmt = select(UserUniverseIgnoredItem).where(
         UserUniverseIgnoredItem.user_id == user_id,
@@ -1659,12 +1662,15 @@ async def _build_universe_detail_response(
     ign_res = await db.execute(ign_stmt)
     ignored_pairs = {(x.tmdb_id, x.media_type) for x in ign_res.scalars().all()}
 
-    uu_stmt = select(UserUniverse).where(
-        UserUniverse.user_id == user_id,
-        UserUniverse.universe_id == universe.id,
-    )
-    uu_res = await db.execute(uu_stmt)
-    uu = uu_res.scalars().first()
+    if user_universe is not None:
+        uu = user_universe
+    else:
+        uu_stmt = select(UserUniverse).where(
+            UserUniverse.user_id == user_id,
+            UserUniverse.universe_id == universe.id,
+        )
+        uu_res = await db.execute(uu_stmt)
+        uu = uu_res.scalars().first()
     auto_add = uu.auto_add if uu else True
 
     watched_count = 0
@@ -1789,10 +1795,30 @@ async def get_user_universes(
     )
     res = await db.execute(stmt)
     rows = res.all()
+    if not rows:
+        return []
+
+    # Pré-carrega a lista do usuário UMA ÚNICA VEZ para todos os universos (evita N+1 crítico)
+    list_stmt = (
+        select(UserListItem, Media)
+        .join(Media, UserListItem.media_id == Media.id)
+        .where(UserListItem.user_id == user_id)
+    )
+    list_res = await db.execute(list_stmt)
+    preloaded_user_items: Dict[Tuple[int, str], Tuple[UserListItem, Media]] = {
+        (media.tmdb_id, media.media_type): (uli, media) for uli, media in list_res.all()
+    }
 
     results: List[UserUniverseDetailResponse] = []
     for uc, universe in rows:
-        detail = await _build_universe_detail_response(db, user_id, universe, uc.created_at)
+        detail = await _build_universe_detail_response(
+            db,
+            user_id,
+            universe,
+            uc.created_at,
+            user_items_by_pair=preloaded_user_items,
+            user_universe=uc,
+        )
         results.append(detail)
     return results
 

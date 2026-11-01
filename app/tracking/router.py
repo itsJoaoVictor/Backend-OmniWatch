@@ -5,7 +5,7 @@ from typing import List, Optional
 from app.core.database import get_db
 from app.auth.dependencies import get_current_user_id
 from app.tracking.schemas import (
-    UserListItemCreate, UserListItemUpdate, UserListItemResponse,
+    UserListItemCreate, UserListItemUpdate, UserListItemResponse, UserListItemCompactResponse,
     UserEpisodeProgressCreate, UserEpisodeProgressResponse, UserEpisodeRatingUpdate,
     UserEpisodeRewatchUpdate, MediaRankingResponse, PeopleRankingResponse
 )
@@ -15,7 +15,7 @@ from app.tracking.services import (
 
 router = APIRouter()
 
-@router.get("/my-list", response_model=List[UserListItemResponse])
+@router.get("/my-list", response_model=List[UserListItemCompactResponse])
 async def get_my_list(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
