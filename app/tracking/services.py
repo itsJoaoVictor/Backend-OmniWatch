@@ -199,7 +199,7 @@ async def get_user_list(db: AsyncSession, user_id: str):
 
     return items
 
-async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
+async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate, background_tasks: Optional[BackgroundTasks] = None):
     media = await get_media_by_tmdb_id(db, item.tmdb_id)
     if not media:
         title = item.title
@@ -275,23 +275,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
             except Exception:
                 title = title or "Desconhecido"
 
-        # Fase 6: Gera embedding semântico via OpenRouter
-        embedding = None
-        try:
-            from app.recommendation.embeddings import build_text_for_embedding, generate_embedding
-            dummy_dict = {
-                "title": title,
-                "media_type": item.media_type,
-                "genres": genres,
-                "crew": directors,
-                "cast": main_cast,
-                "keywords": keywords
-            }
-            emb_text = build_text_for_embedding(dummy_dict)
-            embedding = await generate_embedding(emb_text)
-        except Exception:
-            embedding = None
-
+        # Metadados preparados para geração assíncrona de embedding em background
         media_create = MediaCreate(
             tmdb_id=item.tmdb_id,
             media_type=item.media_type,
@@ -305,7 +289,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
             keywords=keywords,
             cast_ids=cast_ids if cast_ids else None,
             crew_ids=crew_ids if crew_ids else None,
-            embedding=embedding,
+            embedding=None,  # Gerado em background sem bloquear o POST
             release_date=release_date,
             runtime=runtime,
             collection_tmdb_id=collection_tmdb_id,
@@ -411,8 +395,10 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
         if changed:
             await db.commit()
             await db.refresh(existing_item)
-            from app.recommendation.profile_manager import update_user_profile
-            await update_user_profile(db, user_id, existing_item, existing_item.media)
+            if background_tasks:
+                background_tasks.add_task(_async_post_process_list_item_update, user_id=user_id, item_id=str(existing_item.id))
+            else:
+                asyncio.create_task(_async_post_process_list_item_update(user_id=user_id, item_id=str(existing_item.id)))
         
         reloaded = await db.execute(
             select(UserListItem)
@@ -457,30 +443,39 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate):
         saved_item.is_up_to_date = is_up_to_date
         saved_item.next_episode = next_ep
     
-    # Trigger Profile Update
-    from app.recommendation.profile_manager import update_user_profile
-    await update_user_profile(db, user_id, saved_item, saved_item.media)
+    # Fast-Path: Processamento pesado de IA, perfis, recomendações e cacheamentos 100% em background (0ms no request)
+    media_data_for_emb = None
+    if saved_item and saved_item.media and not saved_item.media.embedding:
+        media_data_for_emb = {
+            "title": saved_item.media.title,
+            "media_type": saved_item.media.media_type,
+            "genres": saved_item.media.genres or [],
+            "crew": saved_item.media.directors or [],
+            "cast": saved_item.media.main_cast or [],
+            "keywords": saved_item.media.keywords or []
+        }
 
-    # Dispara o cacheamento local do pôster em segundo plano (LRU ~45KB)
-    if saved_item and saved_item.media and saved_item.media.poster_path:
-        import asyncio
-        from app.images.router import ensure_image_cached
-        asyncio.create_task(ensure_image_cached(saved_item.media.poster_path, "w342"))
-    # Dispara sugestões de coleções em segundo plano se for filme
-    if saved_item and saved_item.media and saved_item.media.media_type == "movie":
-        try:
-            from app.media_collections.services import schedule_collection_suggestions_scan
-            schedule_collection_suggestions_scan(str(user_id))
-        except Exception:
-            pass
-
-    # Dispara sugestões de universos em segundo plano (filmes e séries)
-    if saved_item and saved_item.media:
-        try:
-            from app.universes.services import schedule_universe_suggestions_scan
-            schedule_universe_suggestions_scan(str(user_id))
-        except Exception:
-            pass
+    if background_tasks:
+        background_tasks.add_task(
+            _async_post_process_new_item,
+            user_id=user_id,
+            item_id=str(saved_item.id),
+            poster_path=saved_item.media.poster_path if saved_item.media else None,
+            media_type=saved_item.media.media_type if saved_item.media else None,
+            media_id=str(saved_item.media.id) if saved_item.media else None,
+            media_data_for_emb=media_data_for_emb
+        )
+    else:
+        asyncio.create_task(
+            _async_post_process_new_item(
+                user_id=user_id,
+                item_id=str(saved_item.id),
+                poster_path=saved_item.media.poster_path if saved_item.media else None,
+                media_type=saved_item.media.media_type if saved_item.media else None,
+                media_id=str(saved_item.media.id) if saved_item.media else None,
+                media_data_for_emb=media_data_for_emb
+            )
+        )
 
     invalidate_user_stats_cache(user_id)
     return saved_item
@@ -885,6 +880,80 @@ async def _async_post_process_episode(
                     await update_user_profile(session, user_id, item_obj, item_obj.media, explicit_scale=completion_boost)
         except Exception as e:
             logger.warning(f"Error in background update_user_profile: {e}")
+
+async def _async_post_process_new_item(
+    user_id: str,
+    item_id: str,
+    poster_path: Optional[str] = None,
+    media_type: Optional[str] = None,
+    media_id: Optional[str] = None,
+    media_data_for_emb: Optional[dict] = None
+):
+    from app.core.database import AsyncSessionLocal
+    from app.tracking.models import UserListItem
+    from app.media.models import Media
+    from sqlalchemy.orm import selectinload
+    from sqlalchemy import update
+    import uuid
+
+    # 1. Gera embedding da mídia em background se não existir
+    if media_id and media_data_for_emb:
+        try:
+            from app.recommendation.embeddings import build_text_for_embedding, generate_embedding
+            emb_text = build_text_for_embedding(media_data_for_emb)
+            emb = await generate_embedding(emb_text)
+            if emb:
+                async with AsyncSessionLocal() as session:
+                    await session.execute(
+                        update(Media)
+                        .where(Media.id == uuid.UUID(media_id))
+                        .values(embedding=emb)
+                    )
+                    await session.commit()
+        except Exception as e:
+            logger.warning(f"Erro ao gerar embedding de mídia em background: {e}")
+
+    # 2. Atualiza perfil do usuário e clusters
+    async with AsyncSessionLocal() as session:
+        try:
+            from app.recommendation.profile_manager import update_user_profile
+            item_res = await session.execute(
+                select(UserListItem)
+                .where(UserListItem.id == uuid.UUID(item_id))
+                .options(
+                    selectinload(UserListItem.media),
+                    selectinload(UserListItem.episodes)
+                )
+            )
+            item_obj = item_res.scalars().first()
+            if item_obj and item_obj.media:
+                await update_user_profile(session, user_id, item_obj, item_obj.media)
+        except Exception as e:
+            logger.warning(f"Erro ao atualizar perfil do usuário em background: {e}")
+
+    # 3. Dispara cacheamento local do poster em segundo plano (LRU ~45KB)
+    if poster_path:
+        try:
+            from app.images.router import ensure_image_cached
+            await ensure_image_cached(poster_path, "w342")
+        except Exception:
+            pass
+
+    # 4. Dispara sugestões de coleções em segundo plano se for filme
+    if media_type == "movie":
+        try:
+            from app.media_collections.services import schedule_collection_suggestions_scan
+            schedule_collection_suggestions_scan(str(user_id))
+        except Exception:
+            pass
+
+    # 5. Dispara sugestões de universos em segundo plano (filmes e séries)
+    try:
+        from app.universes.services import schedule_universe_suggestions_scan
+        schedule_universe_suggestions_scan(str(user_id))
+    except Exception:
+        pass
+
 
 async def _async_post_process_list_item_update(user_id: str, item_id: str):
     from app.core.database import AsyncSessionLocal

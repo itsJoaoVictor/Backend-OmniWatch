@@ -455,8 +455,11 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
         await db.commit()
         return single_cluster
 
+    embeddings = np.array([it.media.embedding for it in items_with_emb])
+
     if n_items < 6:
         k = 1
+        labels = np.zeros(n_items, dtype=int)
     else:
         if n_items < 12:
             max_k = 2
@@ -466,8 +469,6 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
             max_k = 4
         else:
             max_k = 5
-
-        embeddings = np.array([it.media.embedding for it in items_with_emb])
         min_cluster_size = min(5, n_items // max_k)
 
         best_k = 2

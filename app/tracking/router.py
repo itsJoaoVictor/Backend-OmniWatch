@@ -37,7 +37,7 @@ async def add_item_to_list(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    new_item = await add_to_list(db, user_id, item)
+    new_item = await add_to_list(db, user_id, item, background_tasks=background_tasks)
     
     # Trigger background sync for this media
     from app.calendar.sync import sync_single_media_release
