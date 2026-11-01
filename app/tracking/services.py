@@ -53,8 +53,8 @@ async def determine_tv_next_episode_status(
         from app.core.utils import is_date_released
         from app.details.services import fetch_season_details
         
-        # Timeout rígido de 2.0s para nunca travar a resposta caso o TMDB demore
-        async with asyncio.timeout(2.0):
+        # Timeout estrito de 0.8s para nunca travar a resposta caso o TMDB demore
+        async with asyncio.timeout(0.8):
             season_details = await fetch_season_details(tmdb_id, next_season)
             episodes = season_details.episodes or []
             
@@ -95,6 +95,7 @@ async def determine_tv_next_episode_status(
             "air_date": None,
             "is_released": True
         }
+        tv_status_cache.set(cache_key, {"is_up_to_date": False, "next_episode": fallback_next})
         return False, fallback_next
 
 def invalidate_user_stats_cache(user_id: str):

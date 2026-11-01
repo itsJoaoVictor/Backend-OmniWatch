@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
+from pydantic import TypeAdapter
 
 from app.core.database import get_db
 from app.auth.dependencies import get_current_user_id
@@ -14,6 +15,7 @@ from app.tracking.services import (
 )
 
 router = APIRouter()
+_user_list_compact_adapter = TypeAdapter(List[UserListItemCompactResponse])
 
 @router.get("/my-list", response_model=List[UserListItemCompactResponse])
 async def get_my_list(
@@ -21,7 +23,10 @@ async def get_my_list(
     db: AsyncSession = Depends(get_db)
 ):
     items = await get_user_list(db, user_id)
-    return items
+    return Response(
+        content=_user_list_compact_adapter.dump_json(items),
+        media_type="application/json"
+    )
 
 from fastapi import BackgroundTasks
 

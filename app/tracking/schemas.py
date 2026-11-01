@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 from datetime import datetime
 from uuid import UUID
 from app.media.schemas import MediaResponse
@@ -43,7 +43,7 @@ class UserListItemResponse(UserListItemBase):
     updated_at: datetime
     media: MediaResponse
     is_up_to_date: Optional[bool] = None
-    next_episode: Optional[NextEpisodeInfo] = None
+    next_episode: Optional[Union[NextEpisodeInfo, dict]] = None
 
     class Config:
         from_attributes = True
@@ -69,7 +69,7 @@ class UserListItemCompactResponse(UserListItemBase):
     updated_at: datetime
     media: MediaCompactResponse
     is_up_to_date: Optional[bool] = None
-    next_episode: Optional[NextEpisodeInfo] = None
+    next_episode: Optional[Union[NextEpisodeInfo, dict]] = None
 
     class Config:
         from_attributes = True
