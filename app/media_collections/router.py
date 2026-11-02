@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks
+from fastapi.responses import Response
+from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Dict, Any
 
@@ -29,7 +31,11 @@ async def list_followed_collections(
     user_id: str = Depends(get_current_user_id)
 ):
     """List all collections followed by current user with watching progress."""
-    return await get_user_collections(db, user_id)
+    collections_data = await get_user_collections(db, user_id)
+    return Response(
+        content=TypeAdapter(List[UserCollectionDetailResponse]).dump_json(collections_data),
+        media_type="application/json"
+    )
 
 @router.get("/{tmdb_id}/status", response_model=CollectionStatusResponse)
 async def check_collection_status(
@@ -39,18 +45,25 @@ async def check_collection_status(
 ):
     """Check if the user is following a specific collection."""
     status_data = await get_collection_status(db, user_id, tmdb_id)
-    return CollectionStatusResponse(**status_data)
+    return Response(
+        content=CollectionStatusResponse(**status_data).model_dump_json(),
+        media_type="application/json"
+    )
 
 @router.post("/{tmdb_id}/follow", response_model=CollectionFollowResponse)
 async def follow_user_collection(
     tmdb_id: int,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
     """Follow a collection and bulk-add all unwatched movies to user's list as plan_to_watch."""
     try:
-        result = await follow_collection(db, user_id, tmdb_id)
-        return CollectionFollowResponse(**result)
+        result = await follow_collection(db, user_id, tmdb_id, background_tasks=background_tasks)
+        return Response(
+            content=CollectionFollowResponse(**result).model_dump_json(),
+            media_type="application/json"
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -98,7 +111,10 @@ async def list_collection_suggestions(
     last_scanned = _user_last_scanned.get(str(user_id), 0)
     if not suggestions and (now - last_scanned > 300):
         schedule_collection_suggestions_scan(user_id, debounce_seconds=2)
-    return suggestions
+    return Response(
+        content=TypeAdapter(List[CollectionSuggestionResponse]).dump_json(suggestions),
+        media_type="application/json"
+    )
 
 
 @router.post("/suggestions/{tmdb_id}/dismiss")

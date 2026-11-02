@@ -8,9 +8,10 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload, joinedload
-from sqlalchemy import delete
+from sqlalchemy import delete, func, or_
 
 from app.core.database import AsyncSessionLocal
+from app.core.utils import is_date_released
 from app.media_collections.models import Collection, CollectionItem, UserCollection, UserCollectionSuggestion
 from app.media.models import Media
 from app.tracking.models import UserListItem
@@ -29,7 +30,11 @@ async def get_or_create_collection(db: AsyncSession, tmdb_collection_id: int) ->
     )
     collection = result.scalars().first()
 
-    # Fetch TMDB data
+    # O(1) DB Cache: Se a coleção já foi registrada com itens, reaproveita sem chamada HTTP ao TMDB
+    if collection and collection.items:
+        return collection
+
+    # Fetch TMDB data somente quando ainda não catalogada
     tmdb_data = await fetch_collection_details(tmdb_collection_id)
 
     if not collection:
@@ -84,7 +89,20 @@ async def get_or_create_collection(db: AsyncSession, tmdb_collection_id: int) ->
     return refreshed.scalars().first()
 
 
-async def follow_collection(db: AsyncSession, user_id: str, tmdb_collection_id: int) -> Dict[str, Any]:
+async def follow_collection(
+    db: AsyncSession,
+    user_id: str,
+    tmdb_collection_id: int,
+    background_tasks: Optional[Any] = None
+) -> Dict[str, Any]:
+    """
+    Segue uma coleção e adiciona em lote todos os filmes não adicionados como 'Quero Ver' (ou 'Aguardando Estreia').
+    Execução O(1) em roundtrips SQL:
+    - 1 SELECT em lote para checar mídias existentes
+    - 1 SELECT em lote para checar quais já estão na lista do usuário
+    - 1 INSERT em lote para novos UserListItem
+    - 1 commit único para todas as operações
+    """
     user_uuid = uuid.UUID(str(user_id))
 
     collection = await get_or_create_collection(db, tmdb_collection_id)
@@ -104,65 +122,98 @@ async def follow_collection(db: AsyncSession, user_id: str, tmdb_collection_id: 
             auto_add=True
         )
         db.add(new_follow)
-        await db.commit()
 
-    # Add movies to user list
     movies_added = 0
     movies_already_in_list = 0
 
-    # Get user list items for these movies
-    for item in collection.items:
-        # Check if already in user's list
-        media_res = await db.execute(select(Media).where(Media.tmdb_id == item.tmdb_id))
-        media = media_res.scalars().first()
+    col_items = collection.items or []
+    if col_items:
+        tmdb_ids = [item.tmdb_id for item in col_items]
 
-        # Auto-recover poster_path / backdrop_path if media in DB was missing them
-        if media:
-            updated = False
-            if not media.poster_path and item.poster_path:
-                media.poster_path = item.poster_path
-                updated = True
-            if not media.backdrop_path and item.backdrop_path:
-                media.backdrop_path = item.backdrop_path
-                updated = True
-            if updated:
-                await db.commit()
-                await db.refresh(media)
+        # 1. Busca todas as mídias em uma única query SQL
+        media_res = await db.execute(select(Media).where(Media.tmdb_id.in_(tmdb_ids)))
+        existing_medias = {m.tmdb_id: m for m in media_res.scalars().all()}
 
-        already_in_list = False
-        if media:
-            uli_res = await db.execute(
-                select(UserListItem).where(
-                    UserListItem.user_id == user_uuid,
-                    UserListItem.media_id == media.id
-                )
-            )
-            if uli_res.scalars().first():
-                already_in_list = True
-
-        if already_in_list:
-            movies_already_in_list += 1
-        else:
-            try:
-                # Add to list as plan_to_watch with complete poster and backdrop
-                create_payload = UserListItemCreate(
+        # 2. Cria mídias faltantes diretamente a partir dos metadados já persistidos em CollectionItem
+        new_medias = []
+        for item in col_items:
+            media = existing_medias.get(item.tmdb_id)
+            if not media:
+                media = Media(
                     tmdb_id=item.tmdb_id,
                     media_type="movie",
                     title=item.title,
                     poster_path=item.poster_path,
                     backdrop_path=item.backdrop_path,
                     release_date=item.release_date,
-                    status="plan_to_watch"
+                    collection_tmdb_id=collection.tmdb_id,
+                    collection_name=collection.name,
+                    genres=[],
+                    directors=[],
+                    main_cast=[],
+                    keywords=[]
                 )
-                saved_item = await add_to_list(db, str(user_id), create_payload)
-                if saved_item and saved_item.media_id and not item.media_id:
-                    item.media_id = saved_item.media_id
-                    await db.commit()
-                movies_added += 1
-            except Exception as e:
-                logger.error(f"Error adding movie {item.tmdb_id} to user list: {e}")
+                db.add(media)
+                new_medias.append(media)
+            else:
+                updated = False
+                if not media.poster_path and item.poster_path:
+                    media.poster_path = item.poster_path
+                    updated = True
+                if not media.backdrop_path and item.backdrop_path:
+                    media.backdrop_path = item.backdrop_path
+                    updated = True
+                if not media.collection_tmdb_id:
+                    media.collection_tmdb_id = collection.tmdb_id
+                    media.collection_name = collection.name
+                    updated = True
 
-    # Remove qualquer sugestão existente para essa coleção
+        if new_medias:
+            await db.flush()  # Popula media.id sem commitar transação
+            for m in new_medias:
+                existing_medias[m.tmdb_id] = m
+
+        # 3. Busca em uma única query os UserListItems que o usuário já possui
+        all_media_ids = [m.id for m in existing_medias.values() if m.id]
+        user_media_ids = set()
+        if all_media_ids:
+            uli_res = await db.execute(
+                select(UserListItem.media_id).where(
+                    UserListItem.user_id == user_uuid,
+                    UserListItem.media_id.in_(all_media_ids)
+                )
+            )
+            user_media_ids = set(uli_res.scalars().all())
+
+        # 4. Prepara inserção em lote para itens novos
+        new_user_items = []
+        for item in col_items:
+            media = existing_medias.get(item.tmdb_id)
+            if not media:
+                continue
+
+            if not item.media_id:
+                item.media_id = media.id
+
+            if media.id in user_media_ids:
+                movies_already_in_list += 1
+            else:
+                rel_date = media.release_date or item.release_date
+                initial_status = "upcoming" if not is_date_released(rel_date) else "plan_to_watch"
+
+                new_uli = UserListItem(
+                    user_id=user_uuid,
+                    media_id=media.id,
+                    status=initial_status,
+                    is_favorite=False
+                )
+                new_user_items.append(new_uli)
+                movies_added += 1
+
+        if new_user_items:
+            db.add_all(new_user_items)
+
+    # 5. Remove qualquer sugestão existente para essa coleção
     await db.execute(
         delete(UserCollectionSuggestion).where(
             UserCollectionSuggestion.user_id == user_uuid,
@@ -170,6 +221,10 @@ async def follow_collection(db: AsyncSession, user_id: str, tmdb_collection_id: 
         )
     )
     await db.commit()
+
+    # Dispara scan assíncrono de sugestões com debounce caso novos itens tenham sido adicionados
+    if movies_added > 0:
+        schedule_collection_suggestions_scan(user_id, debounce_seconds=3)
 
     return {
         "success": True,
@@ -184,14 +239,14 @@ async def follow_collection(db: AsyncSession, user_id: str, tmdb_collection_id: 
 
 async def unfollow_collection(db: AsyncSession, user_id: str, tmdb_collection_id: int) -> bool:
     user_uuid = uuid.UUID(str(user_id))
-    col_res = await db.execute(select(Collection).where(Collection.tmdb_id == tmdb_collection_id))
-    collection = col_res.scalars().first()
-    if not collection:
+    col_res = await db.execute(select(Collection.id).where(Collection.tmdb_id == tmdb_collection_id))
+    collection_id = col_res.scalar_one_or_none()
+    if not collection_id:
         return False
 
     stmt = delete(UserCollection).where(
         UserCollection.user_id == user_uuid,
-        UserCollection.collection_id == collection.id
+        UserCollection.collection_id == collection_id
     )
     await db.execute(stmt)
     await db.commit()
@@ -216,32 +271,43 @@ async def get_collection_status(db: AsyncSession, user_id: str, tmdb_collection_
         }
 
     uc_res = await db.execute(
-        select(UserCollection).where(
+        select(UserCollection.auto_add).where(
             UserCollection.user_id == user_uuid,
             UserCollection.collection_id == collection.id
         )
     )
-    user_col = uc_res.scalars().first()
+    user_col_auto_add = uc_res.scalar_one_or_none()
+    is_following = user_col_auto_add is not None
 
-    # Count watched movies
-    watched_count = 0
+    # Count watched movies via single aggregated query (O(1) SQL roundtrip)
     total_count = len(collection.items)
+    watched_count = 0
 
-    for item in collection.items:
-        if item.media_id:
-            uli_res = await db.execute(
-                select(UserListItem).where(
+    if total_count > 0:
+        item_media_ids = [item.media_id for item in collection.items if item.media_id]
+        item_tmdb_ids = [item.tmdb_id for item in collection.items if item.tmdb_id]
+
+        conditions = []
+        if item_media_ids:
+            conditions.append(UserListItem.media_id.in_(item_media_ids))
+        if item_tmdb_ids:
+            conditions.append(Media.tmdb_id.in_(item_tmdb_ids))
+
+        if conditions:
+            watched_res = await db.execute(
+                select(func.count(UserListItem.id.distinct()))
+                .join(Media, UserListItem.media_id == Media.id)
+                .where(
                     UserListItem.user_id == user_uuid,
-                    UserListItem.media_id == item.media_id
+                    UserListItem.status == "completed",
+                    or_(*conditions)
                 )
             )
-            uli = uli_res.scalars().first()
-            if uli and uli.status == "completed":
-                watched_count += 1
+            watched_count = watched_res.scalar() or 0
 
     return {
-        "is_following": user_col is not None,
-        "auto_add": user_col.auto_add if user_col else True,
+        "is_following": is_following,
+        "auto_add": user_col_auto_add if is_following else True,
         "total_movies": total_count,
         "watched_movies": watched_count,
         "collection_id": collection.id
