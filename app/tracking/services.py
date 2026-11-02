@@ -494,22 +494,38 @@ async def _get_tv_released_episodes_and_status(tmdb_id: int, tv_data=None):
     has_unreleased_episodes = False
     released_keys = []
 
-    for season in (tv_data.seasons or []):
-        if season.season_number > 0:
-            try:
-                season_details = await fetch_season_details(tmdb_id, season.season_number)
-                for ep in (season_details.episodes or []):
-                    if is_date_released(ep.air_date):
-                        released_keys.append((season.season_number, ep.episode_number))
-                    else:
-                        has_unreleased_episodes = True
-            except Exception as e:
-                logger.warning(f"Failed to fetch season {season.season_number} details: {e}")
-                if season.air_date and not is_date_released(season.air_date):
-                    has_unreleased_episodes = True
+    valid_seasons = [s for s in (tv_data.seasons or []) if s.season_number > 0]
+
+    async def _fetch_season_eps(season):
+        s_keys = []
+        s_has_unreleased = False
+        try:
+            season_details = await fetch_season_details(tmdb_id, season.season_number)
+            for ep in (season_details.episodes or []):
+                if is_date_released(ep.air_date):
+                    s_keys.append((season.season_number, ep.episode_number))
                 else:
-                    for ep_num in range(1, (season.episode_count or 0) + 1):
-                        released_keys.append((season.season_number, ep_num))
+                    s_has_unreleased = True
+        except Exception as e:
+            logger.warning(f"Failed to fetch season {season.season_number} details: {e}")
+            if season.air_date and not is_date_released(season.air_date):
+                s_has_unreleased = True
+            else:
+                for ep_num in range(1, (season.episode_count or 0) + 1):
+                    s_keys.append((season.season_number, ep_num))
+        return s_keys, s_has_unreleased
+
+    if valid_seasons:
+        season_results = await asyncio.gather(
+            *[_fetch_season_eps(s) for s in valid_seasons],
+            return_exceptions=True
+        )
+        for res in season_results:
+            if isinstance(res, tuple) and len(res) == 2:
+                s_keys, s_has_unrel = res
+                released_keys.extend(s_keys)
+                if s_has_unrel:
+                    has_unreleased_episodes = True
 
     return released_keys, has_unreleased_episodes, tv_data
 
@@ -980,13 +996,36 @@ async def _async_post_process_list_item_update(user_id: str, item_id: str):
 async def _async_post_process_bulk(
     user_id: str,
     item_id: str,
-    is_completed: bool
+    media_id: Optional[int] = None,
+    is_completed: bool = False,
+    needs_completion_check: bool = False
 ):
     from app.core.database import AsyncSessionLocal
-    from app.tracking.models import UserListItem
+    from app.tracking.models import UserListItem, UserEpisodeProgress
     from sqlalchemy.orm import selectinload
     
     async with AsyncSessionLocal() as session:
+        # Checa finalização da série em background sem travar a resposta HTTP
+        if needs_completion_check and media_id and not is_completed:
+            try:
+                from app.details.services import fetch_tv_details
+                tv_data = await fetch_tv_details(media_id)
+                if tv_data and tv_data.status in ("Ended", "Canceled") and tv_data.number_of_episodes:
+                    all_prog = await session.execute(
+                        select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == uuid.UUID(item_id))
+                    )
+                    if len(all_prog.scalars().all()) >= tv_data.number_of_episodes:
+                        item_res = await session.execute(
+                            select(UserListItem).where(UserListItem.id == uuid.UUID(item_id))
+                        )
+                        it = item_res.scalars().first()
+                        if it and it.status != "completed":
+                            it.status = "completed"
+                            is_completed = True
+                            await session.commit()
+            except Exception as e:
+                logger.warning(f"Error in background bulk completion check: {e}")
+
         try:
             from app.recommendation.profile_manager import update_user_profile
             item_res = await session.execute(
@@ -1601,14 +1640,8 @@ async def mark_season_watched(
     if not item or not item.media or item.media.media_type != "tv":
         return None
 
-    from app.details.services import fetch_tv_details, fetch_season_details
+    from app.details.services import fetch_season_details
     from app.core.utils import is_date_released
-
-    tv_data = None
-    try:
-        tv_data = await fetch_tv_details(item.media.tmdb_id)
-    except Exception:
-        pass
 
     prog_res = await db.execute(
         select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item_uuid)
@@ -1617,7 +1650,6 @@ async def mark_season_watched(
 
     new_progresses = []
     released_in_season = 0
-    has_unreleased_in_season = False
 
     try:
         season_details = await fetch_season_details(item.media.tmdb_id, season_number)
@@ -1632,15 +1664,16 @@ async def mark_season_watched(
                             episode_number=ep.episode_number
                         )
                     )
-            else:
-                has_unreleased_in_season = True
     except Exception as e:
         logger.warning(f"Failed to fetch season {season_number} details in mark_season_watched: {e}")
-        if tv_data:
-            season_meta = next((s for s in tv_data.seasons if s.season_number == season_number), None)
-            if season_meta and (not season_meta.air_date or is_date_released(season_meta.air_date)):
-                released_in_season = season_meta.episode_count
-                for ep_num in range(1, season_meta.episode_count + 1):
+        from app.core.cache import details_cache
+        cached_tv, _ = details_cache.get_with_status(f"details:tv:{item.media.tmdb_id}")
+        if cached_tv and "seasons" in cached_tv:
+            season_meta = next((s for s in cached_tv["seasons"] if s.get("season_number") == season_number), None)
+            if season_meta and (not season_meta.get("air_date") or is_date_released(season_meta.get("air_date"))):
+                ep_cnt = season_meta.get("episode_count", 0)
+                released_in_season = ep_cnt
+                for ep_num in range(1, ep_cnt + 1):
                     if (season_number, ep_num) not in existing_map:
                         new_progresses.append(
                             UserEpisodeProgress(
@@ -1660,16 +1693,7 @@ async def mark_season_watched(
         db.add_all(new_progresses)
         item.last_watched_at = datetime.now(timezone.utc)
 
-        total_episodes_now = len(existing_map) + len(new_progresses)
-        is_completed = False
-        if tv_data:
-            is_ended = tv_data.status in ("Ended", "Canceled")
-            if is_ended and not has_unreleased_in_season and tv_data.number_of_episodes and total_episodes_now >= tv_data.number_of_episodes:
-                item.status = "completed"
-                is_completed = True
-            elif item.status == "plan_to_watch":
-                item.status = "watching"
-        elif item.status == "plan_to_watch":
+        if item.status in ("plan_to_watch", "upcoming"):
             item.status = "watching"
 
         media_ref = item.media
@@ -1684,14 +1708,16 @@ async def mark_season_watched(
                     _async_post_process_bulk,
                     user_id=user_id,
                     item_id=str(item.id),
-                    is_completed=is_completed
+                    media_id=tmdb_id_val,
+                    needs_completion_check=True
                 )
             else:
                 asyncio.create_task(
                     _async_post_process_bulk(
                         user_id=user_id,
                         item_id=str(item.id),
-                        is_completed=is_completed
+                        media_id=tmdb_id_val,
+                        needs_completion_check=True
                     )
                 )
 
