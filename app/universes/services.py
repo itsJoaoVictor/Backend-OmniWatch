@@ -882,14 +882,17 @@ async def get_cached_user_universe_suggestions(
             UserUniverseSuggestion.user_id == user_id,
             UserUniverseSuggestion.is_dismissed == False,
         )
-        .order_by(
-            UserUniverseSuggestion.items_in_list.desc(),
-            UserUniverseSuggestion.total_items.desc(),
-        )
-        .limit(limit)
     )
+    if followed_keys:
+        stmt = stmt.where(UserUniverseSuggestion.universe_key.not_in(followed_keys))
+
+    stmt = stmt.order_by(
+        UserUniverseSuggestion.items_in_list.desc(),
+        UserUniverseSuggestion.total_items.desc(),
+    ).limit(limit)
+
     res = await db.execute(stmt)
-    suggestions = [s for s in res.scalars().all() if s.universe_key not in followed_keys]
+    suggestions = res.scalars().all()
 
     if not suggestions:
         # Verifica se há itens com universe_key == None para agendar scan em background
@@ -1371,16 +1374,22 @@ async def follow_universe(
     )
     await db.commit()
 
-    # Busca itens já na lista do usuário
-    list_stmt = (
-        select(UserListItem, Media)
-        .join(Media, UserListItem.media_id == Media.id)
-        .where(UserListItem.user_id == user_id)
-    )
-    list_res = await db.execute(list_stmt)
-    existing_user_pairs: Dict[Tuple[int, str], Media] = {
-        (media.tmdb_id, media.media_type): media for _, media in list_res.all()
-    }
+    # Busca itens já na lista do usuário (escopo restrito aos itens deste universo O(K))
+    universe_tmdb_ids = [it.tmdb_id for it in universe.items]
+    existing_user_pairs: Dict[Tuple[int, str], Media] = {}
+    if universe_tmdb_ids:
+        list_stmt = (
+            select(UserListItem, Media)
+            .join(Media, UserListItem.media_id == Media.id)
+            .where(
+                UserListItem.user_id == user_id,
+                Media.tmdb_id.in_(universe_tmdb_ids),
+            )
+        )
+        list_res = await db.execute(list_stmt)
+        existing_user_pairs = {
+            (media.tmdb_id, media.media_type): media for _, media in list_res.all()
+        }
 
     items_added = 0
     items_already_in_list = 0
@@ -1646,15 +1655,21 @@ async def _build_universe_detail_response(
 ) -> UserUniverseDetailResponse:
     """Monta o payload detalhado de um universo cruzando com status, notas e itens ignorados."""
     if user_items_by_pair is None:
-        list_stmt = (
-            select(UserListItem, Media)
-            .join(Media, UserListItem.media_id == Media.id)
-            .where(UserListItem.user_id == user_id)
-        )
-        list_res = await db.execute(list_stmt)
-        user_items_by_pair = {
-            (media.tmdb_id, media.media_type): (uli, media) for uli, media in list_res.all()
-        }
+        universe_tmdb_ids = [it.tmdb_id for it in universe.items]
+        user_items_by_pair = {}
+        if universe_tmdb_ids:
+            list_stmt = (
+                select(UserListItem, Media)
+                .join(Media, UserListItem.media_id == Media.id)
+                .where(
+                    UserListItem.user_id == user_id,
+                    Media.tmdb_id.in_(universe_tmdb_ids),
+                )
+            )
+            list_res = await db.execute(list_stmt)
+            user_items_by_pair = {
+                (media.tmdb_id, media.media_type): (uli, media) for uli, media in list_res.all()
+            }
 
     if ignored_pairs is None:
         ign_stmt = select(UserUniverseIgnoredItem).where(
@@ -1681,29 +1696,34 @@ async def _build_universe_detail_response(
     rated_count = 0
     items_resp: List[UniverseItemResponse] = []
 
-    # Auto-healing: Se algum item já persistido estiver com título em CJK/japonês, busca o título em inglês e persiste
+    # Auto-healing assíncrono em background: Se algum item já persistido estiver com título em CJK/japonês, busca o título em inglês sem bloquear a resposta HTTP
     non_latin_items = [it for it in universe.items if _is_non_latin(it.title)]
     if non_latin_items:
-        async def resolve_item_en(u_item: UniverseItem):
+        async def _bg_resolve_non_latin(u_id: UUID, items_to_fix: List[UniverseItem]):
             try:
-                en_data = await tmdb_client._get(f"/{u_item.media_type}/{u_item.tmdb_id}", params={"language": "en-US"})
-                if en_data:
-                    en_title = en_data.get("title") or en_data.get("name")
-                    if en_title and not _is_non_latin(en_title):
-                        u_item.title = en_title
-                        m_stmt = select(Media).where(Media.tmdb_id == u_item.tmdb_id, Media.media_type == u_item.media_type)
-                        m_res = await db.execute(m_stmt)
-                        m_obj = m_res.scalars().first()
-                        if m_obj and _is_non_latin(m_obj.title):
-                            m_obj.title = en_title
-            except Exception as e:
-                logger.warning(f"Falha ao buscar fallback em inglês para item {u_item.tmdb_id}: {e}")
+                async with AsyncSessionLocal() as bg_db:
+                    for u_item in items_to_fix:
+                        try:
+                            en_data = await tmdb_client._get(f"/{u_item.media_type}/{u_item.tmdb_id}", params={"language": "en-US"})
+                            if en_data:
+                                en_title = en_data.get("title") or en_data.get("name")
+                                if en_title and not _is_non_latin(en_title):
+                                    db_it_res = await bg_db.execute(select(UniverseItem).where(UniverseItem.id == u_item.id))
+                                    db_it = db_it_res.scalars().first()
+                                    if db_it:
+                                        db_it.title = en_title
+                                    m_stmt = select(Media).where(Media.tmdb_id == u_item.tmdb_id, Media.media_type == u_item.media_type)
+                                    m_res = await bg_db.execute(m_stmt)
+                                    m_obj = m_res.scalars().first()
+                                    if m_obj and _is_non_latin(m_obj.title):
+                                        m_obj.title = en_title
+                        except Exception:
+                            pass
+                    await bg_db.commit()
+            except Exception:
+                pass
 
-        await asyncio.gather(*(resolve_item_en(it) for it in non_latin_items))
-        try:
-            await db.commit()
-        except Exception:
-            await db.rollback()
+        asyncio.create_task(_bg_resolve_non_latin(universe.id, non_latin_items))
 
     sorted_items = sorted(universe.items, key=lambda x: x.release_date or "9999-12-31")
     for item in sorted_items:

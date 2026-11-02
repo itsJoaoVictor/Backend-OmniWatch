@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
+from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from uuid import UUID
@@ -39,7 +41,11 @@ async def list_followed_universes(
     user_id: str = Depends(get_current_user_id),
 ):
     """Lista todos os universos acompanhados pelo usuário logado com métricas de progresso e notas."""
-    return await get_user_universes(db, UUID(str(user_id)))
+    universes = await get_user_universes(db, UUID(str(user_id)))
+    return Response(
+        content=TypeAdapter(List[UserUniverseDetailResponse]).dump_json(universes),
+        media_type="application/json"
+    )
 
 
 @router.get("/suggestions", response_model=List[UniverseSuggestionResponse])
@@ -49,7 +55,11 @@ async def list_universe_suggestions(
     user_id: str = Depends(get_current_user_id),
 ):
     """Retorna as sugestões de universos descobertas em segundo plano com base na lista do usuário."""
-    return await get_cached_user_universe_suggestions(db, UUID(str(user_id)), limit=limit)
+    suggestions = await get_cached_user_universe_suggestions(db, UUID(str(user_id)), limit=limit)
+    return Response(
+        content=TypeAdapter(List[UniverseSuggestionResponse]).dump_json(suggestions),
+        media_type="application/json"
+    )
 
 
 @router.post("/suggestions/scan")
@@ -84,7 +94,11 @@ async def list_dismissed_suggestions(
     user_id: str = Depends(get_current_user_id),
 ):
     """Retorna as sugestões de universos que foram dispensadas pelo usuário."""
-    return await get_dismissed_universe_suggestions(db, UUID(str(user_id)), limit=limit)
+    dismissed = await get_dismissed_universe_suggestions(db, UUID(str(user_id)), limit=limit)
+    return Response(
+        content=TypeAdapter(List[UniverseSuggestionResponse]).dump_json(dismissed),
+        media_type="application/json"
+    )
 
 
 @router.post("/suggestions/{universe_key}/restore")
@@ -119,7 +133,10 @@ async def get_universe_details(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Universo não encontrado ou não compatível com o formato multimídia.",
         )
-    return detail
+    return Response(
+        content=detail.model_dump_json(),
+        media_type="application/json"
+    )
 
 
 @router.get("/{universe_key}/status", response_model=UniverseStatusResponse)
@@ -129,7 +146,11 @@ async def check_universe_status(
     user_id: str = Depends(get_current_user_id),
 ):
     """Verifica se o usuário segue um universo específico."""
-    return await get_universe_status(db, UUID(str(user_id)), universe_key)
+    status_data = await get_universe_status(db, UUID(str(user_id)), universe_key)
+    return Response(
+        content=status_data.model_dump_json(),
+        media_type="application/json"
+    )
 
 
 @router.post("/{universe_key}/follow", response_model=UniverseFollowResponse)
@@ -158,7 +179,10 @@ async def follow_user_universe(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Não foi possível localizar ou montar os dados deste universo.",
         )
-    return result
+    return Response(
+        content=result.model_dump_json(),
+        media_type="application/json"
+    )
 
 
 @router.delete("/{universe_key}/follow")
