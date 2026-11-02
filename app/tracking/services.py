@@ -943,7 +943,7 @@ async def _async_post_process_new_item(
             )
             item_obj = item_res.scalars().first()
             if item_obj and item_obj.media:
-                await update_user_profile(session, user_id, item_obj, item_obj.media)
+                await update_user_profile(session, user_id, item_obj, item_obj.media, update_clusters=True)
         except Exception as e:
             logger.warning(f"Erro ao atualizar perfil do usuário em background: {e}")
 

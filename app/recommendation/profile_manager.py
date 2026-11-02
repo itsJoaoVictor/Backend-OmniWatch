@@ -103,7 +103,8 @@ async def update_user_profile(
     list_item: Optional[UserListItem] = None, 
     media: Optional[Media] = None,
     explicit_scale: Optional[float] = None,
-    media_vector: Optional[Dict[str, float]] = None
+    media_vector: Optional[Dict[str, float]] = None,
+    update_clusters: bool = False
 ):
     """
     Incrementally updates the user's feature vector in O(1) time.
@@ -216,12 +217,13 @@ async def update_user_profile(
 
     await db.commit()
 
-    # V2: Atualização assíncrona/segura dos clusters de gosto (Personas)
-    try:
-        from app.recommendation.cluster_manager import compute_user_taste_clusters
-        await compute_user_taste_clusters(db, user.id)
-    except Exception:
-        pass
+    # V2: Atualização assíncrona/segura dos clusters de gosto (Personas) apenas quando solicitado
+    if update_clusters:
+        try:
+            from app.recommendation.cluster_manager import compute_user_taste_clusters
+            await compute_user_taste_clusters(db, user.id)
+        except Exception:
+            pass
         
     # Marca como stale, ejeta a mídia imediatamente das recomendações e aciona debounce inteligente
     try:

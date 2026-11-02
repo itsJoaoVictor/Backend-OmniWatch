@@ -410,6 +410,32 @@ async def refine_user_clusters_llm_task(user_id: str):
     except Exception as e:
         logger.error(f"[LLM PERSONAS] Erro na background task de refinamento em lote: {e}")
 
+def _find_best_kmeans_clusters(embeddings: np.ndarray, max_k: int, min_cluster_size: int):
+    best_k = 2
+    best_score = -1.0
+    best_labels = None
+
+    for cand_k in range(2, max_k + 1):
+        km = KMeans(n_clusters=cand_k, random_state=42, n_init="auto")
+        labels_cand = km.fit_predict(embeddings)
+        
+        counts = [int(np.sum(labels_cand == c_idx)) for c_idx in range(cand_k)]
+        if any(cnt < min_cluster_size for cnt in counts):
+            continue
+
+        score = float(silhouette_score(embeddings, labels_cand))
+
+        # Principio da Parcimonia (+0.015)
+        if best_labels is None or (score > best_score + 0.015):
+            best_score = score
+            best_k = cand_k
+            best_labels = labels_cand
+
+    k = best_k if best_labels is not None else 1
+    labels = best_labels if best_labels is not None else np.zeros(len(embeddings), dtype=int)
+    return k, labels
+
+
 async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Dict[str, Any]]:
     user_result = await db.execute(select(User).where(User.id == user_id))
     user = user_result.scalars().first()
@@ -471,28 +497,9 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
             max_k = 5
         min_cluster_size = min(5, n_items // max_k)
 
-        best_k = 2
-        best_score = -1.0
-        best_labels = None
-
-        for cand_k in range(2, max_k + 1):
-            km = KMeans(n_clusters=cand_k, random_state=42, n_init=10)
-            labels_cand = km.fit_predict(embeddings)
-            
-            counts = [int(np.sum(labels_cand == c_idx)) for c_idx in range(cand_k)]
-            if any(cnt < min_cluster_size for cnt in counts):
-                continue
-
-            score = float(silhouette_score(embeddings, labels_cand))
-
-            # Principio da Parcimonia (+0.015)
-            if best_labels is None or (score > best_score + 0.015):
-                best_score = score
-                best_k = cand_k
-                best_labels = labels_cand
-
-        k = best_k if best_labels is not None else 1
-        labels = best_labels if best_labels is not None else np.zeros(n_items, dtype=int)
+        k, labels = await asyncio.to_thread(
+            _find_best_kmeans_clusters, embeddings, max_k, min_cluster_size
+        )
 
     clusters_list = []
     has_pending_llm = False
