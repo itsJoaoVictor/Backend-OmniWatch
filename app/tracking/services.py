@@ -1790,57 +1790,112 @@ async def bulk_mark_episodes(
     if not item or item.media.media_type != "tv":
         return None
 
+    from app.core.cache import details_cache
     from app.details.services import fetch_tv_details, fetch_season_details
     from app.core.utils import is_date_released
-    try:
-        tv_data = await fetch_tv_details(item.media.tmdb_id)
-    except Exception:
-        return None
+
+    # 1. Recupera dados da serie (do cache em memoria se disponivel, senao busca TMDB)
+    tv_data = None
+    cached_tv, is_stale = details_cache.get_with_status(f"details:tv:{item.media.tmdb_id}")
+    if not is_stale and cached_tv:
+        try:
+            from app.details.schemas import TvSeriesDetailsResponse
+            tv_data = TvSeriesDetailsResponse(**cached_tv)
+        except Exception:
+            tv_data = None
+
+    if not tv_data:
+        try:
+            tv_data = await fetch_tv_details(item.media.tmdb_id)
+        except Exception:
+            return None
 
     prog_res = await db.execute(select(UserEpisodeProgress).where(UserEpisodeProgress.user_list_item_id == item_uuid))
     existing_map = {(p.season_number, p.episode_number): p for p in prog_res.scalars().all()}
 
+    is_ended = tv_data.status in ("Ended", "Canceled")
+    target_seasons = [s for s in tv_data.seasons if 0 < s.season_number <= target.season_number]
+
+    # Identifica quais temporadas precisam de fetch de detalhes de episodios
+    seasons_needing_fetch = []
+    for s in target_seasons:
+        if s.season_number == target.season_number:
+            seasons_needing_fetch.append(s.season_number)
+        else:
+            season_aired = bool(s.air_date and is_date_released(s.air_date))
+            if not is_ended and not season_aired:
+                seasons_needing_fetch.append(s.season_number)
+
+    # Busca em paralelo apenas as temporadas que realmente precisam (aproveitando cache se disponivel)
+    season_details_map = {}
+    fetch_tasks = []
+    fetch_season_nums = []
+
+    for s_num in seasons_needing_fetch:
+        cache_key = f"details:tv:{item.media.tmdb_id}:season:{s_num}"
+        cached_season, s_stale = details_cache.get_with_status(cache_key)
+        if not s_stale and cached_season:
+            try:
+                from app.details.schemas import SeasonDetailsResponse
+                season_details_map[s_num] = SeasonDetailsResponse(**cached_season)
+            except Exception:
+                pass
+
+        if s_num not in season_details_map:
+            fetch_tasks.append(fetch_season_details(item.media.tmdb_id, s_num))
+            fetch_season_nums.append(s_num)
+
+    if fetch_tasks:
+        fetched_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        for s_num, res in zip(fetch_season_nums, fetched_results):
+            if isinstance(res, Exception):
+                logger.warning(f"Failed to fetch season {s_num} in bulk_mark: {res}")
+            else:
+                season_details_map[s_num] = res
+
     new_progresses = []
     has_unreleased = False
-    for season in tv_data.seasons:
-        if season.season_number > 0 and season.season_number <= target.season_number:
-            max_ep = target.episode_number if season.season_number == target.season_number else season.episode_count
-            try:
-                season_details = await fetch_season_details(item.media.tmdb_id, season.season_number)
-                for ep in season_details.episodes:
-                    if ep.episode_number <= max_ep:
-                        if is_date_released(ep.air_date):
-                            if (season.season_number, ep.episode_number) not in existing_map:
-                                new_progresses.append(UserEpisodeProgress(
-                                    user_list_item_id=item.id,
-                                    season_number=season.season_number,
-                                    episode_number=ep.episode_number
-                                ))
-                        else:
-                            has_unreleased = True
-            except Exception as e:
-                logger.warning(f"Failed to fetch season {season.season_number} details in bulk_mark: {e}")
-                if not (season.air_date and not is_date_released(season.air_date)):
-                    for ep_num in range(1, max_ep + 1):
-                        if (season.season_number, ep_num) not in existing_map:
+
+    for season in target_seasons:
+        max_ep = target.episode_number if season.season_number == target.season_number else season.episode_count
+        s_details = season_details_map.get(season.season_number)
+
+        if s_details and s_details.episodes:
+            for ep in s_details.episodes:
+                if ep.episode_number <= max_ep:
+                    if is_date_released(ep.air_date):
+                        if (season.season_number, ep.episode_number) not in existing_map:
                             new_progresses.append(UserEpisodeProgress(
                                 user_list_item_id=item.id,
                                 season_number=season.season_number,
-                                episode_number=ep_num
+                                episode_number=ep.episode_number
                             ))
+                    else:
+                        has_unreleased = True
+        else:
+            season_aired = bool(season.air_date and is_date_released(season.air_date))
+            if is_ended or season_aired or season.season_number < target.season_number:
+                for ep_num in range(1, max_ep + 1):
+                    if (season.season_number, ep_num) not in existing_map:
+                        new_progresses.append(UserEpisodeProgress(
+                            user_list_item_id=item.id,
+                            season_number=season.season_number,
+                            episode_number=ep_num
+                        ))
+            else:
+                has_unreleased = True
     
     if new_progresses:
         db.add_all(new_progresses)
         item.last_watched_at = datetime.now(timezone.utc)
         
-        is_ended = tv_data.status in ("Ended", "Canceled")
         total_episodes_now = len(existing_map) + len(new_progresses)
         
         is_completed = False
         if is_ended and not has_unreleased and total_episodes_now >= tv_data.number_of_episodes:
             item.status = "completed"
             is_completed = True
-        elif item.status == "plan_to_watch":
+        elif item.status in ("plan_to_watch", "upcoming"):
             item.status = "watching"
             
         media_ref = item.media
@@ -1856,14 +1911,18 @@ async def bulk_mark_episodes(
                     _async_post_process_bulk,
                     user_id=user_id,
                     item_id=str(item.id),
-                    is_completed=is_completed
+                    media_id=tmdb_id_val,
+                    is_completed=is_completed,
+                    needs_completion_check=(not is_completed)
                 )
             else:
                 asyncio.create_task(
                     _async_post_process_bulk(
                         user_id=user_id,
                         item_id=str(item.id),
-                        is_completed=is_completed
+                        media_id=tmdb_id_val,
+                        is_completed=is_completed,
+                        needs_completion_check=(not is_completed)
                     )
                 )
 

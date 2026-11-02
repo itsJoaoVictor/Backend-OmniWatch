@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Path, Depends
+from fastapi import APIRouter, Path, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.database import get_db
@@ -40,7 +40,7 @@ async def get_movie_details(
         u_row = u_res.first()
         if u_row:
             details.universe = UniverseRef(universe_key=u_row[0], name=u_row[1])
-    return details
+    return Response(content=details.model_dump_json(), media_type="application/json")
 
 @router.get("/tv/{series_id}", response_model=TvSeriesDetailsResponse)
 async def get_tv_details(
@@ -62,7 +62,7 @@ async def get_tv_details(
         u_row = u_res.first()
         if u_row:
             details.universe = UniverseRef(universe_key=u_row[0], name=u_row[1])
-    return details
+    return Response(content=details.model_dump_json(), media_type="application/json")
 
 @router.get("/tv/{series_id}/season/{season_number}", response_model=SeasonDetailsResponse)
 async def get_season_details(
@@ -72,7 +72,8 @@ async def get_season_details(
     """
     Obter detalhes de uma temporada de uma série específica, incluindo episódios.
     """
-    return await fetch_season_details(series_id, season_number)
+    details = await fetch_season_details(series_id, season_number)
+    return Response(content=details.model_dump_json(), media_type="application/json")
 
 @router.get("/tv/{series_id}/season/{season_number}/episode/{episode_number}", response_model=EpisodeDetailsResponse)
 async def get_episode_details(
@@ -83,7 +84,8 @@ async def get_episode_details(
     """
     Obter detalhes de um episódio de uma série específica.
     """
-    return await fetch_episode_details(series_id, season_number, episode_number)
+    details = await fetch_episode_details(series_id, season_number, episode_number)
+    return Response(content=details.model_dump_json(), media_type="application/json")
 
 @router.get("/collections/{collection_id}", response_model=CollectionResponse)
 async def get_collection_details(
@@ -92,4 +94,5 @@ async def get_collection_details(
     """
     Obter detalhes de uma coleção específica.
     """
-    return await fetch_collection_details(collection_id)
+    details = await fetch_collection_details(collection_id)
+    return Response(content=details.model_dump_json(), media_type="application/json")
