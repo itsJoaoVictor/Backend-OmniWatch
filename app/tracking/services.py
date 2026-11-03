@@ -19,6 +19,41 @@ from app.media.schemas import MediaCreate
 from app.media.models import Media
 from app.core.cache import tv_status_cache, stats_cache, details_cache
 
+async def _warm_tv_status_in_background(tmdb_id: int, next_season: int, next_ep_num: int, cache_key: str):
+    """Atualiza o cache de status e episódios de TV em background sem bloquear requisições HTTP."""
+    try:
+        from app.core.utils import is_date_released
+        from app.details.services import fetch_season_details
+        
+        season_details = await fetch_season_details(tmdb_id, next_season)
+        episodes = season_details.episodes or []
+        
+        if episodes and next_ep_num > len(episodes):
+            next_season += 1
+            next_ep_num = 1
+            try:
+                season_details = await fetch_season_details(tmdb_id, next_season)
+                episodes = season_details.episodes or []
+            except Exception:
+                episodes = []
+                
+        ep_data = next((e for e in episodes if e.episode_number == next_ep_num), None)
+        if not ep_data:
+            tv_status_cache.set(cache_key, {"is_up_to_date": True, "next_episode": None})
+            return
+            
+        is_released = is_date_released(ep_data.air_date)
+        next_ep_dict = {
+            "season_number": next_season,
+            "episode_number": next_ep_num,
+            "name": getattr(ep_data, "name", None) or f"Episódio {next_ep_num}",
+            "air_date": ep_data.air_date,
+            "is_released": is_released
+        }
+        tv_status_cache.set(cache_key, {"is_up_to_date": not is_released, "next_episode": next_ep_dict})
+    except Exception as e:
+        logger.debug(f"_warm_tv_status_in_background failed for {tmdb_id}: {e}")
+
 async def determine_tv_next_episode_status(
     tmdb_id: int,
     progress_list: Optional[list] = None,
@@ -29,7 +64,7 @@ async def determine_tv_next_episode_status(
     Retorna (is_up_to_date, next_episode_dict) para uma série de TV.
     is_up_to_date é True se todos os episódios lançados até o momento já foram assistidos
     ou se o próximo episódio ainda não estreou (futuro ou sem data).
-    Usa tv_status_cache em memória para responder em < 1ms e evita travar em requisições externas.
+    Usa tv_status_cache e details_cache em memória para responder em < 1ms e evita travar em requisições externas.
     """
     if progress_list:
         for ep in progress_list:
@@ -49,54 +84,55 @@ async def determine_tv_next_episode_status(
     next_season = max_season if max_season > 0 else 1
     next_ep_num = (max_ep + 1) if max_season > 0 else 1
 
-    try:
-        from app.core.utils import is_date_released
-        from app.details.services import fetch_season_details
-        
-        # Timeout estrito de 0.8s para nunca travar a resposta caso o TMDB demore
-        async with asyncio.timeout(0.8):
-            season_details = await fetch_season_details(tmdb_id, next_season)
-            episodes = season_details.episodes or []
-            
-            # Se o episódio ultrapassar a contagem da temporada, checa a próxima
+    # Checa se os detalhes da temporada já estão disponíveis em memória (details_cache)
+    season_cache_key = f"details:tv:{tmdb_id}:season:{next_season}"
+    season_cached_data, _ = details_cache.get_with_status(season_cache_key)
+    if season_cached_data:
+        try:
+            from app.core.utils import is_date_released
+            episodes = season_cached_data.get("episodes", [])
             if episodes and next_ep_num > len(episodes):
                 next_season += 1
                 next_ep_num = 1
-                try:
-                    season_details = await fetch_season_details(tmdb_id, next_season)
-                    episodes = season_details.episodes or []
-                except Exception:
-                    episodes = []
-                    
-            ep_data = next((e for e in episodes if e.episode_number == next_ep_num), None)
+                next_season_key = f"details:tv:{tmdb_id}:season:{next_season}"
+                next_season_cached, _ = details_cache.get_with_status(next_season_key)
+                episodes = next_season_cached.get("episodes", []) if next_season_cached else []
+                
+            ep_data = next((e for e in episodes if e.get("episode_number") == next_ep_num), None) if isinstance(episodes, list) else None
             if not ep_data:
-                # Próximo episódio ainda não existe no catálogo oficial -> Em dia!
                 tv_status_cache.set(cache_key, {"is_up_to_date": True, "next_episode": None})
                 return True, None
                 
-            is_released = is_date_released(ep_data.air_date)
+            air_date = ep_data.get("air_date")
+            is_released = is_date_released(air_date)
             next_ep_dict = {
                 "season_number": next_season,
                 "episode_number": next_ep_num,
-                "name": getattr(ep_data, "name", None) or f"Episódio {next_ep_num}",
-                "air_date": ep_data.air_date,
+                "name": ep_data.get("name") or f"Episódio {next_ep_num}",
+                "air_date": air_date,
                 "is_released": is_released
             }
-            
             is_up = not is_released
             tv_status_cache.set(cache_key, {"is_up_to_date": is_up, "next_episode": next_ep_dict})
             return is_up, next_ep_dict
+        except Exception:
+            pass
+
+    # Resposta instantânea (< 1ms): gera fallback matemático sem bloquear o ciclo do GET
+    fallback_next = {
+        "season_number": next_season,
+        "episode_number": next_ep_num,
+        "name": f"Episódio {next_ep_num}",
+        "air_date": None,
+        "is_released": True
+    }
+    tv_status_cache.set(cache_key, {"is_up_to_date": False, "next_episode": fallback_next})
+    # Agenda aquecimento completo em background sem travar a requisição do usuário
+    try:
+        asyncio.create_task(_warm_tv_status_in_background(tmdb_id, next_season, next_ep_num, cache_key))
     except Exception:
-        # Fallback local imediato: não interrompe a exibição e calcula o próximo número matematicamente
-        fallback_next = {
-            "season_number": next_season,
-            "episode_number": next_ep_num,
-            "name": f"Episódio {next_ep_num}",
-            "air_date": None,
-            "is_released": True
-        }
-        tv_status_cache.set(cache_key, {"is_up_to_date": False, "next_episode": fallback_next})
-        return False, fallback_next
+        pass
+    return False, fallback_next
 
 def invalidate_user_stats_cache(user_id: str):
     """Invalida o cache de estatísticas do usuário marcando como stale para o SWR funcionar e agenda recomputação em background."""
@@ -104,14 +140,22 @@ def invalidate_user_stats_cache(user_id: str):
     stats_cache.invalidate_prefix(f"stats:{uid_str}")
     schedule_user_stats_recompute(uid_str, debounce_seconds=3.0)
 
-async def get_user_list(db: AsyncSession, user_id: str):
+async def get_user_list(db: AsyncSession, user_id: str, status_filter: Optional[str] = None):
     target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
     # Carrega a lista com media em um único JOIN rápido no banco (sub-10ms, eliminando roundtrips)
-    result = await db.execute(
+    query = (
         select(UserListItem)
         .where(UserListItem.user_id == target_uuid)
         .options(joinedload(UserListItem.media))
     )
+    if status_filter:
+        statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
+        if len(statuses) == 1:
+            query = query.where(UserListItem.status == statuses[0])
+        elif len(statuses) > 1:
+            query = query.where(UserListItem.status.in_(statuses))
+
+    result = await db.execute(query)
     all_items = result.scalars().unique().all()
     # Ignora itens órfãos (sem mídia associada), que quebrariam a serialização (HTTP 500)
     items = [item for item in all_items if item.media is not None]

@@ -19,10 +19,11 @@ _user_list_compact_adapter = TypeAdapter(List[UserListItemCompactResponse])
 
 @router.get("/my-list", response_model=List[UserListItemCompactResponse])
 async def get_my_list(
+    status: Optional[str] = None,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    items = await get_user_list(db, user_id)
+    items = await get_user_list(db, user_id, status_filter=status)
     return Response(
         content=_user_list_compact_adapter.dump_json(items),
         media_type="application/json"
