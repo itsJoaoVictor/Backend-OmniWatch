@@ -19,40 +19,62 @@ from app.media.schemas import MediaCreate
 from app.media.models import Media
 from app.core.cache import tv_status_cache, stats_cache, details_cache
 
-async def _warm_tv_status_in_background(tmdb_id: int, next_season: int, next_ep_num: int, cache_key: str):
-    """Atualiza o cache de status e episódios de TV em background sem bloquear requisições HTTP."""
-    try:
-        from app.core.utils import is_date_released
-        from app.details.services import fetch_season_details
-        
-        season_details = await fetch_season_details(tmdb_id, next_season)
-        episodes = season_details.episodes or []
-        
-        if episodes and next_ep_num > len(episodes):
+_tv_status_semaphore = asyncio.Semaphore(4)
+
+async def _resolve_tv_season_status(tmdb_id: int, next_season: int, next_ep_num: int, cache_key: str):
+    """Consulta temporadas com concorrência controlada, realizando rollover automático de temporada (ex: fim da S1 -> S2 E1)."""
+    from fastapi import HTTPException
+    from app.core.utils import is_date_released
+    from app.details.services import fetch_season_details
+
+    async with _tv_status_semaphore:
+        try:
+            season_details = await fetch_season_details(tmdb_id, next_season)
+            episodes = season_details.episodes or []
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                tv_status_cache.set(cache_key, {"is_up_to_date": True, "next_episode": None})
+                return True, None
+            raise
+
+        max_ep_in_season = max((getattr(e, "episode_number", 0) or 0 for e in episodes), default=len(episodes))
+        if episodes and next_ep_num > max_ep_in_season:
             next_season += 1
             next_ep_num = 1
             try:
                 season_details = await fetch_season_details(tmdb_id, next_season)
                 episodes = season_details.episodes or []
-            except Exception:
-                episodes = []
-                
-        ep_data = next((e for e in episodes if e.episode_number == next_ep_num), None)
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    tv_status_cache.set(cache_key, {"is_up_to_date": True, "next_episode": None})
+                    return True, None
+                raise
+
+        ep_data = next((e for e in episodes if getattr(e, "episode_number", None) == next_ep_num), None)
         if not ep_data:
             tv_status_cache.set(cache_key, {"is_up_to_date": True, "next_episode": None})
-            return
-            
+            return True, None
+
         is_released = is_date_released(ep_data.air_date)
         next_ep_dict = {
             "season_number": next_season,
             "episode_number": next_ep_num,
             "name": getattr(ep_data, "name", None) or f"Episódio {next_ep_num}",
             "air_date": ep_data.air_date,
-            "is_released": is_released
+            "is_released": is_released,
         }
-        tv_status_cache.set(cache_key, {"is_up_to_date": not is_released, "next_episode": next_ep_dict})
+        is_up = not is_released
+        tv_status_cache.set(cache_key, {"is_up_to_date": is_up, "next_episode": next_ep_dict})
+        return is_up, next_ep_dict
+
+
+async def _warm_tv_status_in_background(tmdb_id: int, next_season: int, next_ep_num: int, cache_key: str):
+    """Atualiza o cache de status e episódios de TV em background sem bloquear requisições HTTP."""
+    try:
+        await _resolve_tv_season_status(tmdb_id, next_season, next_ep_num, cache_key)
     except Exception as e:
         logger.debug(f"_warm_tv_status_in_background failed for {tmdb_id}: {e}")
+
 
 async def determine_tv_next_episode_status(
     tmdb_id: int,
@@ -62,9 +84,9 @@ async def determine_tv_next_episode_status(
 ):
     """
     Retorna (is_up_to_date, next_episode_dict) para uma série de TV.
-    is_up_to_date é True se todos os episódios lançados até o momento já foram assistidos
-    ou se o próximo episódio ainda não estreou (futuro ou sem data).
-    Usa tv_status_cache e details_cache em memória para responder em < 1ms e evita travar em requisições externas.
+    - is_up_to_date é True quando todos os episódios já lançados foram assistidos ou o próximo ainda não estreou.
+    - Lida com troca automática de temporada (ex: último episódio da S1 assistido -> aponta para S2 E1 se já existir).
+    - Nunca retorna falso negativo (is_up_to_date=False sem verificação): em caso de timeout de rede, retorna (None, None).
     """
     if progress_list:
         for ep in progress_list:
@@ -75,64 +97,70 @@ async def determine_tv_next_episode_status(
                 max_ep = e
             elif s == max_season and e > max_ep:
                 max_ep = e
-            
+
     cache_key = f"tv_status:{tmdb_id}:{max_season}:{max_ep}"
-    cached_data, is_stale = tv_status_cache.get_with_status(cache_key)
+    cached_data, _ = tv_status_cache.get_with_status(cache_key)
     if cached_data is not None:
-        return cached_data.get("is_up_to_date", False), cached_data.get("next_episode")
+        return cached_data.get("is_up_to_date"), cached_data.get("next_episode")
 
     next_season = max_season if max_season > 0 else 1
     next_ep_num = (max_ep + 1) if max_season > 0 else 1
 
-    # Checa se os detalhes da temporada já estão disponíveis em memória (details_cache)
+    # 1. Fast-path em memória (< 1ms) quando a temporada já está em details_cache
     season_cache_key = f"details:tv:{tmdb_id}:season:{next_season}"
     season_cached_data, _ = details_cache.get_with_status(season_cache_key)
-    if season_cached_data:
+    if season_cached_data and isinstance(season_cached_data.get("episodes"), list):
         try:
             from app.core.utils import is_date_released
             episodes = season_cached_data.get("episodes", [])
-            if episodes and next_ep_num > len(episodes):
-                next_season += 1
+            max_ep_in_season = max((e.get("episode_number", 0) or 0 for e in episodes), default=len(episodes))
+            can_resolve_from_mem = True
+
+            if episodes and next_ep_num > max_ep_in_season:
+                next_season = next_season + 1
                 next_ep_num = 1
                 next_season_key = f"details:tv:{tmdb_id}:season:{next_season}"
                 next_season_cached, _ = details_cache.get_with_status(next_season_key)
-                episodes = next_season_cached.get("episodes", []) if next_season_cached else []
-                
-            ep_data = next((e for e in episodes if e.get("episode_number") == next_ep_num), None) if isinstance(episodes, list) else None
-            if not ep_data:
-                tv_status_cache.set(cache_key, {"is_up_to_date": True, "next_episode": None})
-                return True, None
-                
-            air_date = ep_data.get("air_date")
-            is_released = is_date_released(air_date)
-            next_ep_dict = {
-                "season_number": next_season,
-                "episode_number": next_ep_num,
-                "name": ep_data.get("name") or f"Episódio {next_ep_num}",
-                "air_date": air_date,
-                "is_released": is_released
-            }
-            is_up = not is_released
-            tv_status_cache.set(cache_key, {"is_up_to_date": is_up, "next_episode": next_ep_dict})
-            return is_up, next_ep_dict
+                if next_season_cached is not None and isinstance(next_season_cached.get("episodes"), list):
+                    episodes = next_season_cached.get("episodes", [])
+                else:
+                    # A próxima temporada não está em memória ainda: já avança next_season e consulta direto a nova temporada!
+                    can_resolve_from_mem = False
+
+            if can_resolve_from_mem:
+                ep_data = next((e for e in episodes if e.get("episode_number") == next_ep_num), None)
+                if not ep_data:
+                    tv_status_cache.set(cache_key, {"is_up_to_date": True, "next_episode": None})
+                    return True, None
+
+                air_date = ep_data.get("air_date")
+                is_released = is_date_released(air_date)
+                next_ep_dict = {
+                    "season_number": next_season,
+                    "episode_number": next_ep_num,
+                    "name": ep_data.get("name") or f"Episódio {next_ep_num}",
+                    "air_date": air_date,
+                    "is_released": is_released,
+                }
+                is_up = not is_released
+                tv_status_cache.set(cache_key, {"is_up_to_date": is_up, "next_episode": next_ep_dict})
+                return is_up, next_ep_dict
         except Exception:
             pass
 
-    # Resposta instantânea (< 1ms): gera fallback matemático sem bloquear o ciclo do GET
-    fallback_next = {
-        "season_number": next_season,
-        "episode_number": next_ep_num,
-        "name": f"Episódio {next_ep_num}",
-        "air_date": None,
-        "is_released": True
-    }
-    tv_status_cache.set(cache_key, {"is_up_to_date": False, "next_episode": fallback_next})
-    # Agenda aquecimento completo em background sem travar a requisição do usuário
+    # 2. Consulta real controlada por semáforo com timeout curto (2.5s) para nunca mentir is_up_to_date=False
     try:
-        asyncio.create_task(_warm_tv_status_in_background(tmdb_id, next_season, next_ep_num, cache_key))
+        return await asyncio.wait_for(
+            _resolve_tv_season_status(tmdb_id, next_season, next_ep_num, cache_key),
+            timeout=2.5,
+        )
     except Exception:
-        pass
-    return False, fallback_next
+        # Se o TMDB demorar, agenda aquecimento em background e retorna None (não verificado) sem poluir cache
+        try:
+            asyncio.create_task(_warm_tv_status_in_background(tmdb_id, next_season, next_ep_num, cache_key))
+        except Exception:
+            pass
+        return None, None
 
 def invalidate_user_stats_cache(user_id: str):
     """Invalida o cache de estatísticas do usuário marcando como stale para o SWR funcionar e agenda recomputação em background."""
@@ -1197,6 +1225,14 @@ async def add_episode_progress(
     
     if tmdb_id_val:
         tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_val}")
+        try:
+            # Pré-aquece o novo status (incluindo rollover de temporada) para que o próximo GET seja imediato
+            next_s = progress.season_number
+            next_e = progress.episode_number + 1
+            new_key = f"tv_status:{tmdb_id_val}:{progress.season_number}:{progress.episode_number}"
+            asyncio.create_task(_warm_tv_status_in_background(tmdb_id_val, next_s, next_e, new_key))
+        except Exception:
+            pass
     
     invalidate_user_stats_cache(user_id)
 
