@@ -799,3 +799,209 @@ def calculate_semantic_dismiss_penalty(
 
     return round(max_penalty, 1)
 
+
+async def refresh_explore_media_batch(
+    db: AsyncSession,
+    user_id: str,
+    media_type: str = "movie",
+    exclude_ids: Optional[List[int]] = None,
+    limit: int = 24,
+) -> Dict[str, Any]:
+    """
+    Renova de forma síncrona, ultraleve (< 25ms) e sem chamadas externas ao TMDB
+    o pool de recomendações de um formato ('movie' ou 'tv') após o usuário fechar
+    o ciclo de lotes na tela Explorar.
+
+    Complexidade:
+    - O(U + E) para montar conjuntos hash de exclusão (vistos, dispensados e ciclo atual)
+    - O(M + K log K) na projeção vetorial SIMD em memória (_CACHED_MATRIX, K <= 48)
+    - O(K) constante no reranqueamento OmniMatch v3 + LightGBM + MMR
+    """
+    from app.users.models import User
+    from app.tracking.services import get_user_list
+    from app.recommendation.vector_search import search_semantic_candidates
+    from app.recommendation.collaborative import fetch_collaborative_candidates
+    from app.recommendation.orchestrator import (
+        build_candidate_vector,
+        apply_mmr_reranking,
+        reciprocal_rank_fusion,
+    )
+    from app.recommendation.matcher import compute_omnimatch_score
+    from app.recommendation.ranker import LightGBMRanker
+
+    u_uuid = _parse_uuid(user_id)
+    user_res = await db.execute(select(User).where(User.id == u_uuid))
+    user = user_res.scalars().first()
+
+    record = await get_user_recommendations_record(db, user_id)
+    existing_explore = list(record.explore_items or []) if record else []
+    other_type_items = [it for it in existing_explore if it.get("media_type") != media_type]
+    current_type_items = [it for it in existing_explore if it.get("media_type") == media_type]
+
+    if not user or not user.feature_vector:
+        return {"items": sanitize_recommendation_list(current_type_items[:limit]), "refreshed": False}
+
+    user_list = await get_user_list(db, user_id)
+    seen_media_keys: Set[Tuple[str, int]] = {
+        (it.media.media_type, it.media.tmdb_id) for it in user_list if getattr(it, "media", None)
+    }
+    dismissed_keys = await get_active_dismissed_media_keys(db, user_id)
+    dismissed_records = await get_user_dismissed_records(db, user_id)
+    dismissed_snapshots = [
+        {
+            "embedding": getattr(r, "embedding", None),
+            "expires_at": getattr(r, "expires_at", None),
+            "created_at": getattr(r, "created_at", None),
+        }
+        for r in dismissed_records
+    ]
+
+    exclude_set: Set[int] = {int(x) for x in (exclude_ids or []) if x}
+    cycle_excluded_keys: Set[Tuple[str, int]] = {(media_type, tid) for tid in exclude_set}
+    all_excluded = seen_media_keys | dismissed_keys | cycle_excluded_keys
+
+    # Snapshots leves do histórico para tags explicativas ("Porque você favoritou...")
+    user_item_snapshots = []
+    for it in user_list:
+        m = getattr(it, "media", None)
+        if not m:
+            continue
+        ep_list = getattr(it, "__dict__", {}).get("episodes") or []
+        ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in ep_list)
+        user_item_snapshots.append({
+            "title": getattr(m, "title", None),
+            "media_type": getattr(m, "media_type", "movie"),
+            "embedding": getattr(m, "embedding", None),
+            "media_obj": m,
+            "rating": getattr(it, "rating", None),
+            "status": getattr(it, "status", None),
+            "is_favorite": getattr(it, "is_favorite", False),
+            "rewatch_count": getattr(it, "rewatch_count", 0) or 0,
+            "ep_rewatches": ep_rewatches,
+        })
+
+    # 1. Busca semântica ANN em memória filtrada por media_type (zero chamadas HTTP)
+    fetch_k = max(36, limit * 2)
+    sem_cands = await search_semantic_candidates(
+        db=db,
+        query_embedding=user.embedding,
+        excluded_keys=all_excluded,
+        limit=fetch_k,
+        media_type_filter=media_type,
+    )
+
+    collab_cands: List[Dict[str, Any]] = []
+    try:
+        raw_collab = await fetch_collaborative_candidates(
+            db=db,
+            target_user_id=str(user_id),
+            seen_media_keys=all_excluded,
+            limit=30,
+        )
+        collab_cands = [c for c in raw_collab if c.get("media_type", "movie") == media_type]
+    except Exception:
+        collab_cands = []
+
+    channels = []
+    if sem_cands:
+        channels.append(("semantic", sem_cands, 1.0))
+    if collab_cands:
+        channels.append(("collaborative", collab_cands, 1.15))
+
+    candidates = reciprocal_rank_fusion(channels, k_constant=60, top_n=48) if channels else []
+
+    user_taste_clusters = user.taste_clusters or []
+    active_personas = user_taste_clusters if len(user_taste_clusters) > 1 else None
+    lgbm_ranker = LightGBMRanker()
+    current_impressions = dict(record.impressions or {}) if record else {}
+
+    # Registra impressão nos itens que o usuário acabou de rotacionar
+    for tid in exclude_set:
+        imp_k = f"{media_type}:{tid}"
+        current_impressions[imp_k] = current_impressions.get(imp_k, 0) + 1
+
+    scored: List[Dict[str, Any]] = []
+    for c in candidates:
+        c_vec = build_candidate_vector(c)
+        c["_candidate_vector"] = c_vec
+        cand_emb = c.get("embedding")
+
+        omni = compute_omnimatch_score(
+            user_vector=user.feature_vector,
+            candidate_vector=c_vec,
+            user_embedding=user.embedding,
+            candidate_embedding=cand_emb,
+            active_personas=active_personas,
+            vote_average=float(c.get("vote_average") or 0.0),
+            vote_count=int(c.get("vote_count") or 0),
+            user_item_count=len(user_list),
+            candidate=c,
+            user_items=user_item_snapshots,
+        )
+        score = omni["match_score"]
+        tags = omni["match_tags"]
+
+        if lgbm_ranker.is_ready():
+            try:
+                score = lgbm_ranker.predict_score(
+                    user=user,
+                    candidate=c,
+                    cand_emb=cand_emb,
+                    base_omnimatch=score,
+                    user_items=user_item_snapshots,
+                    active_personas=active_personas,
+                )
+            except Exception:
+                pass
+
+        if dismissed_snapshots and cand_emb:
+            pen = calculate_semantic_dismiss_penalty(cand_emb, dismissed_snapshots)
+            if pen > 0:
+                score = max(0.0, round(score - pen, 1))
+
+        imp_cnt = current_impressions.get(f"{media_type}:{c.get('id')}", 0)
+        if imp_cnt >= 2:
+            score = max(0.0, round(score - min(15.0, (imp_cnt - 1) * 3.0), 1))
+
+        c["match_score"] = score
+        c["match_tags"] = tags
+        c["is_preliminary"] = omni.get("is_preliminary", False)
+        scored.append(c)
+
+    selected = apply_mmr_reranking(scored, lambda_param=0.62, top_k=limit) if scored else []
+    fresh_count = len(selected)
+
+    # Fallback gracioso caso o catálogo local ainda tenha poucos itens inéditos fora de exclude_set:
+    # completa até `limit` rotacionando itens anteriores não vistos e agenda descoberta TMDB assíncrona
+    if len(selected) < min(8, len(current_type_items)):
+        selected_ids = {it.get("id") for it in selected}
+        base_seen_ids = {k[1] for k in (seen_media_keys | dismissed_keys) if k[0] == media_type}
+        rotated_prev = [
+            it for it in reversed(current_type_items)
+            if it.get("id") not in selected_ids and it.get("id") not in base_seen_ids
+        ]
+        selected.extend(rotated_prev[: max(0, limit - len(selected))])
+        schedule_recommendation_computation(str(user_id), force=False)
+
+    sanitize_recommendation_list(selected)
+
+    if record is not None:
+        if len(current_impressions) > 250:
+            sorted_imps = sorted(current_impressions.items(), key=lambda x: x[1], reverse=True)
+            current_impressions = dict(sorted_imps[:200])
+
+        merged_explore = selected + other_type_items if media_type == "movie" else other_type_items + selected
+        record.explore_items = merged_explore
+        record.impressions = current_impressions
+        record.updated_at = datetime.now(timezone.utc)
+        flag_modified(record, "explore_items")
+        flag_modified(record, "impressions")
+        await db.commit()
+
+    return {
+        "items": selected,
+        "refreshed": fresh_count >= 4,
+        "fresh_count": fresh_count,
+    }
+
+

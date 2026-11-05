@@ -25,6 +25,7 @@ from app.recommendation.service import (
     get_user_recommendations_record,
     compute_and_save_user_recommendations,
     schedule_recommendation_computation,
+    refresh_explore_media_batch,
     dismiss_recommendation,
     undismiss_recommendation,
     get_user_dismissed_records,
@@ -61,6 +62,11 @@ class TelemetryEventItem(BaseModel):
 
 class TelemetryBatchRequest(BaseModel):
     events: List[TelemetryEventItem]
+
+class RefreshExploreBatchRequest(BaseModel):
+    media_type: str = "movie"
+    exclude_ids: List[int] = []
+    limit: int = 24
 
 _seen_ids_locks: Dict[str, asyncio.Lock] = {}
 
@@ -423,6 +429,32 @@ async def force_recompute_recommendations(
     """Dispara um recálculo forçado de recomendações em segundo plano."""
     background_tasks.add_task(compute_and_save_user_recommendations, current_user_id, force=True)
     return {"message": "Recálculo forçado de recomendações iniciado em segundo plano."}
+
+
+@router.post("/explore/refresh-batch", response_model=Dict[str, Any])
+async def refresh_explore_batch_endpoint(
+    payload: RefreshExploreBatchRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Renova em O(M + K log K) (sem chamadas externas síncronas ao TMDB) o pool de sugestões
+    para um tipo de mídia ('movie' ou 'tv') quando o usuário fecha o ciclo de lotes no Explorar.
+    """
+    mtype = "tv" if payload.media_type == "tv" else "movie"
+    safe_limit = max(8, min(40, payload.limit))
+    safe_exclude = payload.exclude_ids[:120] if payload.exclude_ids else []
+    try:
+        return await refresh_explore_media_batch(
+            db=db,
+            user_id=current_user_id,
+            media_type=mtype,
+            exclude_ids=safe_exclude,
+            limit=safe_limit,
+        )
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail="Erro ao gerar novas sugestões.")
 
 
 @router.get("/score/{media_type}/{tmdb_id}")
