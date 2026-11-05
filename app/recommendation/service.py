@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import AsyncSessionLocal
+from app.core.cache import recommendations_seen_cache
 from app.recommendation.models import UserRecommendation, UserDismissedRecommendation
 from app.recommendation.orchestrator import (
     get_personalized_recommendations,
@@ -121,6 +123,60 @@ def _parse_uuid(uid: Any) -> uuid.UUID:
     if isinstance(uid, uuid.UUID):
         return uid
     return uuid.UUID(str(uid))
+
+def check_etag_match(client_etag: Optional[str], current_etag: str) -> bool:
+    """
+    Verifica se o cabeçalho If-None-Match enviado pelo cliente corresponde
+    ao ETag atual do recurso em conformidade com a RFC 7232.
+    Lida com tags fracas (W/), aspas duplas e listas separadas por vírgula.
+    """
+    if not client_etag or not current_etag:
+        return False
+    curr_clean = current_etag.strip().lstrip("W/").strip('"')
+    client_tags = [t.strip().lstrip("W/").strip('"') for t in client_etag.split(",")]
+    return curr_clean in client_tags or "*" in client_tags
+
+def generate_recommendations_etag(
+    user_id: str,
+    record: Optional[Any],
+    seen_ids: Optional[Set[int]] = None,
+    section: str = "explore",
+    extra: str = ""
+) -> str:
+    """
+    Gera um ETag HTTP determinístico e ultrarrápido em O(1) baseado no estado
+    de geração das recomendações do usuário no PostgreSQL.
+    Permite responder com HTTP 304 Not Modified (payload de 0 bytes) sem serializar JSON nem
+    gastar CPU e conexões do Galaxy A9 caso nada tenha mudado.
+
+    Se o worker em segundo plano gerar novas recomendações (last_generated_at),
+    se itens forem ejetados/dispensados (updated_at) ou se novas obras forem adicionadas
+    à lista (seen_ids), o hash se altera imediatamente, forçando a revalidação (HTTP 200).
+    """
+    if not record:
+        return f'"{hashlib.md5(f"{user_id}:{section}:empty:{extra}".encode()).hexdigest()}"'
+
+    last_gen = (
+        record.last_generated_at.isoformat()
+        if getattr(record, "last_generated_at", None)
+        else "none"
+    )
+    updated = (
+        record.updated_at.isoformat()
+        if getattr(record, "updated_at", None)
+        else "none"
+    )
+    is_stale = "1" if getattr(record, "is_stale", False) else "0"
+
+    seen_count = len(seen_ids) if seen_ids else 0
+    seen_sample = ""
+    if seen_ids:
+        # Soma determinística de uma amostra dos IDs para hash em O(1)
+        seen_sample = str(sum(list(seen_ids)[:15]))
+
+    raw = f"{user_id}:{section}:{last_gen}:{updated}:{is_stale}:{seen_count}:{seen_sample}:{extra}"
+    digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
+    return f'"{digest}"'
 
 async def get_user_recommendations_record(
     db: AsyncSession, user_id: str
@@ -249,6 +305,7 @@ async def eject_media_from_user_recommendations(
         if modified:
             record.is_stale = True
             await db.commit()
+            recommendations_seen_cache.delete_prefix(str(user_id))
             type_info = f" ({media_type})" if media_type else ""
             logger.info(f"[RECS-SERVICE] Obra tmdb_id={tmdb_id}{type_info} ejetada imediatamente das recomendações de {user_id}.")
 
@@ -270,6 +327,7 @@ def notify_user_media_action(
       apenas agenda com o cooldown padrão longo para não sobrecarregar TMDB/CPU.
     """
     user_id_str = str(user_id)
+    recommendations_seen_cache.delete_prefix(user_id_str)
     if user_id_str not in _user_recent_media_ids:
         _user_recent_media_ids[user_id_str] = set()
 
@@ -637,6 +695,7 @@ async def undismiss_recommendation(
         await db.delete(r)
 
     await db.commit()
+    recommendations_seen_cache.delete_prefix(str(user_id))
     logger.info(f"[RECS-SERVICE] Obra {media_type or ''} tmdb_id={tmdb_id} restaurada da lista de dispensadas para usuário {user_id}.")
     return True
 

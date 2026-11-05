@@ -1,10 +1,11 @@
+import asyncio
 import logging
 logger = logging.getLogger(__name__)
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, BackgroundTasks, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, BackgroundTasks, Response, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Any, Dict, Optional
 from app.core.database import get_db
-from app.core.cache import SimpleTTLCache
+from app.core.cache import SimpleTTLCache, recommendations_seen_cache
 from app.auth.dependencies import get_current_user_id
 from app.users.models import User
 from app.recommendation.orchestrator import (
@@ -33,10 +34,11 @@ from app.recommendation.service import (
     sanitize_recommendation_list,
     check_is_bloated,
     cleanup_bloated_user_record,
+    generate_recommendations_etag,
+    check_etag_match,
 )
 
-RECS_CACHE_HEADER = "private, max-age=180, stale-while-revalidate=300"
-_seen_ids_cache = SimpleTTLCache(ttl_seconds=30)
+RECS_CACHE_HEADER = "private, no-cache, must-revalidate, max-age=0"
 
 class DismissRecommendationRequest(BaseModel):
     tmdb_id: int
@@ -60,36 +62,46 @@ class TelemetryEventItem(BaseModel):
 class TelemetryBatchRequest(BaseModel):
     events: List[TelemetryEventItem]
 
+_seen_ids_locks: Dict[str, asyncio.Lock] = {}
+
 async def _get_user_seen_tmdb_ids(db: AsyncSession, user_id: str) -> set:
     user_key = str(user_id)
-    cached_val, is_stale = _seen_ids_cache.get_with_status(user_key)
+    cached_val, is_stale = recommendations_seen_cache.get_with_status(user_key)
     if not is_stale and cached_val is not None:
         return cached_val
 
-    try:
-        import uuid
-        target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(user_key)
-        from app.media.models import Media
-        from app.tracking.models import UserListItem
-        from sqlalchemy.future import select
-        
-        stmt = (
-            select(Media.tmdb_id)
-            .join(UserListItem, UserListItem.media_id == Media.id)
-            .where(UserListItem.user_id == target_uuid)
-        )
-        result = await db.execute(stmt)
-        seen = set(result.scalars().all())
-        dismissed = await get_active_dismissed_tmdb_ids(db, user_id)
-        all_seen = seen.union(dismissed)
-        _seen_ids_cache.set(user_key, all_seen)
-        return all_seen
-    except Exception as e:
-        logger.warning(f"Erro ao obter seen_tmdb_ids para {user_id}: {e}")
-        return set()
+    lock = _seen_ids_locks.setdefault(user_key, asyncio.Lock())
+    async with lock:
+        # Double-check após adquirir o lock para evitar concorrência/thundering herd simultâneo
+        cached_val, is_stale = recommendations_seen_cache.get_with_status(user_key)
+        if not is_stale and cached_val is not None:
+            return cached_val
+
+        try:
+            import uuid
+            target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(user_key)
+            from app.media.models import Media
+            from app.tracking.models import UserListItem
+            from sqlalchemy.future import select
+            
+            stmt = (
+                select(Media.tmdb_id)
+                .join(UserListItem, UserListItem.media_id == Media.id)
+                .where(UserListItem.user_id == target_uuid)
+            )
+            result = await db.execute(stmt)
+            seen = set(result.scalars().all())
+            dismissed = await get_active_dismissed_tmdb_ids(db, user_id)
+            all_seen = seen.union(dismissed)
+            recommendations_seen_cache.set(user_key, all_seen)
+            return all_seen
+        except Exception as e:
+            logger.warning(f"Erro ao obter seen_tmdb_ids para {user_id}: {e}")
+            return set()
 
 @router.get("/explore", response_model=List[Any])
 async def get_explore_recommendations(
+    request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
     limit: int = Query(50, ge=1, le=100),
@@ -105,6 +117,7 @@ async def get_explore_recommendations(
         if not record or not record.explore_items:
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
             items = (res.get("explore_items") if res else [])
+            record = await get_user_recommendations_record(db, current_user_id)
         else:
             items = record.explore_items
             if check_is_bloated(items):
@@ -118,11 +131,18 @@ async def get_explore_recommendations(
             if record.is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
+        etag = generate_recommendations_etag(
+            current_user_id, record, seen_ids, section="explore", extra=str(persona_id or "")
+        )
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
+
+        if check_etag_match(request.headers.get("if-none-match"), etag):
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": RECS_CACHE_HEADER})
+
         # Filtragem dinâmica defensiva: garante que nenhuma obra na lista do usuário seja exibida
         if seen_ids and items:
             items = [it for it in items if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
-
-        response.headers["Cache-Control"] = RECS_CACHE_HEADER
 
         if persona_id:
             personas = record.personas_items if record else []
@@ -144,6 +164,7 @@ async def get_explore_recommendations(
 
 @router.get("/explore/recent-vibe", response_model=List[Any])
 async def get_recent_vibe_endpoint(
+    request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
     limit: int = Query(20, ge=1, le=50),
@@ -160,6 +181,7 @@ async def get_recent_vibe_endpoint(
         if not record or not getattr(record, "recent_vibe_items", None):
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
             items = (res.get("recent_vibe_items") if res else [])
+            record = await get_user_recommendations_record(db, current_user_id)
         else:
             items = record.recent_vibe_items or []
             now = datetime.now(timezone.utc)
@@ -170,10 +192,18 @@ async def get_recent_vibe_endpoint(
             if record.is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
+        etag = generate_recommendations_etag(
+            current_user_id, record, seen_ids, section="recent-vibe", extra=str(limit)
+        )
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
+
+        if check_etag_match(request.headers.get("if-none-match"), etag):
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": RECS_CACHE_HEADER})
+
         if seen_ids and items:
             items = [it for it in items if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
 
-        response.headers["Cache-Control"] = RECS_CACHE_HEADER
         return sanitize_recommendation_list(items[:limit])
     except Exception as e:
         logger.exception(e)
@@ -181,6 +211,7 @@ async def get_recent_vibe_endpoint(
 
 @router.get("/personas", response_model=List[Any])
 async def get_user_personas(
+    request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
     top_k: int = Query(15, ge=1, le=30),
@@ -194,6 +225,7 @@ async def get_user_personas(
         if not record or not record.personas_items:
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
             personas = (res.get("personas_items", []) if res else [])
+            record = await get_user_recommendations_record(db, current_user_id)
         else:
             personas = record.personas_items
             if personas and any(check_is_bloated(p.get("recommendations")) for p in personas if isinstance(p, dict)):
@@ -207,6 +239,15 @@ async def get_user_personas(
             if record.is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
+        etag = generate_recommendations_etag(
+            current_user_id, record, seen_ids, section="personas", extra=str(top_k)
+        )
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
+
+        if check_etag_match(request.headers.get("if-none-match"), etag):
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": RECS_CACHE_HEADER})
+
         result = []
         for p in personas:
             p_copy = dict(p)
@@ -217,7 +258,6 @@ async def get_user_personas(
                 p_copy["recommendations"] = sanitize_recommendation_list(recs[:top_k])
             result.append(p_copy)
 
-        response.headers["Cache-Control"] = RECS_CACHE_HEADER
         return result
     except Exception as e:
         logger.exception(e)
@@ -225,6 +265,7 @@ async def get_user_personas(
 
 @router.get("/upcoming", response_model=Dict[str, Any])
 async def get_upcoming_recommendations_endpoint(
+    request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
     limit: int = Query(20, ge=1, le=50),
@@ -242,6 +283,7 @@ async def get_upcoming_recommendations_endpoint(
         if not record or not record.upcoming_items:
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
             upcoming = (res.get("upcoming_items", {}) if res else {"movies": [], "tv": []})
+            record = await get_user_recommendations_record(db, current_user_id)
         else:
             upcoming = record.upcoming_items
             now = datetime.now(timezone.utc)
@@ -252,20 +294,28 @@ async def get_upcoming_recommendations_endpoint(
             if record.is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        etag = generate_recommendations_etag(
+            current_user_id, record, seen_ids, section="upcoming", extra=f"{limit}:{today_str}"
+        )
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
+
+        if check_etag_match(request.headers.get("if-none-match"), etag):
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": RECS_CACHE_HEADER})
+
         movies = upcoming.get("movies") or []
         tv = upcoming.get("tv") or upcoming.get("series") or []
         if seen_ids:
             movies = [it for it in movies if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
             tv = [it for it in tv if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
 
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         movies = [it for it in movies if str(it.get("release_date") or "").strip() >= today_str]
         tv = [it for it in tv if str(it.get("first_air_date") or "").strip() >= today_str]
 
         clean_movies = sanitize_recommendation_list(movies[:limit])
         clean_tv = sanitize_recommendation_list(tv[:limit])
 
-        response.headers["Cache-Control"] = RECS_CACHE_HEADER
         return {
             "movies": clean_movies,
             "tv": clean_tv,
@@ -277,6 +327,7 @@ async def get_upcoming_recommendations_endpoint(
 
 @router.get("/feed", response_model=Dict[str, Any])
 async def get_explore_feed(
+    request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
     current_user_id: str = Depends(get_current_user_id),
@@ -298,6 +349,7 @@ async def get_explore_feed(
             personas = res.get("personas_items", []) if res else []
             is_stale = False
             last_gen = datetime.now(timezone.utc).isoformat()
+            record = await get_user_recommendations_record(db, current_user_id)
         else:
             explore = record.explore_items
             recent_vibe = getattr(record, "recent_vibe_items", []) or []
@@ -318,6 +370,15 @@ async def get_explore_feed(
                 schedule_recommendation_computation(current_user_id)
 
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        etag = generate_recommendations_etag(
+            current_user_id, record, seen_ids, section="feed", extra=today_str
+        )
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
+
+        if check_etag_match(request.headers.get("if-none-match"), etag):
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": RECS_CACHE_HEADER})
+
         if seen_ids:
             explore = [it for it in explore if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
             recent_vibe = [it for it in recent_vibe if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
@@ -342,7 +403,6 @@ async def get_explore_feed(
 
         upcoming = {"movies": clean_up_movies, "tv": clean_up_tv, "series": clean_up_tv}
 
-        response.headers["Cache-Control"] = RECS_CACHE_HEADER
         return {
             "explore": clean_explore,
             "recent_vibe": clean_recent_vibe,
