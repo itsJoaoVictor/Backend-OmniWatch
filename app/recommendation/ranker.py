@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "lgbm_ranker.pkl")
 CALIBRATOR_PATH = os.path.join(os.path.dirname(__file__), "lgbm_calibrator.pkl")
-ENABLE_LGBM_RANKER = True  # Habilitado via feature flag condicionado à existência de modelo e calibrador válidos (Etapa 6 + Ideia 10)
+ENABLE_LGBM_RANKER = False  # Desabilitado em favor da Equação Canônica Analítica Calibrada (OmniMatch v3) até conclusão da telemetria offline (Ideia 10)
 
 
 def extract_ranker_features(
