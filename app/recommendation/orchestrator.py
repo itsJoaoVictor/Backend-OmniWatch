@@ -1,6 +1,8 @@
 import asyncio
 import httpx
-from typing import List, Dict, Any, Optional
+import math
+import numpy as np
+from typing import List, Dict, Any, Optional, Set, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.users.models import User
@@ -459,34 +461,61 @@ async def enrich_candidates_with_details(
 
             if texts_to_embed:
                 batch_embeddings = await generate_embeddings_batch(texts_to_embed)
+                added_keys = set()
                 for cand_item, emb in zip(cands_to_embed, batch_embeddings):
                     if emb:
                         cand_item["embedding"] = emb
                         cid = cand_item["id"]
                         mtype = cand_item.get("media_type", "movie")
+                        key = (mtype, cid)
+                        if key in added_keys:
+                            continue
+                        added_keys.add(key)
                         existing_m = (await db.execute(
                             select(MediaModel).where(MediaModel.tmdb_id == cid, MediaModel.media_type == mtype)
                         )).scalars().first()
                         if existing_m:
                             existing_m.embedding = emb
+                            if cand_item.get("popularity"):
+                                existing_m.popularity = float(cand_item.get("popularity") or 0.0)
+                            if cand_item.get("vote_average"):
+                                existing_m.vote_average = float(cand_item.get("vote_average") or 0.0)
+                            if cand_item.get("vote_count"):
+                                existing_m.vote_count = int(cand_item.get("vote_count") or 0)
+                            if cand_item.get("watch_providers_br"):
+                                existing_m.watch_providers_br = cand_item.get("watch_providers_br")
                         else:
-                            new_m = MediaModel(
-                                tmdb_id=cid,
-                                media_type=mtype,
-                                title=cand_item.get("title") or "Mídia",
-                                poster_path=cand_item.get("poster_path"),
-                                backdrop_path=cand_item.get("backdrop_path"),
-                                original_language=cand_item.get("original_language"),
-                                genres=[{"id": 0, "name": g} for g in cand_item.get("genres", [])] if isinstance(cand_item.get("genres"), list) else [],
-                                directors=cand_item.get("crew", []),
-                                main_cast=cand_item.get("cast", []),
-                                keywords=cand_item.get("keywords_list", []),
-                                embedding=emb
-                            )
-                            db.add(new_m)
+                            by_tmdb = (await db.execute(
+                                select(MediaModel).where(MediaModel.tmdb_id == cid)
+                            )).scalars().first()
+                            if by_tmdb:
+                                by_tmdb.embedding = emb
+                            else:
+                                new_m = MediaModel(
+                                    tmdb_id=cid,
+                                    media_type=mtype,
+                                    title=cand_item.get("title") or "Mídia",
+                                    poster_path=cand_item.get("poster_path"),
+                                    backdrop_path=cand_item.get("backdrop_path"),
+                                    original_language=cand_item.get("original_language"),
+                                    genres=[{"id": 0, "name": g} for g in cand_item.get("genres", [])] if isinstance(cand_item.get("genres"), list) else [],
+                                    directors=cand_item.get("crew", []),
+                                    main_cast=cand_item.get("cast", []),
+                                    keywords=cand_item.get("keywords_list", []),
+                                    popularity=float(cand_item.get("popularity", 0.0) or 0.0),
+                                    vote_average=float(cand_item.get("vote_average", 0.0) or 0.0),
+                                    vote_count=int(cand_item.get("vote_count", 0) or 0),
+                                    belongs_to_collection=cand_item.get("belongs_to_collection"),
+                                    watch_providers_br=cand_item.get("flatrate_providers_br") or cand_item.get("watch_providers_br", []),
+                                    embedding=emb
+                                )
+                                db.add(new_m)
                 await db.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
 
     return list(enriched)
 
@@ -581,77 +610,155 @@ def calculate_item_similarity(cand_a: Dict[str, Any], cand_b: Dict[str, Any]) ->
     return 0.0
 
 
-def apply_mmr_reranking(
+def apply_fast_dpp_reranking(
     candidates: List[Dict[str, Any]],
-    lambda_param: float = 0.65,
-    top_k: int = 15
+    top_k: int = 15,
+    lambda_param: float = 0.65
 ) -> List[Dict[str, Any]]:
     """
-    Aplica o algoritmo Maximal Marginal Relevance (MMR) para diversificar o carrossel de recomendações,
-    evitando 'bolhas de filtro' (ex: quando todos os itens são de uma única franquia ou subgênero).
+    Aplica Fast Greedy DPP (Determinantal Point Processes) com decomposição incremental de Cholesky
+    (Chen et al. 2018) para selecionar o subconjunto que maximiza simultaneamente a relevância
+    e a diversidade volumétrica de subgêneros e estilos (Ideia 12) em tempo de execução < 2ms.
 
-    Fórmula:
-    MMR = argmax_{d_i in Remaining} [ lambda * Rel(d_i) - (1 - lambda) * max_{d_j in Selected} Sim(d_i, d_j) ]
-
-    - lambda_param = 0.65: 65% relevância individual do usuário e 35% diversidade/novidade temática.
-    - Se dois filmes forem extremamente parecidos, o segundo sofre penalidade de redundância,
-      abrindo espaço para o próximo gênero ou estilo que o usuário também aprecia.
+    Kernel L = diag(q) S diag(q), onde:
+      q_i = exp(alpha * rel_i) com alpha = 0.5 * lambda / (1 - lambda)
+      S_ij = similaridade semântico-estrutural entre obras
+      Ganho marginal incremental = d_i^2 = L_ii - ||c_i||^2
     """
     if not candidates:
         return []
+    if len(candidates) <= 1 or top_k <= 1:
+        return candidates[:top_k]
 
-    if len(candidates) <= 1:
-        return candidates
+    n = len(candidates)
+    target_k = min(top_k, n)
 
-    sim_cache: Dict[tuple, float] = {}
+    eff_lambda = max(0.01, min(0.99, lambda_param))
+    alpha = 0.5 * (eff_lambda / (1.0 - eff_lambda))
 
-    def get_sim(item_a: Dict[str, Any], item_b: Dict[str, Any]) -> float:
-        id_a = item_a.get("id")
-        id_b = item_b.get("id")
-        if id_a == id_b:
+    q = np.zeros(n, dtype=np.float64)
+    for i, c in enumerate(candidates):
+        rel = float(c.get("match_score", 50.0)) / 100.0
+        q[i] = math.exp(alpha * rel)
+
+    c_matrix = np.zeros((target_k, n), dtype=np.float64)
+    d_sq = q ** 2
+
+    sim_cache: Dict[Tuple[int, int], float] = {}
+    def get_cand_sim(idx_a: int, idx_b: int) -> float:
+        if idx_a == idx_b:
             return 1.0
-        pair_key = (min(id_a, id_b), max(id_a, id_b))
-        if pair_key not in sim_cache:
-            sim_cache[pair_key] = calculate_item_similarity(item_a, item_b)
-        return sim_cache[pair_key]
+        pair = (min(idx_a, idx_b), max(idx_a, idx_b))
+        if pair not in sim_cache:
+            sim = calculate_item_similarity(candidates[pair[0]], candidates[pair[1]])
+            sim_cache[pair] = max(0.0, min(1.0, float(sim)))
+        return sim_cache[pair]
 
-    remaining = list(candidates)
-    selected = []
+    selected_indices: List[int] = []
+    selected_mask = np.zeros(n, dtype=bool)
 
-    # 1. Primeiro selecionado é o item de maior afinidade absoluta
-    remaining.sort(key=lambda x: x.get("match_score", 0), reverse=True)
-    selected.append(remaining.pop(0))
+    for step in range(target_k):
+        masked_d_sq = np.where(selected_mask, -np.inf, d_sq)
+        best_idx = int(np.argmax(masked_d_sq))
 
-    # 2. Seleção gananciosa (greedy) dos próximos itens maximizando o score MMR
-    target_count = min(top_k, len(candidates))
+        if masked_d_sq[best_idx] <= 1e-12:
+            rem = [idx for idx in range(n) if not selected_mask[idx]]
+            rem.sort(key=lambda idx: candidates[idx].get("match_score", 0), reverse=True)
+            for r_idx in rem[:(target_k - step)]:
+                selected_indices.append(r_idx)
+                selected_mask[r_idx] = True
+            break
 
-    while len(selected) < target_count and remaining:
-        best_mmr_score = -float("inf")
-        best_idx = 0
+        selected_indices.append(best_idx)
+        selected_mask[best_idx] = True
 
-        for idx, cand in enumerate(remaining):
-            rel = float(cand.get("match_score", 0)) / 100.0
+        if len(selected_indices) >= target_k:
+            break
 
-            # Similaridade máxima com qualquer um dos itens já escolhidos para o carrossel
-            max_sim_to_selected = max(get_sim(cand, sel_item) for sel_item in selected)
+        d_best = math.sqrt(masked_d_sq[best_idx])
+        c_matrix[step, best_idx] = d_best
 
-            # Equilíbrio MMR: relevância vs redundância
-            mmr_score = (lambda_param * rel) - ((1.0 - lambda_param) * max_sim_to_selected)
+        for i in range(n):
+            if not selected_mask[i]:
+                s_ij = get_cand_sim(best_idx, i)
+                l_ij = q[best_idx] * s_ij * q[i]
 
-            if mmr_score > best_mmr_score:
-                best_mmr_score = mmr_score
-                best_idx = idx
+                if step > 0:
+                    inner_prod = float(np.dot(c_matrix[:step, best_idx], c_matrix[:step, i]))
+                else:
+                    inner_prod = 0.0
 
-        selected.append(remaining.pop(best_idx))
+                e_i = (l_ij - inner_prod) / d_best
+                c_matrix[step, i] = e_i
+                d_sq[i] = max(0.0, d_sq[i] - (e_i ** 2))
 
-    return selected
+    return [candidates[i] for i in selected_indices]
+
+
+# Alias para retrocompatibilidade com chamadas existentes
+apply_mmr_reranking = apply_fast_dpp_reranking
+
+
+def reciprocal_rank_fusion(
+    channel_lists: List[Tuple[str, List[Dict[str, Any]], float]],
+    k_constant: int = 60,
+    top_n: int = 150
+) -> List[Dict[str, Any]]:
+    """
+    Combina múltiplos canais heterogêneos de recuperação (Canal 1 Semântico ANN,
+    Canal 2 TMDB Discover e Canal 3 Colaborativo ALS - Sub-etapa 5.2 + Ideia 9)
+    através da fórmula canônica de Reciprocal Rank Fusion:
+      RRF(d) = sum_{c in Canais} [ weight_c / (k + rank_c(d)) ]
+    """
+    scores: Dict[Tuple[str, int], float] = {}
+    candidates_by_key: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    channel_tags: Dict[Tuple[str, int], List[str]] = {}
+
+    for channel_name, cand_list, weight in channel_lists:
+        for rank, cand in enumerate(cand_list, start=1):
+            cid = cand.get("id")
+            mtype = cand.get("media_type") or "movie"
+            if not cid:
+                continue
+            key = (mtype, cid)
+
+            rrf_gain = weight / (k_constant + rank)
+            scores[key] = scores.get(key, 0.0) + rrf_gain
+
+            if key not in candidates_by_key:
+                candidates_by_key[key] = cand
+                channel_tags[key] = []
+            else:
+                existing = candidates_by_key[key]
+                if cand.get("collaborative"):
+                    existing["collaborative"] = True
+                    existing["collaborative_score"] = cand.get("collaborative_score", 0.0)
+                if cand.get("semantic"):
+                    existing["semantic"] = True
+                    existing["semantic_score"] = cand.get("semantic_score", 0.0)
+                if cand.get("embedding") and not existing.get("embedding"):
+                    existing["embedding"] = cand.get("embedding")
+
+            channel_tags[key].append(channel_name)
+
+    sorted_keys = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+    merged: List[Dict[str, Any]] = []
+
+    for k in sorted_keys[:top_n]:
+        cand = candidates_by_key[k]
+        cand["_rrf_score"] = round(scores[k], 5)
+        cand["_channels"] = channel_tags.get(k, [])
+        merged.append(cand)
+
+    return merged
 
 
 async def get_personalized_recommendations(
     db: AsyncSession,
     user_id: str,
     top_k: int = 50,
-    persona_id: Optional[str] = None
+    persona_id: Optional[str] = None,
+    impressions_map: Optional[Dict[str, int]] = None
 ) -> List[Dict[str, Any]]:
     # Get user profile
     user_result = await db.execute(select(User).where(User.id == user_id))
@@ -742,44 +849,54 @@ async def get_personalized_recommendations(
         if (c.get("media_type", "movie"), c.get("id")) not in seen_media_keys
     ]
 
-    # B) Fase 5: Collaborative Filtering candidates from similar users
+    # === CANAL 1: Retrieval Semântico / ANN (Sub-etapa 5.1 + Ideia 2) ===
+    from app.recommendation.vector_search import search_semantic_candidates
+    try:
+        semantic_candidates = await search_semantic_candidates(
+            db=db,
+            query_embedding=user_embedding,
+            excluded_keys=seen_media_keys,
+            limit=80
+        )
+    except Exception as e:
+        logger.warning(f"Erro no Canal Semântico ANN: {e}")
+        semantic_candidates = []
+
+    # === CANAL 3: Filtragem Colaborativa Implícita ALS (Sub-etapa 5.2 + Ideia 9) ===
     from app.recommendation.collaborative import fetch_collaborative_candidates
     try:
         collab_candidates = await fetch_collaborative_candidates(
             db=db,
             target_user_id=user_id,
             seen_media_keys=seen_media_keys,
-            limit=10
+            limit=60
         )
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Erro no Canal Colaborativo ALS: {e}")
         collab_candidates = []
 
-    # Merge candidates: chave composta (media_type, tmdb_id)
-    all_candidates = []
-    seen_candidate_keys = set()
+    # === FUSÃO RRF (Reciprocal Rank Fusion) DOS 3 CANAIS (Sub-etapa 5.2 + Ideia 9) ===
+    channel_inputs = []
+    if semantic_candidates:
+        channel_inputs.append(("semantic", semantic_candidates, 1.0))
+    if filtered_discover:
+        channel_inputs.append(("discover", filtered_discover, 1.0))
+    if collab_candidates:
+        channel_inputs.append(("collaborative", collab_candidates, 1.2))
 
-    for c in collab_candidates:
-        cid = c.get("id")
-        mtype = c.get("media_type", "movie")
-        ckey = (mtype, cid)
-        if cid and ckey not in seen_candidate_keys:
-            all_candidates.append(c)
-            seen_candidate_keys.add(ckey)
-
-    for c in filtered_discover:
-        cid = c.get("id")
-        mtype = c.get("media_type", "movie")
-        ckey = (mtype, cid)
-        if cid and ckey not in seen_candidate_keys:
-            all_candidates.append(c)
-            seen_candidate_keys.add(ckey)
+    if channel_inputs:
+        all_candidates = reciprocal_rank_fusion(channel_inputs, k_constant=60, top_n=150)
+    else:
+        all_candidates = []
 
     if not all_candidates:
         return []
 
-    # 3. Fase 1: Enrich discover candidates with full TMDB details
-    to_enrich = [c for c in all_candidates if not c.get("collaborative")]
-    already_enriched = [c for c in all_candidates if c.get("collaborative")]
+    seen_candidate_keys = {(c.get("media_type", "movie"), c.get("id")) for c in all_candidates if "id" in c}
+
+    # 3. Enriquece apenas candidatos rasos que não possuem metadados completos
+    to_enrich = [c for c in all_candidates if not (c.get("cast") and c.get("keywords_list"))]
+    already_enriched = [c for c in all_candidates if (c.get("cast") and c.get("keywords_list"))]
 
     enriched_discover = await enrich_candidates_with_details(
         to_enrich,
@@ -814,6 +931,9 @@ async def get_personalized_recommendations(
     active_personas = user_taste_clusters if (not persona_id and user_taste_clusters and len(user_taste_clusters) > 1) else None
     target_persona = next((p for p in user_taste_clusters if str(p.get("id")) == str(persona_id)), None) if persona_id else None
 
+    from app.recommendation.ranker import LightGBMRanker
+    lgbm_ranker = LightGBMRanker()
+
     scored_candidates = []
     for c in total_candidates:
         candidate_vector = build_candidate_vector(c)
@@ -837,14 +957,49 @@ async def get_personalized_recommendations(
         final_score = omni["match_score"]
         top_tags = omni["match_tags"]
 
-        if c.get("collaborative") and "Gosto similar" not in top_tags:
-            top_tags.append("Gosto similar")
+        # LGBMRanker Leak-Free re-ranking e calibração para o feed geral de explore (Sub-etapa 6.2 + Ideia 10)
+        if not persona_id and lgbm_ranker.is_ready():
+            try:
+                final_score = lgbm_ranker.predict_score(
+                    user=user,
+                    candidate=c,
+                    cand_emb=cand_emb,
+                    base_omnimatch=final_score,
+                    user_items=user_item_snapshots,
+                    active_personas=active_personas,
+                )
+            except Exception:
+                pass
+
+        if c.get("collaborative") and "✨ Descoberta Colaborativa" not in top_tags:
+            top_tags.append("✨ Descoberta Colaborativa")
+        elif c.get("semantic") and c.get("semantic_score", 0) >= 70.0 and "✨ Afinidade Semântica" not in top_tags:
+            top_tags.append("✨ Afinidade Semântica")
 
         # Aplica penalidade contextual suave se o candidato for semanticamente muito próximo (>=0.75) de uma obra dispensada
         if dismissed_snapshots and cand_emb:
             penalty = calculate_semantic_dismiss_penalty(cand_emb, dismissed_snapshots)
             if penalty > 0:
                 final_score = max(0.0, round(final_score - penalty, 1))
+
+        # Anti-Fadiga de Carrossel (Impression Freshness - Sub-etapa 4.3 + Ideia 10)
+        # Se o usuário viu a obra em 2 ou mais gerações consecutivas sem interagir:
+        # -3 pts por repetição após a 1ª, teto de -15 pts
+        if impressions_map:
+            c_type = c.get("media_type", "movie")
+            c_id = c.get("id")
+            imp_key = f"{c_type}:{c_id}"
+            imp_count = impressions_map.get(imp_key, 0) or impressions_map.get(str(c_id), 0)
+            if imp_count >= 2:
+                repeats = imp_count - 1
+                decay_penalty = min(15.0, repeats * 3.0)
+                final_score = max(0.0, round(final_score - decay_penalty, 1))
+                c["freshness_penalty"] = decay_penalty
+
+        # Exposição de provedores de streaming BR (Sub-etapa 4.3 + Ideia 11)
+        br_providers = c.get("flatrate_providers_br") or c.get("watch_providers_br", [])
+        c["flatrate_providers_br"] = br_providers
+        c["watch_providers_br"] = br_providers
 
         c["match_score"] = final_score
         c["match_tags"] = top_tags
@@ -909,6 +1064,7 @@ async def get_personalized_recommendations(
         item.pop("_best_persona_id", None)
         item.pop("_ml_score", None)
         item.pop("_rrf_score", None)
+        item.pop("_channels", None)
 
     return diverse_recommendations
 
@@ -1219,4 +1375,150 @@ async def get_upcoming_recommendations(
         "movies": scored_movies[:top_k_per_type],
         "series": scored_tv[:top_k_per_type]
     }
+
+
+async def get_recent_vibe_recommendations(
+    db: AsyncSession,
+    user_id: str,
+    top_k: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Gera o carrossel 'Na Sua Vibe Recente' com janela móvel de 21 dias (Sub-etapa 4.1 + Ideia 5).
+    Captura o humor pontual recente do usuário (ex: maratona de terror, ficção anos 80, animações)
+    usando Rocchio de curto prazo e Fast Greedy DPP para diversificação volumétrica.
+    """
+    import uuid
+    from app.tracking.models import UserListItem
+    from app.recommendation.profile_manager import compute_recent_vibe_profile
+    from sqlalchemy.orm import selectinload
+
+    target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+
+    # 1. Carrega itens da lista do usuário
+    stmt = (
+        select(UserListItem)
+        .options(selectinload(UserListItem.media), selectinload(UserListItem.episodes))
+        .where(UserListItem.user_id == target_uuid)
+    )
+    res = await db.execute(stmt)
+    list_items = res.scalars().all()
+
+    if not list_items:
+        return []
+
+    # 2. Constrói perfil de memória curta Rocchio (21 dias)
+    vibe_vector, vibe_embedding, seed_keys = compute_recent_vibe_profile(
+        list_items, half_life_days=21.0, max_age_days=45.0
+    )
+
+    if not vibe_vector:
+        return []
+
+    # 3. Conjunto de obras já assistidas / dispensadas para filtragem
+    seen_keys: Set[Tuple[str, int]] = set()
+    for it in list_items:
+        if it.media and getattr(it.media, "tmdb_id", None):
+            m_type = getattr(it.media, "media_type", "movie") or "movie"
+            seen_keys.add((m_type, it.media.tmdb_id))
+
+    from app.recommendation.service import get_active_dismissed_media_keys
+    dismissed_keys = await get_active_dismissed_media_keys(db, str(user_id))
+    excluded_keys = seen_keys.union(dismissed_keys)
+
+    # 4. Recuperação de Candidatos para a Vibe
+    # Funil A: Discover baseado no vetor da vibe
+    discover_candidates = await fetch_discover_candidates(vibe_vector, db=db, user_id=str(user_id))
+
+    # Funil B: Recomendações TMDB a partir dos top seeds recentes
+    recommended_candidates: List[Dict[str, Any]] = []
+    top_seeds = seed_keys[:3]
+    if top_seeds:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            for m_type, s_id in top_seeds:
+                endpoint = "movie" if m_type == "movie" else "tv"
+                url = f"https://api.themoviedb.org/3/{endpoint}/{s_id}/recommendations"
+                params = {"api_key": settings.TMDB_API_KEY, "language": "pt-BR", "page": 1}
+                try:
+                    r = await client.get(url, params=params)
+                    if r.status_code == 200:
+                        results = r.json().get("results", [])
+                        for item in results[:10]:
+                            item["media_type"] = m_type
+                            recommended_candidates.append(item)
+                except Exception:
+                    pass
+
+    # Junta e desduplica
+    combined_raw: List[Dict[str, Any]] = []
+    seen_in_vibe: Set[Tuple[str, int]] = set()
+
+    for c in (discover_candidates + recommended_candidates):
+        cid = c.get("id")
+        ctype = c.get("media_type") or "movie"
+        ckey = (ctype, cid)
+        if not cid or ckey in excluded_keys or ckey in seen_in_vibe:
+            continue
+
+        # Filtros básicos de qualidade mínima (vote_count >= 60, vote_avg >= 5.5)
+        v_count = c.get("vote_count", 0) or 0
+        v_avg = c.get("vote_average", 0.0) or 0.0
+        if v_count < 60 or v_avg < 5.5:
+            continue
+
+        seen_in_vibe.add(ckey)
+        combined_raw.append(c)
+
+    if not combined_raw:
+        return []
+
+    # 5. Enriquecimento dos candidatos (1 RTT) + batch embeddings
+    enriched = await enrich_candidates_with_details(
+        combined_raw,
+        user_vector=vibe_vector,
+        db=db,
+        seen_keys=excluded_keys
+    )
+
+    # 6. Pontuação de Afinidade com a Vibe
+    scored_vibe: List[Dict[str, Any]] = []
+    for c in enriched:
+        cand_vec = build_candidate_vector(c)
+        c["_candidate_vector"] = cand_vec
+        cand_emb = c.get("embedding")
+
+        omni = compute_omnimatch_score(
+            user_vector=vibe_vector or {},
+            candidate_vector=cand_vec,
+            user_embedding=vibe_embedding,
+            candidate_embedding=cand_emb,
+            vote_average=float(c.get("vote_average") or 0.0),
+            vote_count=int(c.get("vote_count") or 0),
+            user_item_count=len(list_items),
+            candidate=c,
+        )
+
+        score = omni["match_score"]
+        tags = omni["match_tags"]
+        if "✨ Na Sua Vibe" not in tags:
+            tags.insert(0, "✨ Na Sua Vibe")
+
+        br_providers = c.get("flatrate_providers_br") or c.get("watch_providers_br", [])
+        c["flatrate_providers_br"] = br_providers
+        c["watch_providers_br"] = br_providers
+        c["match_score"] = score
+        c["match_tags"] = tags[:3]
+        scored_vibe.append(c)
+
+    # 7. Aplica Fast Greedy DPP para selecionar conjunto diverso dentro da vibe
+    diverse_vibe = apply_fast_dpp_reranking(scored_vibe, top_k=top_k, lambda_param=0.65)
+    diverse_vibe.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+
+    for it in diverse_vibe:
+        it.pop("_candidate_vector", None)
+        it.pop("_best_persona_id", None)
+        it.pop("_ml_score", None)
+        it.pop("_rrf_score", None)
+
+    return diverse_vibe
+
 

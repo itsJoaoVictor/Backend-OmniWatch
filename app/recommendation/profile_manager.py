@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Tuple
 from datetime import datetime, timezone
 import math
 import numpy as np
@@ -283,5 +283,116 @@ async def update_user_profile(
             schedule_recommendation_computation(user.id, force=False, cooldown_seconds=1200)
     except Exception as e:
         logger.warning(f"Erro ao agendar atualização de recomendações para {user.id}: {e}")
+
+
+def compute_recent_vibe_profile(
+    list_items: List[UserListItem],
+    half_life_days: float = 21.0,
+    max_age_days: float = 45.0,
+) -> Tuple[Dict[str, float], Optional[List[float]], List[Tuple[str, int]]]:
+    """
+    Calcula o perfil Rocchio de memória curta (janela móvel com meia-vida de 21 dias)
+    para alimentar o carrossel 'Na Sua Vibe Recente' sem contaminar o perfil permanente (Ideia 5).
+    Retorna (vibe_feature_vector, vibe_embedding, recent_seed_keys).
+    """
+    now = datetime.now(timezone.utc)
+
+    def get_item_date(it: UserListItem) -> datetime:
+        dt = it.last_watched_at or it.updated_at or it.created_at
+        if dt and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt or datetime.fromtimestamp(0, tz=timezone.utc)
+
+    sorted_items = sorted(list_items, key=get_item_date, reverse=True)
+
+    # Filtra itens recentes positivos (<= max_age_days)
+    recent_candidates: List[UserListItem] = []
+    for it in sorted_items:
+        media = getattr(it, "media", None)
+        if not media or not getattr(media, "tmdb_id", None):
+            continue
+        scale = calculate_rating_scale(it.rating, it.status, rewatch_count=getattr(it, "rewatch_count", 0) or 0)
+        if scale <= 0:
+            continue
+        dt = get_item_date(it)
+        age_days = (now - dt).total_seconds() / 86400.0
+        if age_days <= max_age_days:
+            recent_candidates.append(it)
+
+    # Fallback gracioso: se houver pouca atividade nos últimos 45 dias, usa os últimos 4 itens positivos
+    if len(recent_candidates) < 3:
+        for it in sorted_items:
+            if it not in recent_candidates:
+                media = getattr(it, "media", None)
+                if not media or not getattr(media, "tmdb_id", None):
+                    continue
+                scale = calculate_rating_scale(it.rating, it.status, rewatch_count=getattr(it, "rewatch_count", 0) or 0)
+                if scale > 0:
+                    recent_candidates.append(it)
+            if len(recent_candidates) >= 4:
+                break
+
+    if not recent_candidates:
+        return {}, None, []
+
+    raw_scores: Dict[str, float] = {}
+    pos_emb_sum: Optional[np.ndarray] = None
+    pos_weight_total: float = 0.0
+    seed_keys: List[Tuple[str, int]] = []
+
+    for item in recent_candidates:
+        media = item.media
+        m_type = getattr(media, "media_type", "movie") or "movie"
+        t_id = getattr(media, "tmdb_id", None)
+        if t_id:
+            seed_keys.append((m_type, t_id))
+
+        action_date = get_item_date(item)
+        time_decay = calculate_time_decay(action_date, half_life_days=half_life_days)
+        rating_scale = calculate_rating_scale(item.rating, item.status, rewatch_count=getattr(item, "rewatch_count", 0) or 0)
+        fav_mod = 2.0 if item.is_favorite else 1.0
+
+        item_scale = time_decay * rating_scale * fav_mod
+
+        # Acumulação Esparsa
+        m_vec = build_sparse_vector(media)
+        for k, v in m_vec.items():
+            raw_scores[k] = raw_scores.get(k, 0.0) + (v * item_scale)
+
+        # Acumulação Densa Rocchio
+        if getattr(media, "embedding", None):
+            m_emb = np.array(media.embedding, dtype=np.float32)
+            if m_emb.shape == (settings.EMBEDDING_DIM,):
+                norm_m = np.linalg.norm(m_emb)
+                if norm_m > 0:
+                    m_emb = m_emb / norm_m
+                    if pos_emb_sum is None:
+                        pos_emb_sum = item_scale * m_emb
+                    else:
+                        pos_emb_sum += item_scale * m_emb
+                    pos_weight_total += item_scale
+
+    # Escala Sublinear e teto em Top 300 features (vibe focada no momento)
+    scaled_vector: Dict[str, float] = {}
+    for k, raw_v in raw_scores.items():
+        s_v = sublinear_scale(raw_v)
+        if abs(s_v) > 0.001:
+            scaled_vector[k] = s_v
+
+    max_abs = max((abs(v) for v in scaled_vector.values()), default=1.0)
+    if max_abs > 100.0:
+        scaled_vector = {k: (v / max_abs) * 100.0 for k, v in scaled_vector.items()}
+
+    if len(scaled_vector) > 300:
+        sorted_feats = sorted(scaled_vector.items(), key=lambda x: abs(x[1]), reverse=True)
+        scaled_vector = dict(sorted_feats[:300])
+
+    vibe_embedding = None
+    if pos_emb_sum is not None and pos_weight_total > 0:
+        u_norm = np.linalg.norm(pos_emb_sum)
+        if u_norm > 0:
+            vibe_embedding = (pos_emb_sum / u_norm).tolist()
+
+    return scaled_vector, vibe_embedding, seed_keys
 
 

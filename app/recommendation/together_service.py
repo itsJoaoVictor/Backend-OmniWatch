@@ -17,6 +17,7 @@ from app.recommendation.orchestrator import (
     fetch_discover_candidates,
     enrich_candidates_with_details,
     build_candidate_vector,
+    apply_fast_dpp_reranking,
 )
 from app.recommendation.embeddings import calculate_cosine_similarity
 from app.recommendation.service import get_active_dismissed_media_keys
@@ -318,6 +319,30 @@ async def get_together_recommendations(
             elif tags_b:
                 shared_tags.append(tags_b[0])
 
+        # Cruzamento Matricial de Personas User A x User B (Sub-etapa 4.2 + Ideia 10)
+        p_id_a = res_a.get("best_persona_id")
+        p_id_b = res_b.get("best_persona_id")
+        clusters_a = user_a.taste_clusters or []
+        clusters_b = user_b.taste_clusters or []
+
+        p_obj_a = next((p for p in clusters_a if p.get("id") == p_id_a), None) if p_id_a else None
+        p_obj_b = next((p for p in clusters_b if p.get("id") == p_id_b), None) if p_id_b else None
+
+        if p_obj_a and p_obj_b:
+            name_a = (user_a.name or "Você").split()[0]
+            name_b = (user_b.name or "Amigo").split()[0]
+            title_a = p_obj_a.get("name") or p_obj_a.get("title") or "Gosto A"
+            title_b = p_obj_b.get("name") or p_obj_b.get("title") or "Gosto B"
+            if title_a.lower() == title_b.lower():
+                shared_tags.insert(0, f"✨ Sintonia mútua: {title_a}")
+            else:
+                shared_tags.insert(0, f"✨ Sintonia: {title_a} ({name_a}) + {title_b} ({name_b})")
+
+        # Provedores de streaming BR disponíveis
+        br_providers = c.get("flatrate_providers_br") or c.get("watch_providers_br", [])
+        if br_providers:
+            shared_tags.append(f"📺 No {br_providers[0]} (BR)")
+
         # Priorização de obras no 'Quero Ver' de ambos os usuários (chave composta)
         cand_key = (c.get("media_type", "movie"), c.get("id"))
         is_in_both_watchlists = cand_key in in_both_watchlists
@@ -343,11 +368,28 @@ async def get_together_recommendations(
             "watched_by_user": c.get("_watched_by_user", False),
             "watched_by_friend": c.get("_watched_by_friend", False),
             "in_both_watchlists": is_in_both_watchlists,
+            "flatrate_providers_br": br_providers,
+            "watch_providers_br": br_providers,
+            "_candidate_vector": cand_vec,
+            "embedding": cand_emb,
+            "genre_ids": c.get("genre_ids", []),
         }
         scored_items.append(item_data)
 
-    # 8. Ordena priorizando obras no 'Quero Ver' de ambos e em seguida por Match Duplo decrescente
-    scored_items.sort(key=lambda x: (1 if x.get("in_both_watchlists") else 0, x["match_score"]), reverse=True)
+    # 8. Diversificação volumétrica com Fast Greedy DPP (< 2ms) + prioridade 'Quero Ver'
+    must_include = [it for it in scored_items if it.get("in_both_watchlists")]
+    must_include.sort(key=lambda x: x["match_score"], reverse=True)
+
+    other_items = [it for it in scored_items if not it.get("in_both_watchlists")]
+
+    dpp_target = max(0, limit - len(must_include))
+    dpp_selected = apply_fast_dpp_reranking(other_items, top_k=dpp_target, lambda_param=0.65) if (dpp_target > 0 and other_items) else []
+
+    final_items = must_include + dpp_selected
+
+    for it in final_items:
+        it.pop("_candidate_vector", None)
+        it.pop("embedding", None)
 
     return {
         "friend": {
@@ -355,6 +397,6 @@ async def get_together_recommendations(
             "name": user_b.name,
             "username": user_b.username,
         },
-        "items": scored_items[:limit],
-        "total": len(scored_items),
+        "items": final_items[:limit],
+        "total": len(final_items),
     }

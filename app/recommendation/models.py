@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Integer, DateTime, Boolean, ForeignKey, func, UniqueConstraint
+from sqlalchemy import Column, String, Integer, DateTime, Boolean, ForeignKey, func, UniqueConstraint, Float
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.core.database import Base
 
@@ -15,6 +15,8 @@ class UserRecommendation(Base):
     explore_items = Column(JSONB, nullable=False, default=list)
     upcoming_items = Column(JSONB, nullable=False, default=dict)
     personas_items = Column(JSONB, nullable=False, default=list)
+    recent_vibe_items = Column(JSONB, nullable=False, default=list)
+    impressions = Column(JSONB, nullable=False, default=dict)
     is_stale = Column(Boolean, nullable=False, default=True)
     last_generated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -45,3 +47,28 @@ class UserDismissedRecommendation(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "tmdb_id", "media_type", name="uq_user_dismissed_media"),
     )
+
+
+class RecommendationInteractionEvent(Base):
+    """
+    Coleta eventos leves e anonimizados de interação em /explore e carrosséis
+    (impressão em viewport, clique/detalhes, adição à lista, conclusão e dismiss)
+    para alimentar o treino do ranker LambdaMART sem viés de posição (Sub-etapa 6.1 + Ideia 10).
+    """
+    __tablename__ = "recommendation_interaction_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+    media_type = Column(String, nullable=False)
+    tmdb_id = Column(Integer, nullable=False, index=True)
+    event_type = Column(String, nullable=False, index=True)  # 'impression', 'click', 'add_to_list', 'completed_high', 'dismiss'
+    position = Column(Integer, nullable=True)
+    carousel_type = Column(String, nullable=True)  # 'explore', 'recent_vibe', 'persona', 'together'
+    score_presented = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+

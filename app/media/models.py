@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer, JSON, func, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, Integer, JSON, func, ForeignKey, UniqueConstraint, Float
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -26,6 +26,11 @@ class Media(Base):
     embedding = Column(JSON, nullable=True)
     release_date = Column(String, nullable=True)
     runtime = Column(Integer, nullable=True, default=0)
+    popularity = Column(Float, nullable=True, default=0.0)
+    vote_average = Column(Float, nullable=True, default=0.0)
+    vote_count = Column(Integer, nullable=True, default=0)
+    belongs_to_collection = Column(JSON, nullable=True)
+    watch_providers_br = Column(JSON, nullable=True, default=list)
     collection_tmdb_id = Column(Integer, nullable=True, index=True)
     collection_name = Column(String, nullable=True)
     universe_key = Column(String, nullable=True, index=True)

@@ -232,8 +232,10 @@ def compute_omnimatch_score(
         else:
             phi = aff_score
     elif active_personas and len(active_personas) > 1:
-        best_phi = -1.0
-        best_tags = []
+        # Multi-Persona: calcula potencial para cada cluster ativo e agrega via LogSumExp ponderado (Sub-etapa 3.3 / Ideia 7)
+        phi_items = []
+        tau = 0.08  # Temperatura para LogSumExp suave na escala 0-100
+
         for p in active_personas:
             p_vec = p.get("feature_vector") or user_vector
             p_emb = p.get("centroid_embedding") or user_embedding
@@ -247,13 +249,24 @@ def compute_omnimatch_score(
             else:
                 p_phi = p_aff
 
-            if p_phi > best_phi:
-                best_phi = p_phi
-                best_tags = p_tags
-                matched_persona = p
-                best_persona_id = p.get("id")
+            pi_k = float(p.get("pi_k") or (1.0 / len(active_personas)))
+            phi_items.append((p_phi, pi_k, p, p_tags))
 
-        phi = best_phi
+        # Encontra o cluster de maior afinidade absoluta
+        phi_items.sort(key=lambda x: x[0], reverse=True)
+        best_p_phi, best_pi, best_persona, best_tags = phi_items[0]
+        best_persona_id = best_persona.get("id")
+        matched_persona = best_persona
+
+        # Agregação LogSumExp Ponderada por pi_k:
+        # S_lse = M + (1/tau) * ln(sum_k (pi_k / sum_pi) * exp(tau * (phi_k - M)))
+        sum_pi = sum(item[1] for item in phi_items) or 1.0
+        M = best_p_phi
+        lse_inner = sum((item[1] / sum_pi) * math.exp(tau * (item[0] - M)) for item in phi_items)
+        lse_score = M + (1.0 / tau) * math.log(max(1e-9, lse_inner))
+
+        # Preserva a força do pico da persona principal
+        phi = max(lse_score, best_p_phi * 0.95)
         tags = best_tags
     else:
         aff_score, tags = calculate_match_score(user_vector, candidate_vector)
@@ -275,7 +288,8 @@ def compute_omnimatch_score(
             user_items=user_items or [],
             cand_emb=candidate_embedding,
             target_persona=matched_persona,
-            fallback_tags=tags
+            fallback_tags=tags,
+            candidate_vector=candidate_vector
         )
         if any(t.startswith("❤️") for t in rich_tags):
             phi = min(100.0, phi + 4.0)
@@ -460,6 +474,7 @@ def build_rich_explanation_tags(
     cand_emb: Optional[List[float]] = None,
     target_persona: Optional[Dict[str, Any]] = None,
     fallback_tags: Optional[List[str]] = None,
+    candidate_vector: Optional[Dict[str, float]] = None,
 ) -> List[str]:
     """
     Gera tags de explicabilidade ricas, humanas e contextuais para a recomendação:
@@ -571,13 +586,30 @@ def build_rich_explanation_tags(
                 rich_tags.append(f"🌟 Estrelado por {name}")
                 break
 
-    # 3. Associação à Persona / Faceta de Gosto
+    # 3. Associação à Persona / Faceta de Gosto com Gate Angular Estrito (Sub-etapa 3.3 / Ideia 7)
     if target_persona:
         from app.recommendation.cluster_manager import is_valid_persona_name
         p_name = (target_persona.get("name") or "").strip()
         p_emoji = target_persona.get("emoji", "✨")
         if p_name and is_valid_persona_name(p_name):
-            rich_tags.append(f"{p_emoji} Para sua faceta {p_name}")
+            # Limiar angular mínimo (theta_k - 25º percentil do cluster)
+            theta_k = float(target_persona.get("theta_k") or 0.55)
+            p_emb = target_persona.get("centroid_embedding")
+
+            allow_persona_tag = True
+            if cand_emb and p_emb:
+                angular_sim = calculate_cosine_similarity(cand_emb, p_emb)
+                if angular_sim < theta_k:
+                    allow_persona_tag = False  # Bloqueado pelo Gate Angular Estrito!
+            elif not cand_emb:
+                p_vec = target_persona.get("feature_vector") or {}
+                if p_vec and candidate_vector:
+                    cand_aff, _ = calculate_match_score(p_vec, candidate_vector)
+                    if cand_aff < 55.0:
+                        allow_persona_tag = False
+
+            if allow_persona_tag:
+                rich_tags.append(f"{p_emoji} Para sua faceta {p_name}")
 
     # 4. Microtemas / Vibe Narrativa a partir de keywords do candidato
     keywords = candidate.get("keywords_list") or candidate.get("keywords") or []

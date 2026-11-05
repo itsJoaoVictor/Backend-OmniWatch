@@ -42,6 +42,17 @@ class UndismissRecommendationRequest(BaseModel):
     tmdb_id: int
     media_type: Optional[str] = None
 
+class TelemetryEventItem(BaseModel):
+    tmdb_id: int
+    media_type: str = "movie"
+    event_type: str  # 'impression', 'click', 'add_to_list', 'completed_high', 'dismiss'
+    carousel_type: Optional[str] = "explore"
+    position: Optional[int] = 0
+    score_presented: Optional[float] = None
+
+class TelemetryBatchRequest(BaseModel):
+    events: List[TelemetryEventItem]
+
 async def _get_user_seen_tmdb_ids(db: AsyncSession, user_id: str) -> set:
     try:
         import uuid
@@ -105,6 +116,41 @@ async def get_explore_recommendations(
             if seen_ids:
                 raw = [it for it in raw if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
             return raw[:limit]
+
+        return items[:limit]
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
+
+@router.get("/explore/recent-vibe", response_model=List[Any])
+async def get_recent_vibe_endpoint(
+    background_tasks: BackgroundTasks,
+    limit: int = Query(20, ge=1, le=50),
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Retorna o carrossel 'Na Sua Vibe Recente' gerado pelo perfil Rocchio de memória curta (21 dias).
+    """
+    try:
+        record = await get_user_recommendations_record(db, current_user_id)
+        seen_ids = await _get_user_seen_tmdb_ids(db, current_user_id)
+
+        if not record or not getattr(record, "recent_vibe_items", None):
+            res = await compute_and_save_user_recommendations(current_user_id, force=True)
+            items = (res.get("recent_vibe_items") if res else [])
+        else:
+            items = record.recent_vibe_items or []
+            now = datetime.now(timezone.utc)
+            is_expired = (
+                record.last_generated_at is None
+                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
+            )
+            if record.is_stale or is_expired:
+                schedule_recommendation_computation(current_user_id)
+
+        if seen_ids and items:
+            items = [it for it in items if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
 
         return items[:limit]
     except Exception as e:
@@ -208,12 +254,14 @@ async def get_explore_feed(
         if not record or (not record.explore_items and not record.personas_items):
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
             explore = res.get("explore_items", []) if res else []
+            recent_vibe = res.get("recent_vibe_items", []) if res else []
             upcoming = res.get("upcoming_items", {}) if res else {"movies": [], "tv": []}
             personas = res.get("personas_items", []) if res else []
             is_stale = False
             last_gen = datetime.now(timezone.utc).isoformat()
         else:
             explore = record.explore_items
+            recent_vibe = getattr(record, "recent_vibe_items", []) or []
             upcoming = record.upcoming_items
             personas = record.personas_items
             is_stale = record.is_stale
@@ -229,6 +277,7 @@ async def get_explore_feed(
 
         if seen_ids:
             explore = [it for it in explore if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
+            recent_vibe = [it for it in recent_vibe if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
             new_personas = []
             for p in personas:
                 p_c = dict(p)
@@ -242,6 +291,7 @@ async def get_explore_feed(
 
         return {
             "explore": explore,
+            "recent_vibe": recent_vibe,
             "upcoming": upcoming,
             "personas": personas,
             "is_stale": is_stale,
@@ -328,8 +378,24 @@ async def get_item_score(
             user_items=user_list,
         )
 
+        final_score = omni["match_score"]
+        try:
+            from app.recommendation.ranker import LightGBMRanker
+            lgbm_ranker = LightGBMRanker()
+            if lgbm_ranker.is_ready():
+                final_score = lgbm_ranker.predict_score(
+                    user=user,
+                    candidate=candidate_obj,
+                    cand_emb=cand_emb,
+                    base_omnimatch=final_score,
+                    user_items=user_list,
+                    active_personas=active_personas,
+                )
+        except Exception:
+            pass
+
         return {
-            "match_score": omni["match_score"],
+            "match_score": final_score,
             "match_tags": omni["match_tags"],
             "is_preliminary": omni.get("is_preliminary", False),
         }
@@ -376,6 +442,44 @@ async def get_similar_users(
         logger.exception(e)
         raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
 
+@router.post("/events")
+async def record_recommendation_events(
+    payload: TelemetryBatchRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Coleta eventos de telemetria leve (impressions, clicks, add_to_list, dismiss)
+    para alimentar o treino do ranker LambdaMART sem viés de posição (Sub-etapa 6.1 + Ideia 10).
+    """
+    try:
+        import uuid
+        from app.recommendation.models import RecommendationInteractionEvent
+
+        u_uuid = uuid.UUID(current_user_id) if isinstance(current_user_id, str) else current_user_id
+        events_to_add = []
+        for ev in payload.events:
+            events_to_add.append(
+                RecommendationInteractionEvent(
+                    user_id=u_uuid,
+                    tmdb_id=ev.tmdb_id,
+                    media_type=ev.media_type or "movie",
+                    event_type=(ev.event_type or "impression").strip().lower(),
+                    carousel_type=ev.carousel_type or "explore",
+                    position=ev.position if ev.position is not None else 0,
+                    score_presented=ev.score_presented,
+                )
+            )
+
+        if events_to_add:
+            db.add_all(events_to_add)
+            await db.commit()
+
+        return {"status": "success", "recorded": len(events_to_add)}
+    except Exception as e:
+        logger.exception(f"Erro ao registrar eventos de telemetria: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao registrar eventos de telemetria.")
+
 @router.post("/dismiss")
 async def dismiss_recommendation_endpoint(
     payload: DismissRecommendationRequest,
@@ -396,6 +500,26 @@ async def dismiss_recommendation_endpoint(
             poster_path=payload.poster_path,
             days_snooze=payload.days_snooze or 180
         )
+
+        # Telemetria: registra evento de dismiss (Sub-etapa 6.1)
+        try:
+            import uuid
+            from app.recommendation.models import RecommendationInteractionEvent
+            u_uuid = uuid.UUID(current_user_id) if isinstance(current_user_id, str) else current_user_id
+            db.add(
+                RecommendationInteractionEvent(
+                    user_id=u_uuid,
+                    tmdb_id=payload.tmdb_id,
+                    media_type=payload.media_type or "movie",
+                    event_type="dismiss",
+                    carousel_type="explore",
+                    position=0,
+                )
+            )
+            await db.commit()
+        except Exception as te:
+            logger.warning(f"Erro ao registrar telemetria de dismiss: {te}")
+
         return {
             "status": "success",
             "message": "Recomendação dispensada com sucesso.",

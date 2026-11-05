@@ -1,13 +1,14 @@
 import json
 import re
+import math
 import logging
 import asyncio
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import httpx
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, HDBSCAN
 from sklearn.metrics import silhouette_score
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -17,6 +18,7 @@ from app.core.config import settings
 from app.users.models import User
 from app.tracking.services import get_user_list
 from app.recommendation.vector_builder import build_sparse_vector
+from app.recommendation.embeddings import get_or_fit_catalog_whitener
 
 logger = logging.getLogger(__name__)
 
@@ -263,10 +265,45 @@ Responda OBRIGATORIAMENTE em JSON puro como uma lista de objetos:
 ]
 """
 
+PERSONAS_BATCH_JSON_SCHEMA = {
+    "name": "personas_editorial_batch",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "personas": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "name": {
+                            "type": "string",
+                            "description": "Título editorial conciso em pt-BR com 3 a 5 palavras (ex: 'Universo Shonen Épico')"
+                        },
+                        "emoji": {
+                            "type": "string",
+                            "description": "1 único emoji representativo"
+                        },
+                        "tagline": {
+                            "type": "string",
+                            "description": "Frase curta sobre a vibe em pt-BR com até 60 caracteres"
+                        }
+                    },
+                    "required": ["id", "name", "emoji", "tagline"],
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["personas"],
+        "additionalProperties": False
+    }
+}
+
 async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
     """
     Envia todas as personas do usuário juntas em um único prompt para a LLM,
-    garantindo contraste semântico absoluto e zero repetição de títulos em Português do Brasil.
+    utilizando Structured Outputs nativo (json_schema) do OpenRouter sem CoT inline (Sub-etapa 3.4 / Ideia 8).
     """
     if not settings.OPENAI_API_KEY or not personas:
         return {}
@@ -285,7 +322,7 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
             f"- Total de obras: {p.get('item_count')}\n"
         )
 
-    prompt_user = "\n".join(prompt_parts) + "\nCrie o título editorial em Português do Brasil (pt-BR), emoji e tagline para cada Persona com contraste máximo em JSON."
+    prompt_user = "\n".join(prompt_parts) + "\nCrie o título editorial em Português do Brasil (pt-BR), emoji e tagline para cada Persona com contraste máximo em formato JSON conforme o schema estrito."
 
     payload = {
         "model": settings.OPENAI_MODEL,
@@ -293,8 +330,12 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
             {"role": "system", "content": PROMPT_BATCH_SYSTEM},
             {"role": "user", "content": prompt_user}
         ],
-        "temperature": 0.7,
-        "max_tokens": 2500
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": PERSONAS_BATCH_JSON_SCHEMA
+        },
+        "temperature": 0.3,
+        "max_tokens": 1500
     }
 
     headers = {
@@ -309,7 +350,7 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
             f"{settings.OPENAI_BASE_URL}/chat/completions",
             json=payload,
             headers=headers,
-            timeout=35.0
+            timeout=25.0
         )
         if resp.status_code != 200:
             logger.warning(f"OpenRouter LLM batch status {resp.status_code}: {resp.text}")
@@ -320,69 +361,35 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
         msg = choice.get("message", {})
         raw_content = (msg.get("content") or "").strip()
 
+        # Remove eventuais delimitadores markdown ```json ... ```
+        if raw_content.startswith("```"):
+            raw_content = re.sub(r"^```[a-zA-Z]*\n?", "", raw_content)
+            raw_content = re.sub(r"\n?```$", "", raw_content).strip()
+
         # Remove blocos de raciocínio <think>...</think> se o modelo retornado usar CoT inline
-        clean_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
-        if not clean_content:
-            clean_content = raw_content
+        raw_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
 
-        clean_content = clean_content.replace('“', '"').replace('”', '"').strip()
-        results_by_id = {}
-
-        # 1. Busca por lista JSON [...]
-        start_idx = clean_content.find("[")
-        end_idx = clean_content.rfind("]")
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_candidate = clean_content[start_idx:end_idx+1]
-            try:
-                parsed_list = json.loads(json_candidate)
-                if isinstance(parsed_list, list):
-                    for item in parsed_list:
-                        if isinstance(item, dict) and "id" in item:
-                            cand_name = item.get("name")
-                            if is_valid_persona_name(cand_name):
-                                results_by_id[item["id"]] = {
-                                    "name": cand_name.strip(),
-                                    "emoji": item.get("emoji", "✨"),
-                                    "tagline": item.get("tagline", "")
-                                }
-                    if len(results_by_id) == len(personas):
-                        return results_by_id
-            except Exception:
-                pass
-
-        # 2. Busca por objetos JSON individuais {"id": "persona_X", ...}
-        matches = re.findall(r'\{\s*"id"\s*:\s*"(persona_\d+)"\s*,\s*"name"\s*:\s*"([^"]+)"\s*,\s*"emoji"\s*:\s*"([^"]+)"(?:\s*,\s*"tagline"\s*:\s*"([^"]*)")?', clean_content)
-        for m in matches:
-            cand_name = m[1].strip()
-            if is_valid_persona_name(cand_name):
-                results_by_id[m[0]] = {
-                    "name": cand_name,
-                    "emoji": m[2],
-                    "tagline": m[3] if len(m) > 3 else ""
-                }
-
-        if len(results_by_id) >= len(personas):
-            return results_by_id
-
-        # 3. Fallback de texto estruturado APENAS se passar na validação estrita
-        text_matches = re.findall(
-            r'Persona[_\s]*(\d+)[:\s]+(?:[^\n]*\n)*?.*?name[:\s]+["\']?([^"\'\n\r]+)["\']?.*?emoji[:\s]+["\']?([^\s"\'\n\r]+)["\']?.*?tagline[:\s]+["\']?([^"\'\n\r]+)["\']?',
-            clean_content,
-            re.IGNORECASE | re.DOTALL
+        parsed_data = json.loads(raw_content)
+        items_list = (
+            parsed_data.get("personas", [])
+            if isinstance(parsed_data, dict)
+            else (parsed_data if isinstance(parsed_data, list) else [])
         )
-        for tm in text_matches:
-            p_id = f"persona_{tm[0]}"
-            cand_name = tm[1].strip()
-            if p_id not in results_by_id and is_valid_persona_name(cand_name):
-                results_by_id[p_id] = {
-                    "name": cand_name,
-                    "emoji": tm[2].strip(),
-                    "tagline": tm[3].strip()
-                }
+
+        results_by_id = {}
+        for item in items_list:
+            if isinstance(item, dict) and "id" in item:
+                cand_name = item.get("name")
+                if is_valid_persona_name(cand_name):
+                    results_by_id[item["id"]] = {
+                        "name": cand_name.strip(),
+                        "emoji": item.get("emoji", "✨").strip(),
+                        "tagline": (item.get("tagline") or "").strip()
+                    }
 
         return results_by_id
     except Exception as e:
-        logger.warning(f"Erro ao gerar titulos em lote via LLM: {e}")
+        logger.warning(f"Erro ao gerar títulos em lote via LLM Structured Outputs: {e}")
         return {}
 
 async def refine_user_clusters_llm_task(user_id: str):
@@ -477,30 +484,155 @@ async def refine_user_clusters_llm_task(user_id: str):
     except Exception as e:
         logger.error(f"[LLM PERSONAS] Erro na background task de refinamento em lote: {e}")
 
-def _find_best_kmeans_clusters(embeddings: np.ndarray, max_k: int, min_cluster_size: int):
-    best_k = 2
+def build_hybrid_cluster_vectors(
+    items_with_emb: List[Any],
+    whitener: Optional[Any] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Constrói o subespaço híbrido para clusterização (Ideia 6 / Sub-etapa 3.2):
+    - 70% embedding semântico isotropizado (Whitened + L2-normalized em RAM)
+    - 30% vetor TF-IDF de gêneros canônicos e cultura/idioma (L2-normalized)
+    Retorna (H, raw_embeddings) onde H tem shape (n_items, 256 + D_g) com norma 1.0.
+    """
+    from app.recommendation.vector_builder import normalize_genre_to_canonical
+
+    n_items = len(items_with_emb)
+    raw_embs = np.array([it.media.embedding for it in items_with_emb], dtype=np.float32)
+
+    # 1. 70% Espaço Semântico Isotropizado
+    if whitener is not None and getattr(whitener, "is_fitted", False):
+        Z = whitener.transform_batch(raw_embs)
+    else:
+        # Centering local + L2 normalization
+        mean_v = np.mean(raw_embs, axis=0, dtype=np.float64).astype(np.float32)
+        Z_c = raw_embs - mean_v
+        norms = np.linalg.norm(Z_c, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        Z = Z_c / norms
+
+    # 2. 30% Espaço Esparso TF-IDF de Gêneros Canônicos e Cultura
+    doc_freqs: Dict[str, int] = {}
+    item_feature_lists: List[List[str]] = []
+
+    for it in items_with_emb:
+        feats = set()
+        media = it.media
+        if media:
+            if media.genres:
+                for g in media.genres:
+                    for cg in normalize_genre_to_canonical(g):
+                        feats.add(f"genre_{cg}")
+            orig_lang = getattr(media, "original_language", "") or ""
+            if orig_lang:
+                feats.add(f"lang_{orig_lang.lower().strip()}")
+        item_feature_lists.append(list(feats))
+        for f in feats:
+            doc_freqs[f] = doc_freqs.get(f, 0) + 1
+
+    feature_index = {f: idx for idx, f in enumerate(sorted(doc_freqs.keys()))}
+    n_feats = max(1, len(feature_index))
+    G = np.zeros((n_items, n_feats), dtype=np.float32)
+
+    for i, feats in enumerate(item_feature_lists):
+        for f in feats:
+            idx = feature_index[f]
+            df = doc_freqs[f]
+            idf = math.log(1.0 + (n_items - df + 0.5) / (df + 0.5))
+            G[i, idx] = max(0.1, idf)
+
+    g_norms = np.linalg.norm(G, axis=1, keepdims=True)
+    g_norms[g_norms == 0] = 1.0
+    G_norm = G / g_norms
+
+    # 3. Concatenação Ponderada (70% denso / 30% esparso)
+    w_dense = math.sqrt(0.70)
+    w_sparse = math.sqrt(0.30)
+    H = np.hstack([w_dense * Z, w_sparse * G_norm])
+
+    h_norms = np.linalg.norm(H, axis=1, keepdims=True)
+    h_norms[h_norms == 0] = 1.0
+    H = (H / h_norms).astype(np.float32)
+
+    return H, raw_embs
+
+
+def _cluster_hybrid_representations(
+    H: np.ndarray,
+    item_weights: List[float],
+    n_items: int
+) -> Tuple[int, np.ndarray]:
+    """
+    Executa clusterização em subespaço híbrido utilizando HDBSCAN
+    com fallback para Spherical K-Means ponderado por sample_weight (Sub-etapa 3.2).
+    Retorna (k_clusters, labels) onde labels contém >= 0 para clusters principais
+    e -1 para outliers/exploração avulsa.
+    """
+    if n_items < 6:
+        return 1, np.zeros(n_items, dtype=int)
+
+    # 1. Tenta HDBSCAN
+    if n_items < 15:
+        min_cluster_size = max(3, n_items // 3)
+    elif n_items < 40:
+        min_cluster_size = max(3, n_items // 5)
+    else:
+        min_cluster_size = max(4, n_items // 8)
+
+    min_samples = max(2, min_cluster_size // 2)
+
+    try:
+        hdb = HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric="euclidean",
+            cluster_selection_method="eom"
+        )
+        labels = hdb.fit_predict(H)
+        valid_cids = [c for c in set(labels) if c >= 0]
+
+        # Se HDBSCAN encontrou entre 2 e 5 clusters consistentes
+        if len(valid_cids) >= 2:
+            # Se encontrou mais de 5 clusters, retém os 5 maiores e joga os demais para -1
+            if len(valid_cids) > 5:
+                counts = {cid: int(np.sum(labels == cid)) for cid in valid_cids}
+                top_5 = sorted(counts.keys(), key=lambda c: counts[c], reverse=True)[:5]
+                labels = np.array([lbl if lbl in top_5 else -1 for lbl in labels])
+                valid_cids = top_5
+
+            # Remapeia labels para 0, 1, ..., k-1 preservando -1
+            label_map = {old_id: new_id for new_id, old_id in enumerate(sorted(valid_cids))}
+            remap_labels = np.array([label_map[lbl] if lbl >= 0 else -1 for lbl in labels])
+            return len(valid_cids), remap_labels
+    except Exception as e:
+        logger.warning(f"[ClusterManager] HDBSCAN falhou ou não convergiu, usando Spherical K-Means: {e}")
+
+    # 2. Fallback: Spherical K-Means Ponderado por sample_weight
+    max_k = 2 if n_items < 12 else (3 if n_items < 30 else (4 if n_items < 80 else 5))
+    min_cluster_size_km = min(4, n_items // max_k)
+
+    best_k = 1
     best_score = -1.0
     best_labels = None
+    weights_arr = np.array(item_weights, dtype=np.float32)
 
     for cand_k in range(2, max_k + 1):
         km = KMeans(n_clusters=cand_k, random_state=42, n_init="auto")
-        labels_cand = km.fit_predict(embeddings)
-        
-        counts = [int(np.sum(labels_cand == c_idx)) for c_idx in range(cand_k)]
-        if any(cnt < min_cluster_size for cnt in counts):
+        cand_labels = km.fit_predict(H, sample_weight=weights_arr)
+        counts = [int(np.sum(cand_labels == c_idx)) for c_idx in range(cand_k)]
+        if any(cnt < min_cluster_size_km for cnt in counts):
             continue
 
-        score = float(silhouette_score(embeddings, labels_cand))
-
-        # Principio da Parcimonia (+0.015)
+        score = float(silhouette_score(H, cand_labels))
+        # Princípio da Parcimônia (+0.015)
         if best_labels is None or (score > best_score + 0.015):
             best_score = score
             best_k = cand_k
-            best_labels = labels_cand
+            best_labels = cand_labels
 
-    k = best_k if best_labels is not None else 1
-    labels = best_labels if best_labels is not None else np.zeros(len(embeddings), dtype=int)
-    return k, labels
+    if best_labels is not None:
+        return best_k, best_labels
+
+    return 1, np.zeros(n_items, dtype=int)
 
 
 async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Dict[str, Any]]:
@@ -542,31 +674,25 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
             "sample_titles": [m.title for m in all_media[:5]],
             "centroid_embedding": centroid,
             "feature_vector": user.feature_vector or build_cluster_feature_vector(all_media),
+            "theta_k": 0.50,
+            "pi_k": 1.0,
             "llm_enhanced": False
         }]
         user.taste_clusters = single_cluster
         await db.commit()
         return single_cluster
 
-    embeddings = np.array([it.media.embedding for it in items_with_emb])
+    # Obtém o whitener global ajustado sobre o catálogo (Sub-etapa 3.1)
+    catalog_whitener = await get_or_fit_catalog_whitener(db, target_dim=256)
 
-    if n_items < 6:
-        k = 1
-        labels = np.zeros(n_items, dtype=int)
-    else:
-        if n_items < 12:
-            max_k = 2
-        elif n_items < 30:
-            max_k = 3
-        elif n_items < 80:
-            max_k = 4
-        else:
-            max_k = 5
-        min_cluster_size = min(5, n_items // max_k)
+    # Constrói o subespaço híbrido: 70% denso isotropizado + 30% esparso TF-IDF (Sub-etapa 3.2)
+    H, raw_embs = build_hybrid_cluster_vectors(items_with_emb, whitener=catalog_whitener)
+    item_weights = [_get_cluster_item_weight(it) for it in items_with_emb]
 
-        k, labels = await asyncio.to_thread(
-            _find_best_kmeans_clusters, embeddings, max_k, min_cluster_size
-        )
+    # Clusterização HDBSCAN com fallback para Spherical K-Means
+    k, labels = await asyncio.to_thread(
+        _cluster_hybrid_representations, H, item_weights, n_items
+    )
 
     clusters_list = []
     has_pending_llm = False
@@ -578,19 +704,29 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
 
         cluster_items = [items_with_emb[i] for i in indices]
         cluster_media = [it.media for it in cluster_items]
-        item_weights = [_get_cluster_item_weight(it) for it in cluster_items]
+        c_weights = [item_weights[i] for i in indices]
         meta = generate_persona_metadata(cluster_media)
 
-        cluster_embs = embeddings[indices]
-        centroid_vec = np.average(cluster_embs, axis=0, weights=item_weights)
+        cluster_raw_embs = raw_embs[indices]
+        centroid_vec = np.average(cluster_raw_embs, axis=0, weights=c_weights)
         norm = np.linalg.norm(centroid_vec)
         if norm > 0:
             centroid_vec = centroid_vec / norm
 
-        feature_vector = build_cluster_feature_vector(cluster_media, weights=item_weights)
-        # Prioriza obras reassistidas/favoritadas nos exemplos da Persona
+        feature_vector = build_cluster_feature_vector(cluster_media, weights=c_weights)
         sorted_for_sample = sorted(cluster_items, key=lambda it: _get_cluster_item_weight(it), reverse=True)
         sample_titles = [it.media.title for it in sorted_for_sample[:5]]
+
+        # Calcula o Limiar Angular Mínimo (theta_k - 25º percentil interno) e Proporção (pi_k) (Sub-etapa 3.3)
+        cosines = [float(np.dot(centroid_vec, raw_embs[i])) for i in indices]
+        if len(cosines) >= 4:
+            theta_k = float(np.percentile(cosines, 25))
+        elif cosines:
+            theta_k = float(np.min(cosines))
+        else:
+            theta_k = 0.55
+        theta_k = max(0.40, min(0.75, theta_k))
+        pi_k = float(len(indices) / n_items)
 
         candidate_cluster = {
             "id": f"persona_{cluster_idx}",
@@ -602,6 +738,8 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
             "sample_titles": sample_titles,
             "centroid_embedding": centroid_vec.tolist(),
             "feature_vector": feature_vector,
+            "theta_k": round(theta_k, 4),
+            "pi_k": round(pi_k, 4),
             "llm_enhanced": False
         }
 

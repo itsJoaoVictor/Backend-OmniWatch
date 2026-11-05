@@ -1,14 +1,152 @@
+import asyncio
+import logging
+import time
 import uuid
 from typing import List, Dict, Any, Set, Optional, Tuple, Union
+import numpy as np
+import scipy.sparse as sp
+import implicit
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from sklearn.feature_extraction import DictVectorizer
-from sklearn.neighbors import NearestNeighbors
-import numpy as np
 
 from app.users.models import User
 from app.tracking.models import UserListItem
+from app.media.models import Media
+
+logger = logging.getLogger(__name__)
+
+# Cache do modelo ALS em memória
+_ALS_LOCK = asyncio.Lock()
+_ALS_MODEL: Optional[implicit.als.AlternatingLeastSquares] = None
+_USER_ITEM_MATRIX: Optional[sp.csr_matrix] = None
+_USER_MAP: Dict[uuid.UUID, int] = {}
+_REVERSE_USER_MAP: Dict[int, uuid.UUID] = {}
+_ITEM_MAP: Dict[Tuple[str, int], int] = {}
+_REVERSE_ITEM_MAP: Dict[int, Tuple[str, int]] = {}
+_LAST_ALS_FIT_TIME: float = 0.0
+_ALS_TTL_SECONDS: float = 900.0  # 15 minutos
+
+
+def invalidate_als_cache():
+    """Invalida o cache do modelo ALS para retreino na próxima chamada."""
+    global _ALS_MODEL, _USER_ITEM_MATRIX, _USER_MAP, _REVERSE_USER_MAP, _ITEM_MAP, _REVERSE_ITEM_MAP, _LAST_ALS_FIT_TIME
+    _ALS_MODEL = None
+    _USER_ITEM_MATRIX = None
+    _USER_MAP = {}
+    _REVERSE_USER_MAP = {}
+    _ITEM_MAP = {}
+    _REVERSE_ITEM_MAP = {}
+    _LAST_ALS_FIT_TIME = 0.0
+
+
+async def _get_or_train_als_model(db: AsyncSession) -> Tuple[
+    Optional[implicit.als.AlternatingLeastSquares],
+    Optional[sp.csr_matrix],
+    Dict[uuid.UUID, int],
+    Dict[int, Tuple[str, int]]
+]:
+    """
+    Treina ou recupera o modelo ALS de fatoração matricial implícita (Sub-etapa 5.2 + Ideia 9)
+    ponderado pela confiança dos sinais implícitos/explícitos dos usuários:
+      c_{ui} = 1 + alpha * r_{ui}
+    """
+    global _ALS_MODEL, _USER_ITEM_MATRIX, _USER_MAP, _REVERSE_USER_MAP, _ITEM_MAP, _REVERSE_ITEM_MAP, _LAST_ALS_FIT_TIME
+
+    now = time.time()
+    if _ALS_MODEL is not None and (now - _LAST_ALS_FIT_TIME) < _ALS_TTL_SECONDS:
+        return _ALS_MODEL, _USER_ITEM_MATRIX, _USER_MAP, _REVERSE_ITEM_MAP
+
+    async with _ALS_LOCK:
+        if _ALS_MODEL is not None and (now - _LAST_ALS_FIT_TIME) < _ALS_TTL_SECONDS:
+            return _ALS_MODEL, _USER_ITEM_MATRIX, _USER_MAP, _REVERSE_ITEM_MAP
+
+        # Carrega todas as interações de listas no banco
+        stmt = (
+            select(
+                UserListItem.user_id,
+                Media.media_type,
+                Media.tmdb_id,
+                UserListItem.rating,
+                UserListItem.status,
+                UserListItem.is_favorite,
+                UserListItem.rewatch_count
+            )
+            .join(Media, UserListItem.media_id == Media.id)
+        )
+        res = await db.execute(stmt)
+        rows = res.all()
+
+        if not rows:
+            return None, None, {}, {}
+
+        user_ids = sorted(list(set(r[0] for r in rows if r[0])))
+        item_keys = sorted(list(set((r[1] or "movie", r[2]) for r in rows if r[2])))
+
+        if not user_ids or not item_keys:
+            return None, None, {}, {}
+
+        user_map = {uid: i for i, uid in enumerate(user_ids)}
+        rev_user_map = {i: uid for uid, i in user_map.items()}
+        item_map = {k: j for j, k in enumerate(item_keys)}
+        rev_item_map = {j: k for k, j in item_map.items()}
+
+        rows_idx = []
+        cols_idx = []
+        data = []
+
+        alpha_weight = 40.0
+        for uid, mtype, tmdb_id, rating, status, is_fav, rewatch_cnt in rows:
+            if not uid or not tmdb_id:
+                continue
+            u_i = user_map[uid]
+            i_j = item_map[(mtype or "movie", tmdb_id)]
+
+            # Cálculo de afinidade r_{ui} e confiança c_{ui} = 1 + alpha * r_{ui}
+            r_ui = 0.5  # Base de interação neutra
+            if rating:
+                r_ui = max(0.1, float(rating) / 2.5)
+            elif status == "completed":
+                r_ui = 1.2
+            elif status == "watching":
+                r_ui = 1.0
+
+            if is_fav:
+                r_ui += 1.5
+            if rewatch_cnt:
+                r_ui += min(2.0, (rewatch_cnt or 0) * 0.5)
+
+            conf = 1.0 + (alpha_weight * r_ui)
+
+            rows_idx.append(u_i)
+            cols_idx.append(i_j)
+            data.append(conf)
+
+        user_item_matrix = sp.csr_matrix((data, (rows_idx, cols_idx)), shape=(len(user_ids), len(item_keys)))
+
+        try:
+            # Treina ALS com 32 fatores latentes e regularização L2
+            model = implicit.als.AlternatingLeastSquares(
+                factors=32,
+                regularization=0.05,
+                iterations=15,
+                random_state=42
+            )
+            model.fit(user_item_matrix, show_progress=False)
+
+            _ALS_MODEL = model
+            _USER_ITEM_MATRIX = user_item_matrix
+            _USER_MAP = user_map
+            _REVERSE_USER_MAP = rev_user_map
+            _ITEM_MAP = item_map
+            _REVERSE_ITEM_MAP = rev_item_map
+            _LAST_ALS_FIT_TIME = now
+            logger.info(f"[ALS] Modelo treinado com sucesso: {len(user_ids)} usuários, {len(item_keys)} obras.")
+            return _ALS_MODEL, _USER_ITEM_MATRIX, _USER_MAP, _REVERSE_ITEM_MAP
+        except Exception as e:
+            logger.error(f"[ALS] Falha ao treinar modelo ALS: {e}")
+            return None, None, {}, {}
 
 
 async def find_similar_users(
@@ -18,93 +156,50 @@ async def find_similar_users(
     min_similarity: float = 0.20
 ) -> List[Dict[str, Any]]:
     """
-    Encontra os usuários mais parecidos com o usuário alvo com base em seus feature_vectors,
-    usando DictVectorizer e NearestNeighbors (métrica cosine) do scikit-learn.
-
-    Retorna uma lista ordenada com os usuários similares e suas métricas de afinidade.
-    Garante isolamento: apenas ID e métricas gerais transitam.
+    Encontra os usuários mais parecidos utilizando as representações latentes do modelo ALS
+    (ou fallback de sobreposição esparsa).
     """
     try:
-        target_uuid = uuid.UUID(target_user_id)
+        target_uuid = uuid.UUID(str(target_user_id))
     except (ValueError, TypeError):
         return []
 
-    # 1. Carrega todos os usuários que possuem feature_vector cadastrado
-    result = await db.execute(
-        select(User).where(User.feature_vector != None)
-    )
-    all_users = result.scalars().all()
-
-    target_user = None
-    peer_users = []
-
-    for u in all_users:
-        if u.id == target_uuid:
-            target_user = u
-        else:
-            if u.feature_vector and len(u.feature_vector) > 0:
-                peer_users.append(u)
-
-    if not target_user or not target_user.feature_vector or not peer_users:
+    model, user_item_matrix, user_map, _ = await _get_or_train_als_model(db)
+    if model is None or target_uuid not in user_map:
         return []
 
-    # 2. Converte os dicionários esparsos heterogêneos em uma matriz comum
-    # DictVectorizer(sparse=True) mapeia todas as chaves (ex: 'genre_ação', 'cast_chris_evans')
-    # para colunas numéricas de forma altamente eficiente em memória.
-    vectorizer = DictVectorizer(sparse=True)
+    target_idx = user_map[target_uuid]
+    user_factors = model.user_factors
+    target_factor = user_factors[target_idx]
 
-    # Ajusta o vocabulário com todos os usuários (alvo + pares)
-    all_vectors = [target_user.feature_vector] + [p.feature_vector for p in peer_users]
-    matrix = vectorizer.fit_transform(all_vectors)
+    # Similaridade cosseno entre os fatores latentes de todos os usuários
+    norms = np.linalg.norm(user_factors, axis=1)
+    target_norm = np.linalg.norm(target_factor)
+    if target_norm == 0 or np.any(norms == 0):
+        norms[norms == 0] = 1.0
 
-    target_matrix_vector = matrix[0]
-    peer_matrix = matrix[1:]
+    dot_prods = np.dot(user_factors, target_factor)
+    sims = dot_prods / (norms * (target_norm or 1.0))
 
-    # 3. Treina o modelo NearestNeighbors com distância cosseno
-    k = min(n_neighbors, len(peer_users))
-    if k == 0:
-        return []
-
-    nn = NearestNeighbors(n_neighbors=k, metric="cosine", algorithm="brute")
-    nn.fit(peer_matrix)
-
-    distances, indices = nn.kneighbors(target_matrix_vector)
-
+    ranked_indices = np.argsort(-sims)
     similar_users = []
-    for dist, idx in zip(distances[0], indices[0]):
-        # Distância cosseno d varia de 0 (idêntico) a 2 (oposto).
-        # Similaridade cosseno s = 1 - d
-        similarity = float(1.0 - dist)
 
-        if similarity >= min_similarity:
-            peer = peer_users[idx]
-
-            # Identifica interesses comuns de alto peso para explicabilidade/debug
-            shared_interests = []
-            target_vec = target_user.feature_vector
-            peer_vec = peer.feature_vector
-
-            for key, t_val in target_vec.items():
-                if key in peer_vec and t_val > 0 and peer_vec[key] > 0:
-                    clean_name = (
-                        key.replace("genre_", "")
-                        .replace("cast_", "")
-                        .replace("director_", "")
-                        .replace("keyword_", "")
-                    )
-                    score = min(t_val, peer_vec[key])
-                    shared_interests.append((clean_name, score))
-
-            shared_interests.sort(key=lambda x: x[1], reverse=True)
-            top_shared = [x[0] for x in shared_interests[:5]]
-
+    for idx in ranked_indices:
+        if idx == target_idx:
+            continue
+        sim_val = float(sims[idx])
+        if sim_val < min_similarity:
+            continue
+        peer_uuid = _REVERSE_USER_MAP.get(idx)
+        if peer_uuid:
             similar_users.append({
-                "user_id": str(peer.id),
-                "similarity": round(similarity, 3),
-                "shared_interests": top_shared
+                "user_id": str(peer_uuid),
+                "similarity": round(sim_val, 3),
+                "shared_interests": []
             })
+            if len(similar_users) >= n_neighbors:
+                break
 
-    similar_users.sort(key=lambda x: x["similarity"], reverse=True)
     return similar_users
 
 
@@ -112,103 +207,127 @@ async def fetch_collaborative_candidates(
     db: AsyncSession,
     target_user_id: str,
     seen_media_keys: Optional[Union[Set[Tuple[str, int]], Set[int]]] = None,
-    limit: int = 15,
-    min_similarity: float = 0.20,
+    limit: int = 60,
+    min_similarity: float = 0.15,
     seen_tmdb_ids: Optional[Set[int]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Busca obras bem avaliadas ou concluídas por usuários com gostos parecidos,
-    que o usuário alvo ainda não assistiu nem adicionou à lista.
-    Usa chave canônica (media_type, tmdb_id) para evitar colisões entre filmes e séries.
-
-    Garante isolamento total:
-    - Nenhum dado pessoal, notas ou avaliações de outros usuários vazam.
-    - Apenas os metadados da obra (Media) são retornados formatados como candidatos
-      para o orquestrador ranquear com o perfil do próprio usuário.
+    Canal 3 de Recuperação Colaborativa Implícita (Sub-etapa 5.2 + Ideia 9):
+    Gera recomendações a partir da fatoração matricial ALS (implicit), capturando
+    correlações latentes ("quem amou X também amou Y") e descobrindo 'hidden gems'.
     """
     effective_seen_keys = seen_media_keys if seen_media_keys is not None else (seen_tmdb_ids or set())
 
-    similar_users = await find_similar_users(
-        db, target_user_id, n_neighbors=5, min_similarity=min_similarity
-    )
-
-    if not similar_users:
+    try:
+        target_uuid = uuid.UUID(str(target_user_id))
+    except (ValueError, TypeError):
         return []
 
-    # Mapa de pesos por similaridade
-    user_weight_map = {u["user_id"]: u["similarity"] for u in similar_users}
-    peer_uuids = [uuid.UUID(u["user_id"]) for u in similar_users]
+    model, user_item_matrix, user_map, rev_item_map = await _get_or_train_als_model(db)
+    if model is None or not rev_item_map:
+        return []
 
-    # Busca os itens da lista desses usuários vizinhos que foram bem avaliados
-    # (rating >= 3.5 ou status 'completed')
-    result = await db.execute(
-        select(UserListItem)
-        .where(
-            UserListItem.user_id.in_(peer_uuids),
-            (UserListItem.rating >= 3.5) | (UserListItem.status == "completed")
-        )
-        .options(selectinload(UserListItem.media))
+    recommended_keys_with_score: List[Tuple[Tuple[str, int], float]] = []
+
+    if target_uuid in user_map and user_item_matrix is not None:
+        target_idx = user_map[target_uuid]
+        try:
+            ids, scores = model.recommend(
+                target_idx,
+                user_item_matrix[target_idx],
+                N=limit * 2,
+                filter_already_liked_items=True
+            )
+            for item_idx, score in zip(ids, scores):
+                m_key = rev_item_map.get(int(item_idx))
+                if m_key and m_key not in effective_seen_keys:
+                    recommended_keys_with_score.append((m_key, float(score)))
+        except Exception as e:
+            logger.warning(f"[ALS] Erro no recommend direto: {e}")
+
+    # Fallback para cold-start (usuário novo sem interações prévias no treino):
+    # Usa similaridade Item-Item ALS a partir das obras positivas da lista do usuário
+    if len(recommended_keys_with_score) < limit:
+        try:
+            user_items_stmt = select(UserListItem.media_id, UserListItem.rating).where(
+                UserListItem.user_id == target_uuid
+            )
+            ui_res = await db.execute(user_items_stmt)
+            liked_media_ids = [r[0] for r in ui_res.all() if (r[1] is None or r[1] >= 3.0)]
+
+            if liked_media_ids:
+                media_stmt = select(Media.media_type, Media.tmdb_id).where(Media.id.in_(liked_media_ids))
+                m_res = await db.execute(media_stmt)
+                user_seed_keys = [(r[0] or "movie", r[1]) for r in m_res.all() if r[1]]
+
+                # Mapeia para índices do modelo
+                seed_indices = [_ITEM_MAP[k] for k in user_seed_keys if k in _ITEM_MAP]
+                if seed_indices:
+                    sim_ids, sim_scores = model.similar_items(seed_indices[:3], N=limit)
+                    if sim_ids.ndim == 2:
+                        for row_ids, row_scs in zip(sim_ids, sim_scores):
+                            for s_id, s_sc in zip(row_ids, row_scs):
+                                m_k = rev_item_map.get(int(s_id))
+                                if m_k and m_k not in effective_seen_keys:
+                                    recommended_keys_with_score.append((m_k, float(s_sc)))
+                    else:
+                        for s_id, s_sc in zip(sim_ids, sim_scores):
+                            m_k = rev_item_map.get(int(s_id))
+                            if m_k and m_k not in effective_seen_keys:
+                                recommended_keys_with_score.append((m_k, float(s_sc)))
+        except Exception as e:
+            logger.warning(f"[ALS] Erro no item-to-item fallback: {e}")
+
+    if not recommended_keys_with_score:
+        return []
+
+    # Desduplica mantendo o maior score colaborativo
+    best_collab: Dict[Tuple[str, int], float] = {}
+    for k, sc in recommended_keys_with_score:
+        if k not in best_collab or sc > best_collab[k]:
+            best_collab[k] = sc
+
+    sorted_keys = sorted(best_collab.keys(), key=lambda k: best_collab[k], reverse=True)[:limit]
+    if not sorted_keys:
+        return []
+
+    # Carrega metadados completos de Media no banco
+    tmdb_ids = [k[1] for k in sorted_keys]
+    media_records = await db.execute(
+        select(Media).where(Media.tmdb_id.in_(tmdb_ids))
     )
-    list_items = result.scalars().all()
+    media_by_key = {(m.media_type or "movie", m.tmdb_id): m for m in media_records.scalars().all()}
 
-    # Agrupa obras candidatas e calcula pontuação colaborativa inicial usando chave canônica
-    candidate_scores: Dict[Tuple[str, int], float] = {}
-    media_map: Dict[Tuple[str, int], Any] = {}
-
-    for item in list_items:
-        media = item.media
-        if not media or not media.tmdb_id:
+    candidates: List[Dict[str, Any]] = []
+    for k in sorted_keys:
+        m = media_by_key.get(k)
+        if not m:
             continue
-
-        m_key = (media.media_type or "movie", media.tmdb_id)
-
-        # Não recomenda obras que o usuário alvo já assistiu/adicionou
-        if m_key in effective_seen_keys or media.tmdb_id in effective_seen_keys:
-            continue
-
-        peer_sim = user_weight_map.get(str(item.user_id), 0.5)
-        # Nota relativa (ou 0.8 se não tiver nota explícita mas estiver completed)
-        rating_factor = (item.rating / 5.0) if item.rating else 0.8
-        fav_factor = 1.35 if getattr(item, "is_favorite", False) else 1.0
-        rewatch_cnt = getattr(item, "rewatch_count", 0) or 0
-        rewatch_factor = (1.0 + min(0.30 * rewatch_cnt, 0.75)) if rewatch_cnt > 0 else 1.0
-        item_score = peer_sim * rating_factor * fav_factor * rewatch_factor
-
-        candidate_scores[m_key] = candidate_scores.get(m_key, 0.0) + item_score
-        media_map[m_key] = media
-
-    # Ordena pelo score colaborativo
-    sorted_media_keys = sorted(
-        candidate_scores.keys(),
-        key=lambda k: candidate_scores[k],
-        reverse=True
-    )
-
-    candidates = []
-    for m_key in sorted_media_keys[:limit]:
-        media = media_map[m_key]
 
         genre_ids = []
-        if media.genres:
-            for g in media.genres:
+        if m.genres and isinstance(m.genres, list):
+            for g in m.genres:
                 if isinstance(g, dict) and "id" in g:
                     genre_ids.append(g["id"])
 
-        candidate = {
-            "id": media.tmdb_id,
-            "title": media.title,
-            "media_type": media.media_type,
-            "poster_path": media.poster_path,
-            "backdrop_path": media.backdrop_path,
+        c = {
+            "id": m.tmdb_id,
+            "title": m.title,
+            "media_type": m.media_type or "movie",
+            "poster_path": m.poster_path,
+            "backdrop_path": m.backdrop_path,
+            "genres": m.genres or [],
             "genre_ids": genre_ids,
-            "genres": media.genres or [],
-            "cast": media.main_cast or [],
-            "crew": media.directors or [],
-            "keywords_list": media.keywords or [],
-            "original_language": media.original_language or "",
-            "collaborative": True,  # Identificador interno de origem colaborativa
-            "collaborative_score": round(candidate_scores[m_key], 2)
+            "cast": m.main_cast or [],
+            "crew": m.directors or [],
+            "keywords_list": m.keywords or [],
+            "original_language": m.original_language or "",
+            "release_date": m.release_date or "",
+            "embedding": m.embedding,
+            "collaborative": True,
+            "collaborative_score": round(float(best_collab[k]), 4),
+            "match_tags": ["✨ Descoberta Colaborativa"],
         }
-        candidates.append(candidate)
+        candidates.append(c)
 
     return candidates

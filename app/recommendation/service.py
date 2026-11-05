@@ -56,6 +56,8 @@ async def mark_user_recommendations_stale(
                 explore_items=[],
                 upcoming_items={},
                 personas_items=[],
+                recent_vibe_items=[],
+                impressions={},
                 is_stale=True,
                 last_generated_at=None,
             )
@@ -133,6 +135,26 @@ async def eject_media_from_user_recommendations(
             record.personas_items = new_personas
             flag_modified(record, "personas_items")
             modified = True
+
+        # 4. Remove de recent_vibe_items
+        if getattr(record, "recent_vibe_items", None):
+            orig_len = len(record.recent_vibe_items)
+            filtered_vibe = [it for it in record.recent_vibe_items if not _matches(it)]
+            if len(filtered_vibe) != orig_len:
+                record.recent_vibe_items = filtered_vibe
+                flag_modified(record, "recent_vibe_items")
+                modified = True
+
+        # 5. Remove de impressions se presente
+        if getattr(record, "impressions", None):
+            imp_copy = dict(record.impressions)
+            keys_to_del = [k for k in imp_copy if (k == str(tmdb_id) or k.endswith(f":{tmdb_id}"))]
+            if keys_to_del:
+                for k in keys_to_del:
+                    imp_copy.pop(k, None)
+                record.impressions = imp_copy
+                flag_modified(record, "impressions")
+                modified = True
 
         if modified:
             record.is_stale = True
@@ -256,11 +278,22 @@ async def compute_and_save_user_recommendations(
 
             logger.info(f"[RECS-SERVICE] Iniciando geração completa de recomendações para o usuário {user_id_str}...")
 
+            current_impressions = dict(record.impressions or {}) if record else {}
+
             try:
-                explore_data = await get_personalized_recommendations(session, user_id_str, top_k=50)
+                explore_data = await get_personalized_recommendations(
+                    session, user_id_str, top_k=50, impressions_map=current_impressions
+                )
             except Exception as e:
                 logger.error(f"[RECS-SERVICE] Erro ao gerar explore_recommendations para {user_id_str}: {e}")
                 explore_data = record.explore_items if record else []
+
+            try:
+                from app.recommendation.orchestrator import get_recent_vibe_recommendations
+                recent_vibe_data = await get_recent_vibe_recommendations(session, user_id_str, top_k=20)
+            except Exception as e:
+                logger.error(f"[RECS-SERVICE] Erro ao gerar recent_vibe_recommendations para {user_id_str}: {e}")
+                recent_vibe_data = getattr(record, "recent_vibe_items", []) if record else []
 
             try:
                 upcoming_data = await get_upcoming_recommendations(session, user_id_str, top_k_per_type=20)
@@ -274,6 +307,20 @@ async def compute_and_save_user_recommendations(
                 logger.error(f"[RECS-SERVICE] Erro ao gerar persona_recommendations para {user_id_str}: {e}")
                 personas_data = record.personas_items if record else []
 
+            # Atualiza mapa de impressões para os itens da vitrine explore (top 30)
+            new_impressions = dict(current_impressions)
+            for it in (explore_data or [])[:30]:
+                it_type = it.get("media_type", "movie")
+                it_id = it.get("id") or it.get("tmdb_id")
+                if it_id:
+                    k = f"{it_type}:{it_id}"
+                    new_impressions[k] = new_impressions.get(k, 0) + 1
+
+            # Limita tamanho do dicionário de impressões para não inflar o JSONB indefinidamente
+            if len(new_impressions) > 250:
+                sorted_imps = sorted(new_impressions.items(), key=lambda x: x[1], reverse=True)
+                new_impressions = dict(sorted_imps[:200])
+
             # Salva na tabela
             if record is None:
                 record = UserRecommendation(
@@ -281,6 +328,8 @@ async def compute_and_save_user_recommendations(
                     explore_items=explore_data,
                     upcoming_items=upcoming_data,
                     personas_items=personas_data,
+                    recent_vibe_items=recent_vibe_data,
+                    impressions=new_impressions,
                     is_stale=False,
                     last_generated_at=now,
                 )
@@ -289,11 +338,15 @@ async def compute_and_save_user_recommendations(
                 record.explore_items = explore_data
                 record.upcoming_items = upcoming_data
                 record.personas_items = personas_data
+                record.recent_vibe_items = recent_vibe_data
+                record.impressions = new_impressions
                 record.is_stale = False
                 record.last_generated_at = now
                 flag_modified(record, "explore_items")
                 flag_modified(record, "upcoming_items")
                 flag_modified(record, "personas_items")
+                flag_modified(record, "recent_vibe_items")
+                flag_modified(record, "impressions")
 
             await session.commit()
             logger.info(f"[RECS-SERVICE] Recomendações atualizadas e persistidas com sucesso no banco para {user_id_str}.")
@@ -302,6 +355,7 @@ async def compute_and_save_user_recommendations(
                 "explore_items": record.explore_items,
                 "upcoming_items": record.upcoming_items,
                 "personas_items": record.personas_items,
+                "recent_vibe_items": record.recent_vibe_items,
             }
 
     except Exception as e:
