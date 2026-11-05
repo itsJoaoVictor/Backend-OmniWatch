@@ -563,22 +563,24 @@ def _cluster_hybrid_representations(
 ) -> Tuple[int, np.ndarray]:
     """
     Executa clusterização em subespaço híbrido utilizando HDBSCAN
-    com fallback para Spherical K-Means ponderado por sample_weight (Sub-etapa 3.2).
-    Retorna (k_clusters, labels) onde labels contém >= 0 para clusters principais
-    e -1 para outliers/exploração avulsa.
+    com reatribuição de ruído e fallback para Spherical K-Means ponderado por sample_weight (Sub-etapa 3.2).
+    Garante que itens válidos da biblioteca não sejam descartados como ruído (-1)
+    e evita o colapso artificial em k=2 para usuários com bibliotecas ricas (>= 40 itens).
     """
     if n_items < 6:
         return 1, np.zeros(n_items, dtype=int)
 
-    # 1. Tenta HDBSCAN
+    # 1. Configuração adaptativa do HDBSCAN
     if n_items < 15:
         min_cluster_size = max(3, n_items // 3)
     elif n_items < 40:
-        min_cluster_size = max(3, n_items // 5)
+        min_cluster_size = max(4, n_items // 5)
+    elif n_items < 100:
+        min_cluster_size = max(5, n_items // 8)
     else:
-        min_cluster_size = max(4, n_items // 8)
+        min_cluster_size = max(8, min(18, n_items // 15))
 
-    min_samples = max(2, min_cluster_size // 2)
+    min_samples = max(2, min(4, min_cluster_size // 3))
 
     try:
         hdb = HDBSCAN(
@@ -590,25 +592,32 @@ def _cluster_hybrid_representations(
         labels = hdb.fit_predict(H)
         valid_cids = [c for c in set(labels) if c >= 0]
 
-        # Se HDBSCAN encontrou entre 2 e 5 clusters consistentes
-        if len(valid_cids) >= 2:
-            # Se encontrou mais de 5 clusters, retém os 5 maiores e joga os demais para -1
+        min_expected_k = 3 if n_items >= 50 else 2
+        if len(valid_cids) >= min_expected_k:
             if len(valid_cids) > 5:
                 counts = {cid: int(np.sum(labels == cid)) for cid in valid_cids}
                 top_5 = sorted(counts.keys(), key=lambda c: counts[c], reverse=True)[:5]
                 labels = np.array([lbl if lbl in top_5 else -1 for lbl in labels])
                 valid_cids = top_5
 
-            # Remapeia labels para 0, 1, ..., k-1 preservando -1
+            # Reatribui pontos de ruído (-1) ao centroide válido mais próximo para que nenhuma obra seja descartada
+            noise_mask = (labels == -1)
+            if np.any(noise_mask):
+                centroids = np.array([np.mean(H[labels == cid], axis=0) for cid in valid_cids])
+                noise_H = H[noise_mask]
+                dists = np.linalg.norm(noise_H[:, np.newaxis, :] - centroids[np.newaxis, :, :], axis=2)
+                nearest_cluster_idx = np.argmin(dists, axis=1)
+                labels[noise_mask] = np.array([valid_cids[idx] for idx in nearest_cluster_idx])
+
             label_map = {old_id: new_id for new_id, old_id in enumerate(sorted(valid_cids))}
-            remap_labels = np.array([label_map[lbl] if lbl >= 0 else -1 for lbl in labels])
+            remap_labels = np.array([label_map[lbl] for lbl in labels])
             return len(valid_cids), remap_labels
     except Exception as e:
         logger.warning(f"[ClusterManager] HDBSCAN falhou ou não convergiu, usando Spherical K-Means: {e}")
 
     # 2. Fallback: Spherical K-Means Ponderado por sample_weight
-    max_k = 2 if n_items < 12 else (3 if n_items < 30 else (4 if n_items < 80 else 5))
-    min_cluster_size_km = min(4, n_items // max_k)
+    max_k = 2 if n_items < 15 else (3 if n_items < 40 else (4 if n_items < 100 else 5))
+    min_cluster_size_km = max(4, n_items // (max_k * 2))
 
     best_k = 1
     best_score = -1.0
@@ -623,9 +632,10 @@ def _cluster_hybrid_representations(
             continue
 
         score = float(silhouette_score(H, cand_labels))
-        # Princípio da Parcimônia (+0.015)
-        if best_labels is None or (score > best_score + 0.015):
-            best_score = score
+        # Para bibliotecas ricas (>= 50 itens), equilibra granularidade sem impor a trava de +0.015 que colapsa tudo em k=2
+        penalty = 0.005 if cand_k > 2 else 0.0
+        if best_labels is None or (score - penalty > best_score):
+            best_score = score - penalty
             best_k = cand_k
             best_labels = cand_labels
 

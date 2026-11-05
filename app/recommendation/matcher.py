@@ -310,6 +310,57 @@ def compute_omnimatch_score(
             ceiling = max(35.0, wr * 10.0)
             phi = min(phi, ceiling)
 
+    # 1. Floor de Tração e Relevância Cultural para Obras Lançadas
+    # Evita que obras com 1 a 10 votos (ex: produções obscuras) ranqueiem no topo
+    is_movie = (candidate and candidate.get("media_type") == "movie") or (candidate and "title" in candidate and "first_air_date" not in candidate)
+    r_date = (candidate.get("release_date") or candidate.get("first_air_date")) if candidate else None
+    is_past_release = bool(r_date and len(str(r_date)) >= 4 and str(r_date)[:4].isdigit())
+
+    if is_past_release and vc > 0:
+        min_vc_threshold = 40.0 if is_movie else 25.0
+        if vc < min_vc_threshold:
+            traction = math.sqrt(max(1.0, vc) / min_vc_threshold)
+            phi = phi * (0.70 + 0.30 * traction)
+
+    # Penalidade para idioma estrangeiro de nicho sem qualquer histórico na biblioteca
+    cand_lang = (candidate.get("original_language") or "").lower() if candidate else ""
+    if cand_lang and cand_lang not in ["en", "pt", "ja"]:
+        user_lang_aff = user_vector.get(f"lang_{cand_lang}", 0.0)
+        if user_lang_aff <= 0.0 and vc < 150:
+            phi = phi * 0.80
+
+    # 2. Penalidade de Gêneros Residuais / Quase Inexistentes na Biblioteca
+    # Ex: Doramas de Romance melodramático para usuários cujo perfil tem < 3% de Romance
+    cand_gids = (candidate.get("genre_ids") or []) if candidate else []
+    is_primarily_romance = bool(cand_gids and cand_gids[0] in [10749, 10766])
+    if is_primarily_romance and user_item_count >= 30:
+        romance_weight = user_vector.get("genre_romance", 0.0)
+        genre_vals = [v for k, v in user_vector.items() if k.startswith("genre_")]
+        top_genres_avg = (sum(sorted(genre_vals, reverse=True)[:3]) / 3.0) if genre_vals else 5.0
+        if romance_weight < 0.55 * top_genres_avg:
+            phi = phi * 0.75
+
+    # 3. Atenuação de Anacronismo Temporal para Comédias/Sitcoms
+    # Sitcoms dos anos 70/80 (ex: The Jeffersons 1975) não devem competir com sitcoms modernas (B99, The Office)
+    if is_past_release:
+        release_year = int(str(r_date)[:4])
+        if release_year < 1995:
+            is_comedy = (cand_gids and 35 in cand_gids) or any(k in ["genre_comédia", "genre_comedy"] for k in candidate_vector)
+            if is_comedy:
+                has_vintage_comedy = False
+                if user_items:
+                    for it in user_items:
+                        m_obj = getattr(it, "media_obj", None) or getattr(it, "media", None)
+                        if m_obj:
+                            m_date = getattr(m_obj, "release_date", None) or getattr(m_obj, "first_air_date", None)
+                            if m_date and len(str(m_date)) >= 4 and str(m_date)[:4].isdigit() and int(str(m_date)[:4]) < 1995:
+                                g_names = [str(g.get("name", "")).lower() for g in (getattr(m_obj, "genres", []) or []) if isinstance(g, dict)]
+                                if "comédia" in g_names or "comedy" in g_names:
+                                    has_vintage_comedy = True
+                                    break
+                if not has_vintage_comedy:
+                    phi = phi * 0.82
+
     # Amortecimento Bayesiano de Cold-Start para novos usuários (n_u < 8)
     is_preliminary = False
     if user_item_count < 8:

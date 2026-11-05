@@ -176,10 +176,10 @@ async def fetch_discover_candidates(
         with_genres_tv = ",".join(top_tv_ids[:2]) if len(top_tv_ids) >= 2 else (top_tv_ids[0] if top_tv_ids else None)
 
         lang_pref = None
-        for k, v in user_vector.items():
-            if k.startswith("lang_") and v >= 15.0:
-                lang_pref = k.replace("lang_", "")
-                break
+        lang_features = [(k.replace("lang_", ""), v) for k, v in user_vector.items() if k.startswith("lang_") and v >= 2.5]
+        lang_features.sort(key=lambda x: x[1], reverse=True)
+        if lang_features and lang_features[0][0] != "en":
+            lang_pref = lang_features[0][0]
 
         if with_genres_m:
             m_params = {
@@ -267,6 +267,13 @@ async def fetch_discover_candidates(
             cid = c.get("id")
             mtype = c.get("media_type", "movie")
             if not cid:
+                continue
+
+            # Filtro de tração mínima para candidatos gerais já lançados (elimina ruído com 0 ou 1 voto)
+            vc = float(c.get("vote_count", 0) or 0)
+            r_date = c.get("release_date") or c.get("first_air_date")
+            is_past = bool(r_date and len(str(r_date)) >= 4 and str(r_date)[:4].isdigit())
+            if is_past and vc < (20.0 if mtype == "movie" else 15.0):
                 continue
             key = (mtype, cid)
             if key not in candidate_map:
