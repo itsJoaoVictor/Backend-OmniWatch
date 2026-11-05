@@ -551,15 +551,30 @@ def calculate_semantic_dismiss_penalty(
     now = datetime.now(timezone.utc)
 
     for item in dismissed_records:
-        if not item.embedding:
+        if isinstance(item, dict):
+            item_emb = item.get("embedding")
+            expires_at = item.get("expires_at")
+            created_at = item.get("created_at")
+        else:
+            try:
+                item_emb = getattr(item, "embedding", None)
+                expires_at = getattr(item, "expires_at", None)
+                created_at = getattr(item, "created_at", None)
+            except Exception:
+                continue
+
+        if not item_emb:
             continue
 
-        sim = calculate_cosine_similarity(candidate_embedding, item.embedding)
+        sim = calculate_cosine_similarity(candidate_embedding, item_emb)
         if sim >= 0.75:
             # Fator de decaimento temporal: quanto mais recente, mais próximo de 1.0; perto de expirar, chega a 0.2
-            total_duration = (item.expires_at - item.created_at).total_seconds() or 1.0
-            remaining = (item.expires_at - now).total_seconds()
-            time_factor = max(0.2, min(1.0, remaining / total_duration))
+            if expires_at and created_at:
+                total_duration = (expires_at - created_at).total_seconds() or 1.0
+                remaining = (expires_at - now).total_seconds()
+                time_factor = max(0.2, min(1.0, remaining / total_duration))
+            else:
+                time_factor = 1.0
 
             # Penalidade proporcional entre 0.75 e 1.0 (escala de 15 a 25 pontos percentuais)
             norm_sim = (sim - 0.75) / 0.25  # 0.0 a 1.0

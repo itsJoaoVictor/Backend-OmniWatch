@@ -42,18 +42,22 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
         if max_u_genre == 0:
             max_u_genre = 1.0
 
-        g_match_sum = 0.0
-        for k, v in media_genres.items():
+        genre_ratios = []
+        for k in media_genres:
             u_val = user_vector.get(k, 0.0)
-            if u_val > 0:
-                g_match_sum += (u_val / max_u_genre) * v
-            elif u_val < 0:
-                # Penaliza gêneros explicitamente rejeitados pelo usuário
-                g_match_sum -= (abs(u_val) / max_u_genre) * v
-
-        g_max_sum = sum(media_genres.values())
-        if g_max_sum > 0:
-            genre_ratio = max(0.0, min(1.0, g_match_sum / g_max_sum))
+            ratio = (u_val / max_u_genre) if max_u_genre > 0 else 0.0
+            genre_ratios.append(ratio)
+        genre_ratios.sort(reverse=True)
+        # Soft Top-r Genre Matching (Ideia 4): 0.50 para 1º, 0.30 para 2º, 0.20 para 3º
+        pos_weights = [0.50, 0.30, 0.20]
+        weighted_genre_ratio = 0.0
+        weight_sum = 0.0
+        for i, r in enumerate(genre_ratios[:3]):
+            w = pos_weights[i]
+            weighted_genre_ratio += r * w
+            weight_sum += w
+        if weight_sum > 0:
+            genre_ratio = max(0.0, min(1.0, weighted_genre_ratio / weight_sum))
             total_score += genre_ratio * 40.0
     else:
         total_score += 0.35 * 40.0  # Shrinkage prior (14.0 pts)
@@ -88,9 +92,13 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
             for k in media_people
             if k in user_vector and user_vector[k] > 0
         ]
-        per_person_weight = 25.0 / min(2, len(media_people))
-        people_score = min(25.0, sum(matched_ratios) * per_person_weight)
-        total_score += people_score
+        matched_sum = sum(matched_ratios)
+        if matched_sum > 0:
+            # Saturação suave exponencial: 1 - exp(-1.2 * matched_sum)
+            sat = 1.0 - math.exp(-1.2 * matched_sum)
+            total_score += sat * 25.0
+        else:
+            total_score += 0.35 * 25.0  # Bayesian prior (8.75 pts)
     else:
         total_score += 0.35 * 25.0  # Bayesian prior (8.75 pts)
 
@@ -107,9 +115,13 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
             for k in media_kw
             if k in user_vector and user_vector[k] > 0
         ]
-        per_kw_weight = 20.0 / min(2, len(media_kw))
-        kw_score = min(20.0, sum(matched_kw_ratios) * per_kw_weight)
-        total_score += kw_score
+        matched_kw_sum = sum(matched_kw_ratios)
+        if matched_kw_sum > 0:
+            # Saturação suave exponencial: 1 - exp(-1.2 * matched_kw_sum)
+            sat_kw = 1.0 - math.exp(-1.2 * matched_kw_sum)
+            total_score += sat_kw * 20.0
+        else:
+            total_score += 0.35 * 20.0  # Bayesian prior (7.0 pts)
     else:
         total_score += 0.35 * 20.0  # Bayesian prior (7.0 pts)
 
@@ -169,6 +181,139 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
                 top_tags.append(f"🏷️ {clean_kw.title()}")
 
     return score, top_tags
+
+
+def compute_omnimatch_score(
+    user_vector: Dict[str, float],
+    candidate_vector: Dict[str, float],
+    user_embedding: Optional[List[float]] = None,
+    candidate_embedding: Optional[List[float]] = None,
+    target_persona: Optional[Dict[str, Any]] = None,
+    active_personas: Optional[List[Dict[str, Any]]] = None,
+    vote_average: float = 0.0,
+    vote_count: int = 0,
+    user_item_count: int = 0,
+    candidate: Optional[Dict[str, Any]] = None,
+    user_items: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Função canônica única de compatibilidade ("OmniMatch v3") servindo de forma unificada:
+    /explore, /personas, /upcoming, /score/{media_type}/{tmdb_id} e /together.
+
+    Componentes da Equação (Ideias 4, 5 e 11):
+    1. S_sparse: Denominador fixo 100.0 com Soft Top-r Genre Matching e Saturação Suave
+    2. S_dense: Similaridade de cosseno angular com embeddings de 4096D
+    3. Potencial Latente Sinérgico:
+       phi = 0.55 * S_dense + 0.30 * S_sparse + 0.15 * sqrt(max(0, S_dense * S_sparse))
+    4. Delta Comportamental: Afeto explícito (+4.0 se favorito) e rewatch
+    5. Curadoria Anti-Bomba (IMDb Weighted Rating):
+       WR = (v*R + 150*6.5)/(v + 150). Se WR < 5.3, teto proporcional de qualidade
+    6. Amortecimento de Cold-Start: n_u / (n_u + 8) quando n_u < 8 ('Match Preliminar')
+    7. Multi-Persona: seleção precisa do polo temático mais aderente
+    """
+    from app.recommendation.embeddings import calculate_cosine_similarity
+
+    matched_persona = None
+    best_persona_id = "general"
+
+    if target_persona:
+        p_vec = target_persona.get("feature_vector") or user_vector
+        p_emb = target_persona.get("centroid_embedding") or user_embedding
+        matched_persona = target_persona
+        best_persona_id = target_persona.get("id")
+
+        aff_score, tags = calculate_match_score(p_vec, candidate_vector)
+        if p_emb and candidate_embedding:
+            sem_sim = calculate_cosine_similarity(p_emb, candidate_embedding)
+            sem_score = sem_sim * 100.0
+            phi = 0.55 * sem_score + 0.30 * aff_score + 0.15 * math.sqrt(max(0.0, sem_score * aff_score))
+            if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in tags:
+                tags.append("✨ Sintonia Semântica")
+        else:
+            phi = aff_score
+    elif active_personas and len(active_personas) > 1:
+        best_phi = -1.0
+        best_tags = []
+        for p in active_personas:
+            p_vec = p.get("feature_vector") or user_vector
+            p_emb = p.get("centroid_embedding") or user_embedding
+            p_aff, p_tags = calculate_match_score(p_vec, candidate_vector)
+            if p_emb and candidate_embedding:
+                sem_sim = calculate_cosine_similarity(p_emb, candidate_embedding)
+                sem_score = sem_sim * 100.0
+                p_phi = 0.55 * sem_score + 0.30 * p_aff + 0.15 * math.sqrt(max(0.0, sem_score * p_aff))
+                if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in p_tags:
+                    p_tags.append("✨ Sintonia Semântica")
+            else:
+                p_phi = p_aff
+
+            if p_phi > best_phi:
+                best_phi = p_phi
+                best_tags = p_tags
+                matched_persona = p
+                best_persona_id = p.get("id")
+
+        phi = best_phi
+        tags = best_tags
+    else:
+        aff_score, tags = calculate_match_score(user_vector, candidate_vector)
+        if user_embedding and candidate_embedding:
+            sem_sim = calculate_cosine_similarity(user_embedding, candidate_embedding)
+            sem_score = sem_sim * 100.0
+            phi = 0.55 * sem_score + 0.30 * aff_score + 0.15 * math.sqrt(max(0.0, sem_score * aff_score))
+            if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in tags:
+                tags.append("✨ Sintonia Semântica")
+        else:
+            phi = aff_score
+
+    # Delta Comportamental e Tags Explicativas
+    rich_tags = tags
+    if candidate:
+        rich_tags = build_rich_explanation_tags(
+            candidate=candidate,
+            user_vector=user_vector,
+            user_items=user_items or [],
+            cand_emb=candidate_embedding,
+            target_persona=matched_persona,
+            fallback_tags=tags
+        )
+        if any(t.startswith("❤️") for t in rich_tags):
+            phi = min(100.0, phi + 4.0)
+
+        rewatch_pts, rewatch_tag = calculate_rewatch_boost(candidate_vector, candidate_embedding, user_items or [])
+        if rewatch_pts > 0:
+            phi = min(100.0, phi + rewatch_pts)
+            if rewatch_tag and not any("reassistiu" in t for t in rich_tags):
+                rich_tags = ([rewatch_tag] + rich_tags)[:3]
+
+    # Gate Anti-Bomba (IMDb Weighted Rating)
+    va = float(vote_average or 0.0)
+    vc = float(vote_count or 0.0)
+    wr = 6.5
+    if vc > 0 and va > 0:
+        wr = (vc * va + 150.0 * 6.5) / (vc + 150.0)
+        if wr < 5.3:
+            ceiling = max(35.0, wr * 10.0)
+            phi = min(phi, ceiling)
+
+    # Amortecimento Bayesiano de Cold-Start para novos usuários (n_u < 8)
+    is_preliminary = False
+    if user_item_count < 8:
+        is_preliminary = True
+        k0 = 8.0
+        prior_quality = (wr * 10.0) if (vc > 0 and va > 0) else 65.0
+        w_user = user_item_count / (user_item_count + k0)
+        phi = w_user * phi + (1.0 - w_user) * prior_quality
+
+    final_score = round(max(0.0, min(100.0, phi)), 1)
+
+    return {
+        "match_score": final_score,
+        "match_tags": rich_tags,
+        "is_preliminary": is_preliminary,
+        "best_persona_id": best_persona_id,
+        "raw_potential": round(phi, 1),
+    }
 
 CURATED_KEYWORDS_MAP: Dict[str, str] = {
     "time travel": "⏳ Viagem no Tempo",
@@ -241,27 +386,42 @@ def calculate_rewatch_boost(
     best_tag = None
 
     for item in user_items:
-        media = getattr(item, "media", None)
-        if not media or not media.title:
-            continue
+        if isinstance(item, dict):
+            m_title = item.get("title")
+            m_emb = item.get("embedding")
+            media_obj = item.get("media_obj")
+            rewatch_cnt = item.get("rewatch_count", 0) or 0
+            ep_rewatches = item.get("ep_rewatches", 0) or 0
+        else:
+            try:
+                media = getattr(item, "media", None)
+                if not media:
+                    continue
+                m_title = getattr(media, "title", None)
+                m_emb = getattr(media, "embedding", None)
+                media_obj = media
+                rewatch_cnt = getattr(item, "rewatch_count", 0) or 0
+                episodes_list = getattr(item, "__dict__", {}).get("episodes") or []
+                ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+            except Exception:
+                continue
 
-        rewatch_cnt = getattr(item, "rewatch_count", 0) or 0
-        episodes_list = getattr(item, "__dict__", {}).get("episodes") or []
-        ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+        if not m_title:
+            continue
 
         if rewatch_cnt <= 0 and ep_rewatches <= 0:
             continue
 
         # 1. Similaridade Semântica (se houver embeddings)
         sem_sim = 0.0
-        if cand_emb and getattr(media, "embedding", None):
-            sem_sim = calculate_cosine_similarity(cand_emb, media.embedding)
+        if cand_emb and m_emb:
+            sem_sim = calculate_cosine_similarity(cand_emb, m_emb)
 
         # 2. Afinidade de Features Esparsas (gênero, elenco, direção, keywords)
         feat_sim = 0.0
-        if candidate_vector:
+        if candidate_vector and media_obj:
             try:
-                item_vec = build_sparse_vector(media)
+                item_vec = build_sparse_vector(media_obj)
                 if item_vec:
                     feat_sim = cosine_similarity(item_vec, candidate_vector)
             except Exception:
@@ -276,15 +436,15 @@ def calculate_rewatch_boost(
             base_pts = 3.5 + min(1.0 * (rewatch_cnt - 1), 2.5)
             boost = round(base_pts * min(1.0, effective_sim / 0.65), 1)
             tag = (
-                f'🔄 Porque você reassistiu "{media.title}" ({rewatch_cnt + 1}x)'
+                f'🔄 Porque você reassistiu "{m_title}" ({rewatch_cnt + 1}x)'
                 if rewatch_cnt > 1
-                else f'🔄 Porque você reassistiu "{media.title}"'
+                else f'🔄 Porque você reassistiu "{m_title}"'
             )
         else:
             # Episódios reassistidos individualmente: bônus moderado (até 2.5 pontos)
             base_pts = min(2.5, 0.8 + 0.35 * ep_rewatches)
             boost = round(base_pts * min(1.0, effective_sim / 0.65), 1)
-            tag = f'🔄 Porque você reassistiu episódios de "{media.title}"'
+            tag = f'🔄 Porque você reassistiu episódios de "{m_title}"'
 
         if boost > best_boost:
             best_boost = boost
@@ -316,25 +476,45 @@ def build_rich_explanation_tags(
     # 1. Conexão com obra que o usuário assistiu e amou (Item-to-Item Similarity)
     if user_items and cand_emb:
         best_sim = -1.0
-        best_item = None
+        best_item_title = None
+        best_rating = None
+        best_is_fav = False
+        best_rewatch_cnt = 0
+        best_ep_rewatches = 0
 
         for item in user_items:
-            media = getattr(item, "media", None)
-            if not media or not media.embedding or not media.title:
+            if isinstance(item, dict):
+                m_title = item.get("title")
+                m_emb = item.get("embedding")
+                rating = item.get("rating") or 0.0
+                status = item.get("status") or ""
+                is_fav = item.get("is_favorite", False)
+                rewatch_cnt = item.get("rewatch_count", 0) or 0
+                ep_rewatches = item.get("ep_rewatches", 0) or 0
+            else:
+                try:
+                    media = getattr(item, "media", None)
+                    if not media or not media.embedding or not media.title:
+                        continue
+                    m_title = media.title
+                    m_emb = media.embedding
+                    rating = getattr(item, "rating", None) or 0.0
+                    status = getattr(item, "status", "")
+                    is_fav = getattr(item, "is_favorite", False)
+                    rewatch_cnt = getattr(item, "rewatch_count", 0) or 0
+                    episodes_list = getattr(item, "__dict__", {}).get("episodes") or []
+                    ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+                except Exception:
+                    continue
+
+            if not m_title or not m_emb:
                 continue
 
             # Prioriza obras com boa avaliação, completadas, favoritadas ou reassistidas
-            rating = getattr(item, "rating", None) or 0.0
-            status = getattr(item, "status", "")
-            is_fav = getattr(item, "is_favorite", False)
-            rewatch_cnt = getattr(item, "rewatch_count", 0) or 0
-            episodes_list = getattr(item, "__dict__", {}).get("episodes") or []
-            ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
-
             if rating < 3.5 and status != "completed" and not is_fav and rewatch_cnt <= 0 and ep_rewatches <= 0:
                 continue
 
-            sim = calculate_cosine_similarity(cand_emb, media.embedding)
+            sim = calculate_cosine_similarity(cand_emb, m_emb)
             fav_mult = 1.25 if is_fav else 1.0
             rewatch_mult = (
                 (1.25 + min(0.10 * (rewatch_cnt - 1), 0.25))
@@ -344,31 +524,28 @@ def build_rich_explanation_tags(
             sim_effective = sim * fav_mult * rewatch_mult
             if sim_effective > best_sim:
                 best_sim = sim_effective
-                best_item = item
+                best_item_title = m_title
+                best_rating = rating
+                best_is_fav = is_fav
+                best_rewatch_cnt = rewatch_cnt
+                best_ep_rewatches = ep_rewatches
 
         # Se houver uma obra com afinidade semântica expressiva (>= 0.65)
-        if best_item and best_sim >= 0.65:
-            m_title = best_item.media.title
-            m_rating = getattr(best_item, "rating", None)
-            is_fav = getattr(best_item, "is_favorite", False)
-            rewatch_cnt = getattr(best_item, "rewatch_count", 0) or 0
-            episodes_list = getattr(best_item, "__dict__", {}).get("episodes") or []
-            ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
-
-            if is_fav and rewatch_cnt > 0:
-                rich_tags.append(f'❤️🔄 Porque você favoritou e reassistiu "{m_title}"')
-            elif is_fav:
-                rich_tags.append(f'❤️ Porque você favoritou "{m_title}"')
-            elif rewatch_cnt > 0:
-                rich_tags.append(f'🔄 Porque você reassistiu "{m_title}"')
-            elif ep_rewatches >= 2:
-                rich_tags.append(f'🔄 Porque você reassistiu episódios de "{m_title}"')
-            elif m_rating and m_rating >= 4.5:
-                rich_tags.append(f'🍿 Porque você deu {m_rating:.0f}★ em "{m_title}"')
-            elif m_rating and m_rating >= 4.0:
-                rich_tags.append(f'🍿 Porque você curtiu "{m_title}"')
+        if best_item_title and best_sim >= 0.65:
+            if best_is_fav and best_rewatch_cnt > 0:
+                rich_tags.append(f'❤️🔄 Porque você favoritou e reassistiu "{best_item_title}"')
+            elif best_is_fav:
+                rich_tags.append(f'❤️ Porque você favoritou "{best_item_title}"')
+            elif best_rewatch_cnt > 0:
+                rich_tags.append(f'🔄 Porque você reassistiu "{best_item_title}"')
+            elif best_ep_rewatches >= 2:
+                rich_tags.append(f'🔄 Porque você reassistiu episódios de "{best_item_title}"')
+            elif best_rating and best_rating >= 4.5:
+                rich_tags.append(f'🍿 Porque você deu {best_rating:.0f}★ em "{best_item_title}"')
+            elif best_rating and best_rating >= 4.0:
+                rich_tags.append(f'🍿 Porque você curtiu "{best_item_title}"')
             else:
-                rich_tags.append(f'🍿 Na mesma vibe de "{m_title}"')
+                rich_tags.append(f'🍿 Na mesma vibe de "{best_item_title}"')
 
     # 2. Diretor ou Ator que o usuário acompanha com peso alto
     directors = candidate.get("directors") or candidate.get("crew") or []

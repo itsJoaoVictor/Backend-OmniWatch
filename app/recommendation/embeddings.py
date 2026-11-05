@@ -12,6 +12,7 @@ def build_text_for_embedding(media: Any) -> str:
     """
     Constrói um texto descritivo denso a partir dos metadados da obra.
     Suporta tanto uma instância de Media (SQLAlchemy) quanto um dict de candidato.
+    Inclui título, tipo, gêneros, direção, elenco, sinopse, década e idioma original.
     """
     if isinstance(media, dict):
         title = media.get("title") or media.get("name") or ""
@@ -20,6 +21,9 @@ def build_text_for_embedding(media: Any) -> str:
         directors = media.get("crew", [])
         cast = media.get("cast", [])
         keywords = media.get("keywords_list", []) or media.get("keywords", [])
+        overview = media.get("overview", "")
+        rel_date = media.get("release_date") or media.get("first_air_date") or ""
+        orig_lang = media.get("original_language", "")
     else:
         title = getattr(media, "title", "")
         media_type = getattr(media, "media_type", "movie")
@@ -27,6 +31,9 @@ def build_text_for_embedding(media: Any) -> str:
         directors = getattr(media, "directors", [])
         cast = getattr(media, "main_cast", [])
         keywords = getattr(media, "keywords", [])
+        overview = getattr(media, "overview", "") if hasattr(media, "overview") else ""
+        rel_date = getattr(media, "release_date", "") or ""
+        orig_lang = getattr(media, "original_language", "") or ""
 
     parts = []
     if title:
@@ -60,7 +67,81 @@ def build_text_for_embedding(media: Any) -> str:
     if keywords:
         parts.append(f"Temas: {', '.join(keywords[:15])}")
 
+    # Sinopse (overview até ~400 chars)
+    if overview:
+        overview_clean = str(overview).strip()
+        if len(overview_clean) > 400:
+            overview_clean = overview_clean[:397] + "..."
+        parts.append(f"Sinopse: {overview_clean}")
+
+    # Ano de lançamento e década
+    if rel_date and len(str(rel_date)) >= 4:
+        try:
+            year = int(str(rel_date)[:4])
+            decade = (year // 10) * 10
+            parts.append(f"Lançamento: {year} (Década de {decade})")
+        except Exception:
+            pass
+
+    # Idioma Original
+    if orig_lang:
+        parts.append(f"Idioma Original: {str(orig_lang).lower().strip()}")
+
     return ". ".join(parts)
+
+
+async def generate_embeddings_batch(texts: List[str], chunk_size: int = 32) -> List[Optional[List[float]]]:
+    """
+    Gera vetores de embedding semântico em batch chamando a API do OpenRouter
+    com o modelo qwen/qwen3-embedding-8b em 1 único POST HTTP (ou chunks de 32).
+    """
+    if not texts:
+        return []
+
+    api_key = settings.OPENAI_API_KEY
+    if not api_key:
+        logger.warning("OPENAI_API_KEY não configurada. Não é possível gerar embeddings em batch.")
+        return [None] * len(texts)
+
+    url = f"{settings.OPENAI_BASE_URL.rstrip('/')}/embeddings"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    all_embeddings: List[Optional[List[float]]] = [None] * len(texts)
+
+    for i in range(0, len(texts), chunk_size):
+        chunk = texts[i:i + chunk_size]
+        cleaned_chunk = [t.strip() if t and t.strip() else "Mídia" for t in chunk]
+
+        payload = {
+            "model": settings.OPENAI_MODEL_Embedding,
+            "input": cleaned_chunk
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, headers=headers, json=payload, timeout=15.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    results_data = data.get("data", [])
+                    results_data.sort(key=lambda x: x.get("index", 0))
+                    for item in results_data:
+                        idx = item.get("index", 0)
+                        raw_emb = item.get("embedding")
+                        if raw_emb:
+                            vec = np.array(raw_emb, dtype=np.float32)
+                            norm = np.linalg.norm(vec)
+                            if norm > 0:
+                                vec = vec / norm
+                            all_embeddings[i + idx] = vec.tolist()
+                else:
+                    logger.error(f"[Embeddings] Erro batch OpenRouter: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"[Embeddings] Exceção em generate_embeddings_batch: {e}")
+
+    return all_embeddings
 
 
 async def generate_embedding(text: str) -> Optional[List[float]]:

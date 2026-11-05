@@ -5,7 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.users.models import User
 from app.core.config import settings
-from app.recommendation.matcher import calculate_match_score
+from app.recommendation.matcher import calculate_match_score, compute_omnimatch_score
+from app.recommendation.embeddings import build_text_for_embedding, generate_embeddings_batch, calculate_cosine_similarity
 from app.recommendation.vector_builder import WEIGHTS, normalize_genre_to_canonical
 
 # TMDB genre_id → pt-BR name (matches vector keys like "genre_ação")
@@ -47,20 +48,24 @@ async def fetch_discover_candidates(
     user_id: str = None,
     persona_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
+    """
+    Recuperação Multi-Funil de Candidatos TMDB (Sub-etapa 2.1 + Ideia 9):
+    4 funis assíncronos paralelos com fusão por postos recíprocos (RRF):
+    - Funil 1 (35%): Grafo Comportamental Direto (/recommendations das 3-5 âncoras de ouro)
+    - Funil 2 (35%): Discover Paramétrico Booleano Fino (conjunção AND ',' de gêneros, sem dealbreakers, vote_avg >= 6.8)
+    - Funil 3 (15%): Franquias & Autoria Cruzada (/collection/{id} + /person/{id}/combined_credits de diretores)
+    - Funil 4 (15%): Momentum & Streaming BR (/discover com watch_region=BR e flatrate)
+    Reduz chamadas HTTP externas de 112 para 12-16 requisições consolidadas.
+    """
     if not settings.TMDB_API_KEY:
         return []
 
-    # --- Build smart filters from user profile ---
-    genre_features = [(k.replace("genre_", ""), v) for k, v in user_vector.items() if k.startswith("genre_")]
-    genre_features.sort(key=lambda x: x[1], reverse=True)
-
-    # --- Busca a lista do usuário uma única vez para genres, cast_ids, crew_ids e PROPORÇÃO Filmes/Séries ---
+    user_items = []
+    golden_anchors = []
+    known_collection_ids = set()
+    signature_director_ids = set()
+    dealbreaker_genre_ids = []
     live_genre_name_to_id: Dict[str, int] = {}
-    cast_person_scores: Dict[int, float] = {}
-    crew_person_scores: Dict[int, float] = {}
-    
-    movie_count = 0
-    tv_count = 0
 
     if db and user_id:
         try:
@@ -71,11 +76,6 @@ async def fetch_discover_candidates(
                 media = list_item.media
                 if not media:
                     continue
-                    
-                if media.media_type == "movie":
-                    movie_count += 1
-                elif media.media_type == "tv":
-                    tv_count += 1
 
                 if media.genres:
                     for g in media.genres:
@@ -86,75 +86,39 @@ async def fetch_discover_candidates(
                                 live_genre_name_to_id[_name] = _gid
 
                 is_fav = getattr(list_item, "is_favorite", False)
-                rewatch_cnt = getattr(list_item, "rewatch_count", 0) or 0
-                episodes_list = getattr(list_item, "__dict__", {}).get("episodes") or []
-                ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in episodes_list)
+                rating = getattr(list_item, "rating", 0.0) or 0.0
+                rewatch = getattr(list_item, "rewatch_count", 0) or 0
 
-                fav_boost = 2.5 if is_fav else 1.0
-                rewatch_boost = (
-                    (1.5 + min(0.35 * (rewatch_cnt - 1), 1.0))
-                    if rewatch_cnt > 0
-                    else (1.25 if ep_rewatches > 0 else 1.0)
-                )
-                combined_boost = fav_boost * rewatch_boost
+                # Âncoras de ouro: favoritas, ratings >= 4.0, ou reassistidas
+                if is_fav or rating >= 4.0 or rewatch > 0:
+                    priority = (3.0 if is_fav else 0.0) + rating + (2.0 if rewatch > 0 else 0.0)
+                    golden_anchors.append((priority, media.media_type, media.tmdb_id))
 
-                if media.cast_ids:
-                    for entry in media.cast_ids:
-                        person_id = entry.get("person_id")
-                        name = entry.get("name", "")
-                        if not person_id or not name:
-                            continue
-                        feature_key = f"cast_{name.lower()}"
-                        signal = user_vector.get(feature_key, 0.0)
-                        if signal > 0:
-                            cast_person_scores[person_id] = cast_person_scores.get(person_id, 0.0) + (signal * combined_boost)
+                if getattr(media, "collection_tmdb_id", None):
+                    known_collection_ids.add(media.collection_tmdb_id)
 
                 if media.crew_ids:
                     for entry in media.crew_ids:
-                        person_id = entry.get("person_id")
+                        pid = entry.get("person_id")
                         name = entry.get("name", "")
-                        if not person_id or not name:
-                            continue
-                        feature_key = f"director_{name.lower()}"
-                        signal = user_vector.get(feature_key, 0.0)
-                        if signal > 0:
-                            crew_person_scores[person_id] = crew_person_scores.get(person_id, 0.0) + (signal * combined_boost)
+                        if pid and name and user_vector.get(f"director_{name.lower()}", 0.0) >= 1.5:
+                            signature_director_ids.add(pid)
         except Exception:
             pass
-            
-    # Proporção Dinâmica Filmes vs Séries
-    total_items = movie_count + tv_count
-    if total_items == 0:
-        movie_prop = 0.5
-        tv_prop = 0.5
-    else:
-        movie_prop = movie_count / total_items
-        tv_prop = tv_count / total_items
 
-    # Divisão dos gêneros do usuário (Top 5 primários, próximos 5 secundários)
-    primary_genres = [g for g, v in genre_features[:5] if v > 0]
-    secondary_genres = [g for g, v in genre_features[5:10] if v > 0]
+    # Dealbreakers: gêneros com peso explicitamente negativo no perfil
+    for k, v in user_vector.items():
+        if k.startswith("genre_") and v < 0:
+            canon = k.replace("genre_", "")
+            gid = GENRE_MAP_REVERSE.get(canon)
+            if gid:
+                dealbreaker_genre_ids.append(str(gid))
 
-    prim_movie_ids = [str(live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g)) for g in primary_genres if (live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g))]
-    with_primary_movie_genres = "|".join(prim_movie_ids) if prim_movie_ids else None
-    sec_movie_ids = [str(live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g)) for g in secondary_genres if (live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g))]
-    with_sec_movie_genres = "|".join(sec_movie_ids) if sec_movie_ids else None
+    without_genres_str = ",".join(set(dealbreaker_genre_ids)) if dealbreaker_genre_ids else None
 
-    prim_tv_ids = [TV_GENRE_MAP.get(g, str(GENRE_MAP_REVERSE.get(g, ""))) for g in primary_genres]
-    prim_tv_ids = [x for x in prim_tv_ids if x]
-    with_primary_tv_genres = "|".join(prim_tv_ids) if prim_tv_ids else None
-    sec_tv_ids = [TV_GENRE_MAP.get(g, str(GENRE_MAP_REVERSE.get(g, ""))) for g in secondary_genres]
-    sec_tv_ids = [x for x in sec_tv_ids if x]
-    with_sec_tv_genres = "|".join(sec_tv_ids) if sec_tv_ids else None
-
-    with_cast: Optional[str] = None
-    with_crew: Optional[str] = None
-    top_cast_ids = sorted(cast_person_scores.keys(), key=lambda pid: cast_person_scores[pid], reverse=True)[:3]
-    top_crew_ids = sorted(crew_person_scores.keys(), key=lambda pid: crew_person_scores[pid], reverse=True)[:2]
-    if top_cast_ids:
-        with_cast = "|".join(str(pid) for pid in top_cast_ids)
-    if top_crew_ids:
-        with_crew = "|".join(str(pid) for pid in top_crew_ids)
+    # Ordena âncoras de ouro
+    golden_anchors.sort(key=lambda x: x[0], reverse=True)
+    top_anchors = golden_anchors[:5]
 
     headers = {
         "accept": "application/json",
@@ -169,128 +133,171 @@ async def fetch_discover_candidates(
             response = await client.get(url, headers=headers, params=default_params, timeout=10.0)
             response.raise_for_status()
             data = response.json()
-            results = data.get("results", [])
-            for r in results:
+            if "results" in data:
+                raw_list = data.get("results", [])
+            elif "parts" in data:
+                raw_list = data.get("parts", [])
+                for r in raw_list:
+                    r["media_type"] = "movie"
+            elif "crew" in data:
+                raw_list = [c for c in data.get("crew", []) if c.get("job") == "Director"]
+            else:
+                raw_list = []
+
+            for r in raw_list:
                 if media_type:
                     r["media_type"] = media_type
                 elif "media_type" not in r:
                     r["media_type"] = "movie" if "title" in r else "tv"
-            return results
+            return raw_list
         except Exception:
             return []
 
     async with httpx.AsyncClient() as client:
-        tasks = []
-        # Consulta determinística das Páginas 1 e 2 com filtro mínimo de qualidade (sem sorteio cego de páginas 1..15)
-        PAGES = [1, 2]
+        # === FUNIL 1: Grafo Comportamental Direto (35%) ===
+        funnel_1_tasks = []
+        for _, mtype, tid in top_anchors:
+            endpoint = f"/{mtype}/{tid}/recommendations"
+            funnel_1_tasks.append(fetch_endpoint(client, endpoint, mtype, {"page": 1}))
 
-        # Faceta 1: Top 5 Gêneros Principais (Filtro de qualidade: vote_count >= 100, vote_avg >= 6.0)
-        if with_primary_movie_genres:
-            for p in PAGES:
-                tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
-                    "with_genres": with_primary_movie_genres,
-                    "vote_count.gte": 100,
-                    "vote_average.gte": 6.0,
-                    "sort_by": "popularity.desc",
-                    "page": p
-                }))
-        if with_primary_tv_genres:
-            for p in PAGES:
-                tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
-                    "with_genres": with_primary_tv_genres,
-                    "vote_count.gte": 50,
-                    "vote_average.gte": 6.0,
-                    "sort_by": "popularity.desc",
-                    "page": p
-                }))
+        # === FUNIL 2: Discover Paramétrico Booleano Fino (35%) ===
+        funnel_2_tasks = []
+        genre_features = [(k.replace("genre_", ""), v) for k, v in user_vector.items() if k.startswith("genre_") and v > 0]
+        genre_features.sort(key=lambda x: x[1], reverse=True)
+        top_genres = [g for g, _ in genre_features[:3]]
 
-        # Faceta 2: Gêneros Secundários
-        if with_sec_movie_genres:
-            for p in PAGES:
-                tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
-                    "with_genres": with_sec_movie_genres,
-                    "vote_count.gte": 100,
-                    "vote_average.gte": 6.0,
-                    "sort_by": "popularity.desc",
-                    "page": p
-                }))
-        if with_sec_tv_genres:
-            for p in PAGES:
-                tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
-                    "with_genres": with_sec_tv_genres,
-                    "vote_count.gte": 50,
-                    "vote_average.gte": 6.0,
-                    "sort_by": "popularity.desc",
-                    "page": p
-                }))
+        top_m_ids = [str(live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g)) for g in top_genres if (live_genre_name_to_id.get(g) or GENRE_MAP_REVERSE.get(g))]
+        top_tv_ids = [TV_GENRE_MAP.get(g, str(GENRE_MAP_REVERSE.get(g, ""))) for g in top_genres if TV_GENRE_MAP.get(g, GENRE_MAP_REVERSE.get(g))]
 
-        # Faceta 3: Elenco / Diretores Favoritos (Simetria Filmes e Séries de TV)
-        if with_cast:
-            tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
-                "with_cast": with_cast,
-                "vote_count.gte": 50,
-                "vote_average.gte": 6.0,
+        # Conjunção AND (',') entre os top gêneros
+        with_genres_m = ",".join(top_m_ids[:2]) if len(top_m_ids) >= 2 else (top_m_ids[0] if top_m_ids else None)
+        with_genres_tv = ",".join(top_tv_ids[:2]) if len(top_tv_ids) >= 2 else (top_tv_ids[0] if top_tv_ids else None)
+
+        lang_pref = None
+        for k, v in user_vector.items():
+            if k.startswith("lang_") and v >= 15.0:
+                lang_pref = k.replace("lang_", "")
+                break
+
+        if with_genres_m:
+            m_params = {
+                "with_genres": with_genres_m,
+                "vote_average.gte": 6.8,
+                "vote_count.gte": 150,
                 "sort_by": "popularity.desc",
                 "page": 1
-            }))
-            tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
-                "with_cast": with_cast,
-                "vote_count.gte": 30,
-                "vote_average.gte": 6.0,
-                "sort_by": "popularity.desc",
-                "page": 1
-            }))
-        if with_crew:
-            tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
-                "with_crew": with_crew,
-                "vote_count.gte": 50,
-                "vote_average.gte": 6.0,
-                "sort_by": "popularity.desc",
-                "page": 1
-            }))
-            tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
-                "with_crew": with_crew,
-                "vote_count.gte": 30,
-                "vote_average.gte": 6.0,
-                "sort_by": "popularity.desc",
-                "page": 1
-            }))
+            }
+            if without_genres_str:
+                m_params["without_genres"] = without_genres_str
+            if lang_pref:
+                m_params["with_original_language"] = lang_pref
+            funnel_2_tasks.append(fetch_endpoint(client, "/discover/movie", "movie", m_params))
+            funnel_2_tasks.append(fetch_endpoint(client, "/discover/movie", "movie", dict(m_params, page=2)))
 
-        # Se persona_id estiver ativo, BLOQUEIA Trending e Populares Globais para isolar o nicho temático
+        if with_genres_tv:
+            tv_params = {
+                "with_genres": with_genres_tv,
+                "vote_average.gte": 6.8,
+                "vote_count.gte": 80,
+                "sort_by": "popularity.desc",
+                "page": 1
+            }
+            if without_genres_str:
+                tv_params["without_genres"] = without_genres_str
+            if lang_pref:
+                tv_params["with_original_language"] = lang_pref
+            funnel_2_tasks.append(fetch_endpoint(client, "/discover/tv", "tv", tv_params))
+            funnel_2_tasks.append(fetch_endpoint(client, "/discover/tv", "tv", dict(tv_params, page=2)))
+
+        # === FUNIL 3: Franquias & Autoria Cruzada (15%) ===
+        funnel_3_tasks = []
+        for col_id in list(known_collection_ids)[:3]:
+            funnel_3_tasks.append(fetch_endpoint(client, f"/collection/{col_id}", "movie", {}))
+        for p_id in list(signature_director_ids)[:3]:
+            funnel_3_tasks.append(fetch_endpoint(client, f"/person/{p_id}/combined_credits", None, {}))
+
+        # === FUNIL 4: Momentum & Streaming BR (15%) ===
+        funnel_4_tasks = []
+        funnel_4_tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
+            "watch_region": "BR",
+            "with_watch_monetization_types": "flatrate",
+            "vote_average.gte": 6.5,
+            "vote_count.gte": 100,
+            "sort_by": "popularity.desc",
+            "page": 1
+        }))
+        funnel_4_tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
+            "watch_region": "BR",
+            "with_watch_monetization_types": "flatrate",
+            "vote_average.gte": 6.5,
+            "vote_count.gte": 50,
+            "sort_by": "popularity.desc",
+            "page": 1
+        }))
         if not persona_id:
-            # Faceta 4: Obras em Alta (Trending Geral)
-            for p in [1, 2]:
-                tasks.append(fetch_endpoint(client, "/trending/all/week", None, {"page": p}))
+            funnel_4_tasks.append(fetch_endpoint(client, "/trending/all/week", None, {"page": 1}))
 
-            # Faceta 5: Populares e Top Rated Globais
-            for p in [1, 2]:
-                tasks.append(fetch_endpoint(client, "/movie/popular", "movie", {"page": p}))
-                tasks.append(fetch_endpoint(client, "/movie/top_rated", "movie", {"page": p}))
-                tasks.append(fetch_endpoint(client, "/tv/popular", "tv", {"page": p}))
-                tasks.append(fetch_endpoint(client, "/tv/top_rated", "tv", {"page": p}))
+        res_f1, res_f2, res_f3, res_f4 = await asyncio.gather(
+            asyncio.gather(*funnel_1_tasks, return_exceptions=True) if funnel_1_tasks else asyncio.sleep(0, result=[]),
+            asyncio.gather(*funnel_2_tasks, return_exceptions=True) if funnel_2_tasks else asyncio.sleep(0, result=[]),
+            asyncio.gather(*funnel_3_tasks, return_exceptions=True) if funnel_3_tasks else asyncio.sleep(0, result=[]),
+            asyncio.gather(*funnel_4_tasks, return_exceptions=True) if funnel_4_tasks else asyncio.sleep(0, result=[]),
+        )
 
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # === FUSÃO POR POSTOS RECÍPROCOS (RRF) ===
+    k_rrf = 60.0
+    w_f1 = 0.35
+    w_f2 = 0.35
+    w_f3 = 0.15
+    w_f4 = 0.15
 
+    rrf_scores: Dict[Tuple[str, int], float] = {}
+    candidate_map: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+    def ingest_funnel_results(results_batch: Any, weight: float):
+        if not isinstance(results_batch, (list, tuple)):
+            return
+        flat_list = []
+        for b in results_batch:
+            if isinstance(b, list):
+                flat_list.extend(b)
+        for rank_idx, c in enumerate(flat_list):
+            cid = c.get("id")
+            mtype = c.get("media_type", "movie")
+            if not cid:
+                continue
+            key = (mtype, cid)
+            if key not in candidate_map:
+                candidate_map[key] = c
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + (weight / (k_rrf + rank_idx + 1))
+
+    ingest_funnel_results(res_f1, w_f1)
+    ingest_funnel_results(res_f2, w_f2)
+    ingest_funnel_results(res_f3, w_f3)
+    ingest_funnel_results(res_f4, w_f4)
+
+    sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
     candidates = []
-    seen_cand_keys = set()
-    for batch in batch_results:
-        if isinstance(batch, list):
-            for c in batch:
-                cid = c.get("id")
-                mtype = c.get("media_type", "movie")
-                ckey = (mtype, cid)
-                if cid and ckey not in seen_cand_keys:
-                    seen_cand_keys.add(ckey)
-                    candidates.append(c)
+    for key in sorted_keys:
+        c = candidate_map[key]
+        c["_rrf_score"] = rrf_scores[key]
+        candidates.append(c)
+        if len(candidates) >= 180:
+            break
 
     return candidates
 
 
-async def enrich_candidates_with_details(candidates: List[Dict[str, Any]], user_vector: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
+async def enrich_candidates_with_details(
+    candidates: List[Dict[str, Any]],
+    user_vector: Optional[Dict[str, float]] = None,
+    db: Optional[AsyncSession] = None,
+    seen_keys: Optional[set] = None
+) -> List[Dict[str, Any]]:
     """
-    Estágio 1 do Ranking: Aplica fusão por postos recíprocos (RRF) combinando afinidade rápida
-    de gênero/idioma, qualidade amortecida da comunidade (Bayesian vote) e prioridade colaborativa.
-    Estágio 2: Enriquece via API apenas os Top 25 filmes e Top 25 séries vencedores.
+    Enriquecimento 1-RTT TMDB (append_to_response=credits,keywords,watch/providers,belongs_to_collection)
+    + Curadoria Collection Gate (redireciona para Filme 1 se franquia inédita - Sub-etapa 2.4)
+    + Batch Embeddings OpenRouter (qwen/qwen3-embedding-8b gravados em Media - Sub-etapa 2.2).
     """
     from app.details.services import fetch_movie_details, fetch_tv_details
     import math
@@ -305,7 +312,6 @@ async def enrich_candidates_with_details(candidates: List[Dict[str, Any]], user_
         if not pool:
             return []
 
-        # 1. Canal de Afinidade Rápida de Gênero e Idioma
         def get_fast_affinity(cand: Dict[str, Any]) -> float:
             if not user_vector:
                 return 0.0
@@ -321,7 +327,6 @@ async def enrich_candidates_with_details(candidates: List[Dict[str, Any]], user_
             lang_score = user_vector.get(f"lang_{lang}", 0.0) if lang else 0.0
             return g_score + 0.5 * lang_score
 
-        # 2. Canal de Qualidade Amortecida (Bayesian vote average + log popularity)
         def get_quality_score(cand: Dict[str, Any]) -> float:
             va = float(cand.get("vote_average") or 0.0)
             vc = float(cand.get("vote_count") or 0.0)
@@ -329,7 +334,6 @@ async def enrich_candidates_with_details(candidates: List[Dict[str, Any]], user_
             pop = float(cand.get("popularity") or 0.0)
             return damped_vote + 0.25 * math.log1p(max(0.0, pop))
 
-        # 3. Canal Colaborativo
         def get_collab_priority(cand: Dict[str, Any]) -> float:
             return 1.0 if cand.get("collaborative") else 0.0
 
@@ -363,11 +367,6 @@ async def enrich_candidates_with_details(candidates: List[Dict[str, Any]], user_
     sorted_tv = compute_rrf_ranking(tv)
 
     top_candidates = sorted_movies[:25] + sorted_tv[:25]
-    seen_enrich_keys = {(c.get("media_type", "movie"), c["id"]) for c in top_candidates if "id" in c}
-    remaining_candidates = [
-        c for c in candidates
-        if (c.get("media_type", "movie"), c.get("id")) not in seen_enrich_keys
-    ]
 
     async def enrich_one(candidate: Dict[str, Any]) -> Dict[str, Any]:
         tmdb_id = candidate.get("id")
@@ -375,16 +374,58 @@ async def enrich_candidates_with_details(candidates: List[Dict[str, Any]], user_
         try:
             if media_type == "movie":
                 details = await fetch_movie_details(tmdb_id)
-                candidate["cast"] = [c.name for c in details.credits.cast[:10]] if details.credits else []
-                candidate["crew"] = [c.name for c in details.credits.crew] if details.credits else []
+                # Curadoria Collection Gate (Sub-etapa 2.4): Redireciona para Filme 1 se franquia inédita
+                if hasattr(details, "belongs_to_collection") and details.belongs_to_collection and seen_keys is not None:
+                    col = details.belongs_to_collection
+                    col_id = col.id if hasattr(col, "id") else (col.get("id") if isinstance(col, dict) else None)
+                    if col_id:
+                        try:
+                            from app.details.services import fetch_collection_details
+                            col_resp = await fetch_collection_details(col_id)
+                            if col_resp and col_resp.parts:
+                                sorted_parts = sorted(
+                                    col_resp.parts,
+                                    key=lambda p: (getattr(p, "release_date", None) or (p.get("release_date") if isinstance(p, dict) else "")) or "9999"
+                                )
+                                if sorted_parts:
+                                    first_p = sorted_parts[0]
+                                    first_id = getattr(first_p, "id", None) or (first_p.get("id") if isinstance(first_p, dict) else None)
+                                    if first_id and first_id != tmdb_id and ("movie", first_id) not in seen_keys:
+                                        first_details = await fetch_movie_details(first_id)
+                                        details = first_details
+                                        candidate["id"] = first_details.id
+                                        candidate["_collection_redirect"] = True
+                        except Exception:
+                            pass
+
+                candidate["title"] = getattr(details, "title", None) or getattr(details, "name", "")
+                candidate["overview"] = getattr(details, "overview", "")
+                candidate["poster_path"] = getattr(details, "poster_path", None)
+                candidate["backdrop_path"] = getattr(details, "backdrop_path", None)
+                candidate["vote_average"] = getattr(details, "vote_average", 0.0)
+                candidate["vote_count"] = getattr(details, "vote_count", 0)
+                candidate["release_date"] = getattr(details, "release_date", "")
+                candidate["cast"] = [c.name for c in details.credits.cast[:10]] if details.credits and details.credits.cast else []
+                candidate["crew"] = [c.name for c in details.credits.crew if getattr(c, "job", "") in ("Director", "Creator")] if details.credits and details.credits.crew else []
                 candidate["keywords_list"] = details.keywords if hasattr(details, "keywords") else []
-                candidate["original_language"] = details.original_language or ""
+                candidate["original_language"] = getattr(details, "original_language", "") or ""
+                if hasattr(details, "watch_providers") and details.watch_providers:
+                    candidate["watch_providers_br"] = [wp.provider_name for wp in details.watch_providers if hasattr(wp, "provider_name")]
             else:
                 details = await fetch_tv_details(tmdb_id)
-                candidate["cast"] = [c.name for c in details.credits.cast[:10]] if details.credits else []
-                candidate["crew"] = [c.name for c in details.credits.crew] if details.credits else []
+                candidate["title"] = getattr(details, "title", None) or getattr(details, "name", "")
+                candidate["overview"] = getattr(details, "overview", "")
+                candidate["poster_path"] = getattr(details, "poster_path", None)
+                candidate["backdrop_path"] = getattr(details, "backdrop_path", None)
+                candidate["vote_average"] = getattr(details, "vote_average", 0.0)
+                candidate["vote_count"] = getattr(details, "vote_count", 0)
+                candidate["release_date"] = getattr(details, "first_air_date", "")
+                candidate["cast"] = [c.name for c in details.credits.cast[:10]] if details.credits and details.credits.cast else []
+                candidate["crew"] = [c.name for c in details.credits.crew if getattr(c, "job", "") in ("Director", "Creator")] if details.credits and details.credits.crew else []
                 candidate["keywords_list"] = details.keywords if hasattr(details, "keywords") else []
-                candidate["original_language"] = details.original_language or ""
+                candidate["original_language"] = getattr(details, "original_language", "") or ""
+                if hasattr(details, "watch_providers") and details.watch_providers:
+                    candidate["watch_providers_br"] = [wp.provider_name for wp in details.watch_providers if hasattr(wp, "provider_name")]
         except Exception:
             candidate["cast"] = []
             candidate["crew"] = []
@@ -393,6 +434,60 @@ async def enrich_candidates_with_details(candidates: List[Dict[str, Any]], user_
         return candidate
 
     enriched = await asyncio.gather(*[enrich_one(c) for c in top_candidates])
+
+    # === BATCH EMBEDDINGS OPENROUTER (Sub-etapa 2.2) ===
+    if db:
+        try:
+            cand_keys = [(c.get("media_type", "movie"), c["id"]) for c in enriched if "id" in c]
+            from app.media.models import Media as MediaModel
+            cand_tmdb_ids = [k[1] for k in cand_keys]
+            media_rows = (await db.execute(
+                select(MediaModel.media_type, MediaModel.tmdb_id, MediaModel.embedding)
+                .where(MediaModel.tmdb_id.in_(cand_tmdb_ids))
+            )).all()
+            existing_embs = {(row[0], row[1]): row[2] for row in media_rows if row[2]}
+
+            cands_to_embed = []
+            texts_to_embed = []
+            for c in enriched:
+                m_key = (c.get("media_type", "movie"), c.get("id"))
+                if m_key in existing_embs:
+                    c["embedding"] = existing_embs[m_key]
+                elif not c.get("embedding"):
+                    cands_to_embed.append(c)
+                    texts_to_embed.append(build_text_for_embedding(c))
+
+            if texts_to_embed:
+                batch_embeddings = await generate_embeddings_batch(texts_to_embed)
+                for cand_item, emb in zip(cands_to_embed, batch_embeddings):
+                    if emb:
+                        cand_item["embedding"] = emb
+                        cid = cand_item["id"]
+                        mtype = cand_item.get("media_type", "movie")
+                        existing_m = (await db.execute(
+                            select(MediaModel).where(MediaModel.tmdb_id == cid, MediaModel.media_type == mtype)
+                        )).scalars().first()
+                        if existing_m:
+                            existing_m.embedding = emb
+                        else:
+                            new_m = MediaModel(
+                                tmdb_id=cid,
+                                media_type=mtype,
+                                title=cand_item.get("title") or "Mídia",
+                                poster_path=cand_item.get("poster_path"),
+                                backdrop_path=cand_item.get("backdrop_path"),
+                                original_language=cand_item.get("original_language"),
+                                genres=[{"id": 0, "name": g} for g in cand_item.get("genres", [])] if isinstance(cand_item.get("genres"), list) else [],
+                                directors=cand_item.get("crew", []),
+                                main_cast=cand_item.get("cast", []),
+                                keywords=cand_item.get("keywords_list", []),
+                                embedding=emb
+                            )
+                            db.add(new_m)
+                await db.commit()
+        except Exception:
+            pass
+
     return list(enriched)
 
 
@@ -567,19 +662,20 @@ async def get_personalized_recommendations(
 
     user_vector = user.feature_vector
     user_embedding = user.embedding
+    user_taste_clusters = user.taste_clusters or []
 
     # V2: Se uma Persona específica foi selecionada, direciona os vetores para o polo do cluster
-    if persona_id and user.taste_clusters:
-        target_persona = next((p for p in user.taste_clusters if p.get("id") == persona_id), None)
+    if persona_id and user_taste_clusters:
+        target_persona = next((p for p in user_taste_clusters if p.get("id") == persona_id), None)
         if target_persona:
             user_vector = target_persona.get("feature_vector") or user_vector
             user_embedding = target_persona.get("centroid_embedding") or user_embedding
         discover_candidates = await fetch_discover_candidates(user_vector, db=db, user_id=user_id, persona_id=persona_id)
-    elif user.taste_clusters and len(user.taste_clusters) > 1:
+    elif user_taste_clusters and len(user_taste_clusters) > 1:
         # Pescaria Multi-Persona para o Carrossel Geral: busca candidatos para cada faceta do usuario
         tasks = [
             fetch_discover_candidates(p.get("feature_vector") or user_vector, db=db, user_id=user_id, persona_id=p.get("id"))
-            for p in user.taste_clusters
+            for p in user_taste_clusters
         ]
         tasks.append(fetch_discover_candidates(user_vector, db=db, user_id=user_id))
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -610,7 +706,36 @@ async def get_personalized_recommendations(
     seen_media_keys = {(item.media.media_type, item.media.tmdb_id) for item in user_list if item.media}
     dismissed_keys = await get_active_dismissed_media_keys(db, user_id)
     dismissed_records = await get_user_dismissed_records(db, user_id)
+    dismissed_snapshots = [
+        {
+            "embedding": getattr(r, "embedding", None),
+            "expires_at": getattr(r, "expires_at", None),
+            "created_at": getattr(r, "created_at", None),
+        }
+        for r in dismissed_records
+    ]
     seen_media_keys = seen_media_keys.union(dismissed_keys)
+
+    # Cria snapshots imutáveis em memória para isolar do ciclo de vida da sessão SQLAlchemy
+    user_item_snapshots = []
+    for it in user_list:
+        try:
+            m = getattr(it, "media", None)
+            ep_list = getattr(it, "episodes", []) or []
+            ep_rewatches = sum((getattr(ep, "rewatch_count", 0) or 0) for ep in ep_list)
+            user_item_snapshots.append({
+                "title": getattr(m, "title", None) if m else None,
+                "media_type": getattr(m, "media_type", "movie") if m else "movie",
+                "embedding": getattr(m, "embedding", None) if m else None,
+                "media_obj": m,
+                "rating": getattr(it, "rating", None),
+                "status": getattr(it, "status", None),
+                "is_favorite": getattr(it, "is_favorite", False),
+                "rewatch_count": getattr(it, "rewatch_count", 0) or 0,
+                "ep_rewatches": ep_rewatches,
+            })
+        except Exception:
+            pass
 
     filtered_discover = [
         c for c in discover_candidates
@@ -656,7 +781,12 @@ async def get_personalized_recommendations(
     to_enrich = [c for c in all_candidates if not c.get("collaborative")]
     already_enriched = [c for c in all_candidates if c.get("collaborative")]
 
-    enriched_discover = await enrich_candidates_with_details(to_enrich, user_vector=user_vector) if to_enrich else []
+    enriched_discover = await enrich_candidates_with_details(
+        to_enrich,
+        user_vector=user_vector,
+        db=db,
+        seen_keys=seen_candidate_keys
+    ) if to_enrich else []
     total_candidates = already_enriched + list(enriched_discover)
 
     # Fase 6: Busca embeddings locais pré-calculados para os candidatos usando chave composta
@@ -677,13 +807,12 @@ async def get_personalized_recommendations(
         except Exception:
             pass
 
-    # 4. Score & Re-rank using hybrid vectors (Affinity + Fase 6 Semantic Embeddings)
-    from app.recommendation.embeddings import calculate_cosine_similarity
+    # 4. Score & Re-rank usando a Equação Canônica Única (OmniMatch v3 - Ideia 5)
     if user_embedding is None:
         user_embedding = user.embedding
 
-    active_personas = user.taste_clusters if (not persona_id and user.taste_clusters and len(user.taste_clusters) > 1) else None
-    target_persona = next((p for p in (user.taste_clusters or []) if str(p.get("id")) == str(persona_id)), None) if persona_id else None
+    active_personas = user_taste_clusters if (not persona_id and user_taste_clusters and len(user_taste_clusters) > 1) else None
+    target_persona = next((p for p in user_taste_clusters if str(p.get("id")) == str(persona_id)), None) if persona_id else None
 
     scored_candidates = []
     for c in total_candidates:
@@ -691,95 +820,36 @@ async def get_personalized_recommendations(
         c["_candidate_vector"] = candidate_vector
         cand_emb = c.get("embedding")
 
-        if target_persona:
-            # Score exclusivo para a Persona selecionada (usa centroid_embedding e feature_vector específicos da Persona)
-            p_vec = target_persona.get("feature_vector") or user_vector
-            p_emb = target_persona.get("centroid_embedding") or user_embedding
-            aff_score, top_tags = calculate_match_score(p_vec, candidate_vector)
+        omni = compute_omnimatch_score(
+            user_vector=user_vector,
+            candidate_vector=candidate_vector,
+            user_embedding=user_embedding,
+            candidate_embedding=cand_emb,
+            target_persona=target_persona,
+            active_personas=active_personas,
+            vote_average=float(c.get("vote_average") or 0.0),
+            vote_count=int(c.get("vote_count") or 0),
+            user_item_count=len(user_list),
+            candidate=c,
+            user_items=user_item_snapshots,
+        )
 
-            if p_emb and cand_emb:
-                sem_sim = calculate_cosine_similarity(p_emb, cand_emb)
-                sem_score = sem_sim * 100.0
-                final_score = round(0.65 * sem_score + 0.35 * aff_score, 1)
-                if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in top_tags:
-                    top_tags.append("✨ Sintonia Semântica")
-            else:
-                final_score = aff_score
-
-            c["_best_persona_id"] = target_persona.get("id")
-        elif active_personas:
-            # Score da Faceta Correspondente (Best Match entre as personas ativas do usuário)
-            best_final_score = -1.0
-            best_tags = []
-            best_persona_id = "general"
-
-            for p in active_personas:
-                p_vec = p.get("feature_vector") or user_vector
-                p_emb = p.get("centroid_embedding") or user_embedding
-                aff_score, tags = calculate_match_score(p_vec, candidate_vector)
-
-                if p_emb and cand_emb:
-                    sem_sim = calculate_cosine_similarity(p_emb, cand_emb)
-                    sem_score = sem_sim * 100.0
-                    f_score = round(0.65 * sem_score + 0.35 * aff_score, 1)
-                    if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in tags:
-                        tags.append("✨ Sintonia Semântica")
-                else:
-                    f_score = aff_score
-
-                if f_score > best_final_score:
-                    best_final_score = f_score
-                    best_tags = tags
-                    best_persona_id = p.get("id")
-
-            final_score = best_final_score
-            top_tags = best_tags
-            c["_best_persona_id"] = best_persona_id
-        else:
-            affinity_score, top_tags = calculate_match_score(user_vector, candidate_vector)
-            if user_embedding and cand_emb:
-                sem_sim = calculate_cosine_similarity(user_embedding, cand_emb)
-                sem_score = sem_sim * 100.0
-                final_score = round(0.65 * sem_score + 0.35 * affinity_score, 1)
-                if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in top_tags:
-                    top_tags.append("✨ Sintonia Semântica")
-            else:
-                final_score = affinity_score
-            c["_best_persona_id"] = "general"
+        final_score = omni["match_score"]
+        top_tags = omni["match_tags"]
 
         if c.get("collaborative") and "Gosto similar" not in top_tags:
             top_tags.append("Gosto similar")
 
         # Aplica penalidade contextual suave se o candidato for semanticamente muito próximo (>=0.75) de uma obra dispensada
-        if dismissed_records and cand_emb:
-            penalty = calculate_semantic_dismiss_penalty(cand_emb, dismissed_records)
+        if dismissed_snapshots and cand_emb:
+            penalty = calculate_semantic_dismiss_penalty(cand_emb, dismissed_snapshots)
             if penalty > 0:
                 final_score = max(0.0, round(final_score - penalty, 1))
 
         c["match_score"] = final_score
-
-        # Gera explicações ricas, persuasivas e humanas (Item-to-item, Talento, Persona, Microtemas)
-        from app.recommendation.matcher import build_rich_explanation_tags, calculate_rewatch_boost
-        matched_persona = target_persona or (
-            next((p for p in active_personas if p.get("id") == c.get("_best_persona_id")), None)
-            if active_personas else None
-        )
-        c["match_tags"] = build_rich_explanation_tags(
-            candidate=c,
-            user_vector=user_vector,
-            user_items=user_list,
-            cand_emb=cand_emb,
-            target_persona=matched_persona,
-            fallback_tags=top_tags,
-        )
-        if any(t.startswith("❤️") for t in c["match_tags"]):
-            c["match_score"] = min(100.0, round(c["match_score"] + 4.0, 1))
-
-        rewatch_boost_pts, rewatch_tag = calculate_rewatch_boost(candidate_vector, cand_emb, user_list)
-        if rewatch_boost_pts > 0:
-            c["match_score"] = min(100.0, round(c["match_score"] + rewatch_boost_pts, 1))
-            if rewatch_tag and not any("reassistiu" in t for t in c["match_tags"]):
-                c["match_tags"] = ([rewatch_tag] + c["match_tags"])[:3]
+        c["match_tags"] = top_tags
+        c["_best_persona_id"] = omni.get("best_persona_id")
+        c["is_preliminary"] = omni.get("is_preliminary", False)
 
         scored_candidates.append(c)
 
@@ -1056,6 +1126,7 @@ async def get_upcoming_recommendations(
 
     user_vector = user.feature_vector if user else {}
     user_embedding = user.embedding if user else None
+    user_taste_clusters = user.taste_clusters if (user and user.taste_clusters) else []
 
     # Candidatos futuros
     upcoming_candidates = await fetch_upcoming_candidates(user_vector, db=db, user_id=user_id)
@@ -1068,6 +1139,24 @@ async def get_upcoming_recommendations(
     dismissed_keys = await get_active_dismissed_media_keys(db, user_id)
     seen_media_keys = seen_media_keys.union(dismissed_keys)
 
+    user_item_snapshots = []
+    for it in user_list:
+        try:
+            m = getattr(it, "media", None)
+            user_item_snapshots.append({
+                "title": getattr(m, "title", None) if m else None,
+                "media_type": getattr(m, "media_type", "movie") if m else "movie",
+                "embedding": getattr(m, "embedding", None) if m else None,
+                "media_obj": m,
+                "rating": getattr(it, "rating", None),
+                "status": getattr(it, "status", None),
+                "is_favorite": getattr(it, "is_favorite", False),
+                "rewatch_count": getattr(it, "rewatch_count", 0) or 0,
+                "ep_rewatches": 0,
+            })
+        except Exception:
+            pass
+
     filtered_candidates = [
         c for c in upcoming_candidates
         if (c.get("media_type", "movie"), c.get("id")) not in seen_media_keys
@@ -1077,9 +1166,14 @@ async def get_upcoming_recommendations(
         return {"movies": [], "series": []}
 
     # Enriquecimento com detalhes (diretores, elenco, palavras-chave)
-    enriched = await enrich_candidates_with_details(filtered_candidates, user_vector=user_vector)
+    enriched = await enrich_candidates_with_details(
+        filtered_candidates,
+        user_vector=user_vector,
+        db=db,
+        seen_keys=seen_media_keys
+    )
 
-    active_personas = user.taste_clusters if (user and user.taste_clusters and len(user.taste_clusters) > 1) else None
+    active_personas = user_taste_clusters if len(user_taste_clusters) > 1 else None
 
     scored_movies = []
     scored_tv = []
@@ -1088,38 +1182,22 @@ async def get_upcoming_recommendations(
         candidate_vector = build_candidate_vector(c)
         c["_candidate_vector"] = candidate_vector
 
-        if active_personas:
-            best_final_score = -1.0
-            best_tags = []
-            for p in active_personas:
-                p_vec = p.get("feature_vector") or user_vector
-                aff_score, tags = calculate_match_score(p_vec, candidate_vector)
-                if aff_score > best_final_score:
-                    best_final_score = aff_score
-                    best_tags = tags
-            final_score = best_final_score
-            top_tags = best_tags
-        elif user_vector:
-            affinity_score, top_tags = calculate_match_score(user_vector, candidate_vector)
-            final_score = affinity_score
-        else:
-            final_score = round(min(95.0, max(50.0, (c.get("popularity", 0) / 10.0))), 1)
-            top_tags = ["Estreia confirmada"]
-
-        c["match_score"] = final_score
-
-        from app.recommendation.matcher import build_rich_explanation_tags, calculate_rewatch_boost
-        c["match_tags"] = build_rich_explanation_tags(
-            candidate=c,
+        omni = compute_omnimatch_score(
             user_vector=user_vector or {},
-            user_items=user_list,
-            fallback_tags=top_tags,
+            candidate_vector=candidate_vector,
+            user_embedding=user_embedding,
+            candidate_embedding=None,
+            active_personas=active_personas,
+            vote_average=float(c.get("vote_average") or 0.0),
+            vote_count=int(c.get("vote_count") or 0),
+            user_item_count=len(user_list),
+            candidate=c,
+            user_items=user_item_snapshots,
         )
-        rewatch_boost_pts, rewatch_tag = calculate_rewatch_boost(candidate_vector, None, user_list)
-        if rewatch_boost_pts > 0:
-            c["match_score"] = min(100.0, round(c["match_score"] + rewatch_boost_pts, 1))
-            if rewatch_tag and not any("reassistiu" in t for t in c["match_tags"]):
-                c["match_tags"] = ([rewatch_tag] + c["match_tags"])[:3]
+
+        c["match_score"] = omni["match_score"]
+        c["match_tags"] = omni["match_tags"]
+        c["is_preliminary"] = omni.get("is_preliminary", False)
 
         if c.get("media_type") == "movie":
             scored_movies.append(c)

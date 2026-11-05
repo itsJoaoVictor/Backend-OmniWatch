@@ -1,3 +1,4 @@
+import math
 from typing import List, Dict, Any, Union
 from app.media.models import Media
 
@@ -129,6 +130,27 @@ def normalize_genre_to_canonical(genre_input: Any) -> List[str]:
 
     # 5. Já está em português ou normalizado
     return [raw_name]
+
+def sublinear_scale(val: float) -> float:
+    """
+    Escala sublinear: sign(val) * ln(1 + |val|)
+    Evita que consumo massivo de um mesmo tema exploda o vetor linearmente.
+    """
+    if val == 0.0:
+        return 0.0
+    sign = 1.0 if val > 0 else -1.0
+    return sign * math.log1p(abs(val))
+
+
+def compute_idf(n_f: int, N: int) -> float:
+    """
+    BM25/IDF: ln(1 + (N - n_f + 0.5) / (n_f + 0.5))
+    Penaliza termos ubíquos (ex.: 'drama') e valoriza metadados raros (ex.: 'cyberpunk').
+    """
+    if N <= 0 or n_f < 0:
+        return 1.0
+    return math.log1p(max(0.0, (N - n_f + 0.5) / (n_f + 0.5)))
+
 
 def build_sparse_vector(media: Media) -> Dict[str, float]:
     """

@@ -12,7 +12,7 @@ from app.recommendation.orchestrator import (
     get_upcoming_recommendations,
     build_candidate_vector,
 )
-from app.recommendation.matcher import calculate_match_score
+from app.recommendation.matcher import calculate_match_score, compute_omnimatch_score
 from app.recommendation.vector_builder import WEIGHTS, normalize_genre_to_canonical
 from app.details.services import fetch_movie_details, fetch_tv_details
 
@@ -307,46 +307,7 @@ async def get_item_score(
         cand_emb = local_media_obj.embedding if local_media_obj else None
 
         active_personas = [p for p in user.taste_clusters if p.get("is_active", True)] if (user.taste_clusters and len(user.taste_clusters) > 1) else []
-        best_persona = None
-        
-        from app.recommendation.embeddings import calculate_cosine_similarity
-        
-        if active_personas:
-            best_final_score = -1.0
-            best_tags = []
-            
-            for p in active_personas:
-                p_vec = p.get("feature_vector") or user.feature_vector
-                p_emb = p.get("centroid_embedding") or user.embedding
-                
-                aff_score, tags = calculate_match_score(p_vec, candidate_vector)
-                
-                if p_emb and cand_emb:
-                    sem_sim = calculate_cosine_similarity(p_emb, cand_emb)
-                    sem_score = sem_sim * 100.0
-                    f_score = round(0.65 * sem_score + 0.35 * aff_score, 1)
-                    if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in tags:
-                        tags.append("✨ Sintonia Semântica")
-                else:
-                    f_score = aff_score
-                    
-                if f_score > best_final_score:
-                    best_final_score = f_score
-                    best_tags = tags
-                    best_persona = p
-                    
-            score = best_final_score
-            top_tags = best_tags
-        else:
-            score, top_tags = calculate_match_score(user.feature_vector, candidate_vector)
-            if user.embedding and cand_emb:
-                sem_sim = calculate_cosine_similarity(user.embedding, cand_emb)
-                sem_score = sem_sim * 100.0
-                score = round(0.65 * sem_score + 0.35 * score, 1)
-                if sem_sim >= 0.60 and "✨ Sintonia Semântica" not in top_tags:
-                    top_tags.append("✨ Sintonia Semântica")
-        
-        # Enriquecer tags com explicabilidade humana (Porque curtiu X, Talentos, Persona, Microtemas)
+
         user_list = []
         try:
             from app.tracking.services import get_user_list
@@ -354,28 +315,23 @@ async def get_item_score(
         except Exception:
             pass
 
-        from app.recommendation.matcher import build_rich_explanation_tags, calculate_rewatch_boost
-        rich_tags = build_rich_explanation_tags(
-            candidate=candidate_obj,
+        omni = compute_omnimatch_score(
             user_vector=user.feature_vector,
+            candidate_vector=candidate_vector,
+            user_embedding=user.embedding,
+            candidate_embedding=cand_emb,
+            active_personas=active_personas,
+            vote_average=float(getattr(tmdb_data, "vote_average", 0.0) or 0.0),
+            vote_count=int(getattr(tmdb_data, "vote_count", 0) or 0),
+            user_item_count=len(user_list),
+            candidate=candidate_obj,
             user_items=user_list,
-            cand_emb=cand_emb,
-            target_persona=best_persona,
-            fallback_tags=top_tags
         )
 
-        if any(t.startswith("❤️") for t in rich_tags):
-            score = min(100.0, round(score + 4.0, 1))
-
-        rewatch_boost_pts, rewatch_tag = calculate_rewatch_boost(candidate_vector, cand_emb, user_list)
-        if rewatch_boost_pts > 0:
-            score = min(100.0, round(score + rewatch_boost_pts, 1))
-            if rewatch_tag and not any("reassistiu" in t for t in rich_tags):
-                rich_tags = ([rewatch_tag] + rich_tags)[:3]
-        
         return {
-            "match_score": score,
-            "match_tags": rich_tags
+            "match_score": omni["match_score"],
+            "match_tags": omni["match_tags"],
+            "is_preliminary": omni.get("is_preliminary", False),
         }
     except Exception as e:
         # Ignore errors if TMDB fetch fails

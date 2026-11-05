@@ -12,7 +12,7 @@ from app.users.models import User
 from app.friends.models import Friendship
 from app.tracking.models import UserListItem
 from app.media.models import Media
-from app.recommendation.matcher import calculate_match_score
+from app.recommendation.matcher import calculate_match_score, compute_omnimatch_score
 from app.recommendation.orchestrator import (
     fetch_discover_candidates,
     enrich_candidates_with_details,
@@ -227,7 +227,7 @@ async def get_together_recommendations(
         synth_vector[k] = synth_vector.get(k, 0.0) + v * 0.5
 
     try:
-        enriched = await enrich_candidates_with_details(filtered_candidates, user_vector=synth_vector)
+        enriched = await enrich_candidates_with_details(filtered_candidates, user_vector=synth_vector, db=db)
     except Exception as e:
         logger.warning(f"Erro ao enriquecer candidatos: {e}")
         enriched = filtered_candidates
@@ -247,28 +247,46 @@ async def get_together_recommendations(
         except Exception:
             pass
 
-    # 7. Calcula Match Duplo Harmônico e tags explicativas
+    # 7. Calcula Match Duplo Harmônico e tags explicativas com compute_omnimatch_score
     scored_items: List[Dict[str, Any]] = []
+    user_a_count = len(seen_a) + len(watchlist_a)
+    user_b_count = len(seen_b) + len(watchlist_b)
 
     for c in enriched:
         cand_vec = build_candidate_vector(c)
         cand_emb = c.get("embedding")
+        vote_avg = float(c.get("vote_average") or 0.0)
+        vote_cnt = int(c.get("vote_count") or 0)
 
         # Score Usuário A
-        aff_a, tags_a = calculate_match_score(vector_a, cand_vec)
-        if emb_a and cand_emb:
-            sim_a = calculate_cosine_similarity(emb_a, cand_emb)
-            score_a = round(0.65 * (sim_a * 100.0) + 0.35 * aff_a, 1)
-        else:
-            score_a = aff_a
+        res_a = compute_omnimatch_score(
+            user_vector=vector_a,
+            candidate_vector=cand_vec,
+            user_embedding=emb_a,
+            candidate_embedding=cand_emb,
+            active_personas=user_a.taste_clusters if (user_a and user_a.taste_clusters and len(user_a.taste_clusters) > 1) else None,
+            vote_average=vote_avg,
+            vote_count=vote_cnt,
+            user_item_count=user_a_count,
+            candidate=c,
+        )
+        score_a = res_a["match_score"]
+        tags_a = res_a["match_tags"]
 
         # Score Usuário B
-        aff_b, tags_b = calculate_match_score(vector_b, cand_vec)
-        if emb_b and cand_emb:
-            sim_b = calculate_cosine_similarity(emb_b, cand_emb)
-            score_b = round(0.65 * (sim_b * 100.0) + 0.35 * aff_b, 1)
-        else:
-            score_b = aff_b
+        res_b = compute_omnimatch_score(
+            user_vector=vector_b,
+            candidate_vector=cand_vec,
+            user_embedding=emb_b,
+            candidate_embedding=cand_emb,
+            active_personas=user_b.taste_clusters if (user_b and user_b.taste_clusters and len(user_b.taste_clusters) > 1) else None,
+            vote_average=vote_avg,
+            vote_count=vote_cnt,
+            user_item_count=user_b_count,
+            candidate=c,
+        )
+        score_b = res_b["match_score"]
+        tags_b = res_b["match_tags"]
 
         # Média Harmônica com prevenção contra zeros
         if score_a <= 5.0 or score_b <= 5.0:
@@ -300,8 +318,9 @@ async def get_together_recommendations(
             elif tags_b:
                 shared_tags.append(tags_b[0])
 
-        # Priorização de obras no 'Quero Ver' de ambos os usuários
-        is_in_both_watchlists = c.get("id") in in_both_watchlists
+        # Priorização de obras no 'Quero Ver' de ambos os usuários (chave composta)
+        cand_key = (c.get("media_type", "movie"), c.get("id"))
+        is_in_both_watchlists = cand_key in in_both_watchlists
         if is_in_both_watchlists:
             # Garante pontuação de destaque para o desejo mútuo explícito
             combined_score = round(min(100.0, max(combined_score, 85.0) + 10.0), 1)
