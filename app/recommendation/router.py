@@ -229,6 +229,10 @@ async def get_upcoming_recommendations_endpoint(
             movies = [it for it in movies if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
             tv = [it for it in tv if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
 
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        movies = [it for it in movies if str(it.get("release_date") or "").strip() >= today_str]
+        tv = [it for it in tv if str(it.get("first_air_date") or "").strip() >= today_str]
+
         return {
             "movies": movies[:limit],
             "tv": tv[:limit]
@@ -275,6 +279,7 @@ async def get_explore_feed(
             if is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if seen_ids:
             explore = [it for it in explore if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
             recent_vibe = [it for it in recent_vibe if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
@@ -285,9 +290,10 @@ async def get_explore_feed(
                 p_c["recommendations"] = [it for it in recs if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
                 new_personas.append(p_c)
             personas = new_personas
-            up_movies = [it for it in (upcoming.get("movies") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
-            up_tv = [it for it in (upcoming.get("tv") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
-            upcoming = {"movies": up_movies, "tv": up_tv}
+
+        up_movies = [it for it in (upcoming.get("movies") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids and str(it.get("release_date") or "").strip() >= today_str]
+        up_tv = [it for it in (upcoming.get("tv") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids and str(it.get("first_air_date") or "").strip() >= today_str]
+        upcoming = {"movies": up_movies, "tv": up_tv}
 
         return {
             "explore": explore,

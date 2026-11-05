@@ -294,7 +294,8 @@ async def enrich_candidates_with_details(
     candidates: List[Dict[str, Any]],
     user_vector: Optional[Dict[str, float]] = None,
     db: Optional[AsyncSession] = None,
-    seen_keys: Optional[set] = None
+    seen_keys: Optional[set] = None,
+    allow_collection_redirect: bool = True
 ) -> List[Dict[str, Any]]:
     """
     Enriquecimento 1-RTT TMDB (append_to_response=credits,keywords,watch/providers,belongs_to_collection)
@@ -377,7 +378,7 @@ async def enrich_candidates_with_details(
             if media_type == "movie":
                 details = await fetch_movie_details(tmdb_id)
                 # Curadoria Collection Gate (Sub-etapa 2.4): Redireciona para Filme 1 se franquia inédita
-                if hasattr(details, "belongs_to_collection") and details.belongs_to_collection and seen_keys is not None:
+                if allow_collection_redirect and hasattr(details, "belongs_to_collection") and details.belongs_to_collection and seen_keys is not None:
                     col = details.belongs_to_collection
                     col_id = col.id if hasattr(col, "id") else (col.get("id") if isinstance(col, dict) else None)
                     if col_id:
@@ -1321,20 +1322,41 @@ async def get_upcoming_recommendations(
     if not filtered_candidates:
         return {"movies": [], "series": []}
 
-    # Enriquecimento com detalhes (diretores, elenco, palavras-chave)
+    # Enriquecimento com detalhes (sem redirecionar para Filme 1 do passado em Próximos Lançamentos)
     enriched = await enrich_candidates_with_details(
         filtered_candidates,
         user_vector=user_vector,
         db=db,
-        seen_keys=seen_media_keys
+        seen_keys=seen_media_keys,
+        allow_collection_redirect=False
     )
+
+    from datetime import datetime, timezone
+    today_dt = datetime.now(timezone.utc)
+    today_str = today_dt.strftime("%Y-%m-%d")
+
+    def _is_future_release(date_val: Any) -> bool:
+        if not date_val:
+            return False
+        d = str(date_val).strip()
+        if len(d) == 4 and d.isdigit():
+            return int(d) >= int(today_str[:4])
+        if len(d) >= 10:
+            return d[:10] >= today_str[:10]
+        return d >= today_str
+
+    # Filtro estrito: garante que somente obras com data de estreia futura permaneçam
+    strictly_upcoming = [
+        c for c in enriched
+        if _is_future_release(c.get("release_date") if c.get("media_type") == "movie" else c.get("first_air_date"))
+    ]
 
     active_personas = user_taste_clusters if len(user_taste_clusters) > 1 else None
 
     scored_movies = []
     scored_tv = []
 
-    for c in enriched:
+    for c in strictly_upcoming:
         candidate_vector = build_candidate_vector(c)
         c["_candidate_vector"] = candidate_vector
 
