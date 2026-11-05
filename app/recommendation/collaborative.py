@@ -5,7 +5,11 @@ import uuid
 from typing import List, Dict, Any, Set, Optional, Tuple, Union
 import numpy as np
 import scipy.sparse as sp
-import implicit
+
+try:
+    import implicit
+except ImportError:
+    implicit = None
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -53,6 +57,9 @@ async def _get_or_train_als_model(db: AsyncSession) -> Tuple[
       c_{ui} = 1 + alpha * r_{ui}
     """
     global _ALS_MODEL, _USER_ITEM_MATRIX, _USER_MAP, _REVERSE_USER_MAP, _ITEM_MAP, _REVERSE_ITEM_MAP, _LAST_ALS_FIT_TIME
+
+    if implicit is None:
+        return None, None, {}, {}
 
     now = time.time()
     if _ALS_MODEL is not None and (now - _LAST_ALS_FIT_TIME) < _ALS_TTL_SECONDS:
