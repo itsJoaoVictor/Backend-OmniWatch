@@ -1129,19 +1129,39 @@ async def fetch_upcoming_candidates(user_vector: Dict[str, float], db=None, user
     genre_features.sort(key=lambda x: x[1], reverse=True)
 
     live_genre_name_to_id: Dict[str, int] = {}
+    favorite_crew_ids: List[str] = []
+    favorite_cast_ids: List[str] = []
+
     if db and user_id:
         try:
             from app.tracking.services import get_user_list
             user_items = await get_user_list(db, user_id)
+            crew_counter: Dict[str, int] = {}
+            cast_counter: Dict[str, int] = {}
+
             for list_item in user_items:
                 media = list_item.media
-                if media and media.genres:
+                if not media:
+                    continue
+
+                if media.genres:
                     for g in media.genres:
                         if isinstance(g, dict):
                             _name = str(g.get("name", "")).lower()
                             _gid = g.get("id")
                             if _name and _gid:
                                 live_genre_name_to_id[_name] = _gid
+
+                weight = 2 if list_item.is_favorite or (list_item.rating and list_item.rating >= 4.0) else 1
+                if media.crew_ids and isinstance(media.crew_ids, list):
+                    for cid in media.crew_ids[:5]:
+                        crew_counter[str(cid)] = crew_counter.get(str(cid), 0) + weight
+                if media.cast_ids and isinstance(media.cast_ids, list):
+                    for cid in media.cast_ids[:5]:
+                        cast_counter[str(cid)] = cast_counter.get(str(cid), 0) + weight
+
+            favorite_crew_ids = [k for k, _ in sorted(crew_counter.items(), key=lambda x: x[1], reverse=True)[:5]]
+            favorite_cast_ids = [k for k, _ in sorted(cast_counter.items(), key=lambda x: x[1], reverse=True)[:5]]
         except Exception:
             pass
 
@@ -1185,18 +1205,62 @@ async def fetch_upcoming_candidates(user_vector: Dict[str, float], db=None, user
 
     tasks = []
     async with httpx.AsyncClient() as client:
-        # === FILMES FUTUROS ===
-        # 1. Discover filmes com gêneros primários do usuário
+        # === 1. OBRAS ORIGINAIS INÉDITAS (Anti-Franquias / Sem Sequências) ===
+        # Exclui tags de sequel (9663), franchise (209714), prequel (179431), spin-off (236407), cinematic universe (180547)
         if with_primary_movie_genres:
             for p in [1, 2]:
                 tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
                     "primary_release_date.gte": today,
                     "primary_release_date.lte": max_date,
+                    "without_keywords": "9663,209714,179431,236407,180547",
                     "with_genres": with_primary_movie_genres,
                     "sort_by": "popularity.desc",
                     "page": p
                 }))
-        # 2. Discover filmes com gêneros secundários do usuário
+
+        # === 2. PRODUTORAS DE CINEMA AUTORAL / HISTÓRIAS ORIGINAIS DE PRESTÍGIO ===
+        # A24 (41077), Neon (90886), Searchlight (43), Focus Features (10163)
+        tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
+            "primary_release_date.gte": today,
+            "primary_release_date.lte": max_date,
+            "with_companies": "41077|90886|43|10163",
+            "sort_by": "popularity.desc",
+            "page": 1
+        }))
+
+        # === 3. RADAR DE TALENTOS FAVORITOS (Diretores e Atores que o usuário mais consome) ===
+        if favorite_crew_ids:
+            tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
+                "primary_release_date.gte": today,
+                "primary_release_date.lte": max_date,
+                "with_crew": "|".join(favorite_crew_ids),
+                "sort_by": "popularity.desc",
+                "page": 1
+            }))
+        if favorite_cast_ids:
+            tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
+                "primary_release_date.gte": today,
+                "primary_release_date.lte": max_date,
+                "with_cast": "|".join(favorite_cast_ids),
+                "sort_by": "popularity.desc",
+                "page": 1
+            }))
+
+        # === 4. ESTREIAS NO BRASIL (Cinema comercial/limitado e Streaming Digital) ===
+        tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
+            "region": "BR",
+            "release_date.gte": today,
+            "release_date.lte": max_date,
+            "with_release_type": "2|3|4",
+            "sort_by": "popularity.desc",
+            "page": 1
+        }))
+        tasks.append(fetch_endpoint(client, "/movie/upcoming", "movie", {
+            "region": "BR",
+            "page": 1
+        }))
+
+        # === 5. DESCOBERTA GLOBAL POR GÊNEROS E POPULARIDADE ===
         if with_sec_movie_genres:
             tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
                 "primary_release_date.gte": today,
@@ -1205,49 +1269,32 @@ async def fetch_upcoming_candidates(user_vector: Dict[str, float], db=None, user
                 "sort_by": "popularity.desc",
                 "page": 1
             }))
-        # 3. Discover filmes mais populares globais a estrear
-        for p in [1, 2, 3]:
+        for p in [1, 2]:
             tasks.append(fetch_endpoint(client, "/discover/movie", "movie", {
                 "primary_release_date.gte": today,
                 "primary_release_date.lte": max_date,
                 "sort_by": "popularity.desc",
                 "page": p
             }))
-        # 4. Upcoming oficial com region=BR
-        for p in [1, 2]:
-            tasks.append(fetch_endpoint(client, "/movie/upcoming", "movie", {
-                "region": "BR",
-                "page": p
-            }))
 
-        # === SÉRIES INÉDITAS FUTURAS ===
-        # 1. Discover TV com gêneros primários do usuário
+        # === 6. SÉRIES INÉDITAS DE FICÇÃO E MINISSÉRIES (com with_type=2|4) ===
         if with_primary_tv_genres:
             for p in [1, 2]:
                 tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
                     "first_air_date.gte": today,
                     "first_air_date.lte": max_date,
                     "include_null_first_air_dates": "false",
+                    "with_type": "2|4",
                     "with_genres": with_primary_tv_genres,
                     "sort_by": "popularity.desc",
                     "page": p
                 }))
-        # 2. Discover TV com gêneros secundários do usuário
-        if with_sec_tv_genres:
+        for p in [1, 2]:
             tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
                 "first_air_date.gte": today,
                 "first_air_date.lte": max_date,
                 "include_null_first_air_dates": "false",
-                "with_genres": with_sec_tv_genres,
-                "sort_by": "popularity.desc",
-                "page": 1
-            }))
-        # 3. Discover TV mais populares globais inéditas a estrear
-        for p in [1, 2, 3]:
-            tasks.append(fetch_endpoint(client, "/discover/tv", "tv", {
-                "first_air_date.gte": today,
-                "first_air_date.lte": max_date,
-                "include_null_first_air_dates": "false",
+                "with_type": "2|4",
                 "sort_by": "popularity.desc",
                 "page": p
             }))
@@ -1373,8 +1420,12 @@ async def get_upcoming_recommendations(
             user_items=user_item_snapshots,
         )
 
+        top_tags = list(omni["match_tags"])
+        if not c.get("belongs_to_collection") and "✨ História Original" not in top_tags:
+            top_tags.append("✨ História Original")
+
         c["match_score"] = omni["match_score"]
-        c["match_tags"] = omni["match_tags"]
+        c["match_tags"] = top_tags
         c["is_preliminary"] = omni.get("is_preliminary", False)
 
         if c.get("media_type") == "movie":
