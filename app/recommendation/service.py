@@ -2,7 +2,7 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -65,12 +65,16 @@ async def mark_user_recommendations_stale(
         logger.error(f"[RECS-SERVICE] Erro ao marcar recomendações como stale para {user_id}: {e}")
 
 async def eject_media_from_user_recommendations(
-    db: AsyncSession, user_id: str, tmdb_id: int
+    db: AsyncSession,
+    user_id: str,
+    tmdb_id: int,
+    media_type: Optional[str] = None
 ) -> bool:
     """
-    Remove imediatamente a obra com tmdb_id de todas as recomendações salvas
-    do usuário (explore, upcoming e personas), garantindo que ela suma
-    instantaneamente da tela /explore sem esperar nenhum recálculo.
+    Remove imediatamente a obra com chave canônica (media_type, tmdb_id)
+    de todas as recomendações salvas do usuário (explore, upcoming e personas),
+    garantindo que ela suma instantaneamente sem colidir filmes e séries com mesmo ID.
+    Se media_type for None, remove por tmdb_id (compatibilidade retroativa).
     """
     try:
         record = await get_user_recommendations_record(db, user_id)
@@ -79,13 +83,20 @@ async def eject_media_from_user_recommendations(
 
         modified = False
 
+        def _matches(item: Dict[str, Any]) -> bool:
+            it_id = item.get("id") or item.get("tmdb_id")
+            if it_id != tmdb_id:
+                return False
+            if media_type is not None:
+                it_mtype = item.get("media_type")
+                if it_mtype and it_mtype != media_type:
+                    return False
+            return True
+
         # 1. Remove de explore_items
         if record.explore_items:
             orig_len = len(record.explore_items)
-            filtered_explore = [
-                it for it in record.explore_items
-                if it.get("id") != tmdb_id and it.get("tmdb_id") != tmdb_id
-            ]
+            filtered_explore = [it for it in record.explore_items if not _matches(it)]
             if len(filtered_explore) != orig_len:
                 record.explore_items = filtered_explore
                 flag_modified(record, "explore_items")
@@ -95,8 +106,16 @@ async def eject_media_from_user_recommendations(
         if record.upcoming_items:
             up_movies = record.upcoming_items.get("movies", [])
             up_tv = record.upcoming_items.get("tv", [])
-            new_movies = [it for it in up_movies if it.get("id") != tmdb_id and it.get("tmdb_id") != tmdb_id]
-            new_tv = [it for it in up_tv if it.get("id") != tmdb_id and it.get("tmdb_id") != tmdb_id]
+            new_movies = [
+                it for it in up_movies
+                if not (it.get("id") == tmdb_id or it.get("tmdb_id") == tmdb_id)
+                or (media_type is not None and media_type != "movie")
+            ]
+            new_tv = [
+                it for it in up_tv
+                if not (it.get("id") == tmdb_id or it.get("tmdb_id") == tmdb_id)
+                or (media_type is not None and media_type != "tv")
+            ]
             if len(new_movies) != len(up_movies) or len(new_tv) != len(up_tv):
                 record.upcoming_items = {"movies": new_movies, "tv": new_tv}
                 flag_modified(record, "upcoming_items")
@@ -107,10 +126,7 @@ async def eject_media_from_user_recommendations(
             new_personas = []
             for persona in record.personas_items:
                 recs = persona.get("recommendations", [])
-                filtered_recs = [
-                    it for it in recs
-                    if it.get("id") != tmdb_id and it.get("tmdb_id") != tmdb_id
-                ]
+                filtered_recs = [it for it in recs if not _matches(it)]
                 p_copy = dict(persona)
                 p_copy["recommendations"] = filtered_recs
                 new_personas.append(p_copy)
@@ -121,7 +137,8 @@ async def eject_media_from_user_recommendations(
         if modified:
             record.is_stale = True
             await db.commit()
-            logger.info(f"[RECS-SERVICE] Obra tmdb_id={tmdb_id} ejetada imediatamente das recomendações de {user_id}.")
+            type_info = f" ({media_type})" if media_type else ""
+            logger.info(f"[RECS-SERVICE] Obra tmdb_id={tmdb_id}{type_info} ejetada imediatamente das recomendações de {user_id}.")
 
         return modified
     except Exception as e:
@@ -431,10 +448,10 @@ async def dismiss_recommendation(
     await db.commit()
     await db.refresh(dismissed)
 
-    # 3. Ejetar imediatamente dos carrosséis salvos
-    await eject_media_from_user_recommendations(db, user_id, tmdb_id)
+    # 3. Ejetar imediatamente dos carrosséis salvos com chave canônica (media_type, tmdb_id)
+    await eject_media_from_user_recommendations(db, user_id, tmdb_id, media_type=media_type)
 
-    logger.info(f"[RECS-SERVICE] Obra {tmdb_id} dispensada pelo usuário {user_id} com snooze até {expires_at}.")
+    logger.info(f"[RECS-SERVICE] Obra {media_type} tmdb_id={tmdb_id} dispensada pelo usuário {user_id} com snooze até {expires_at}.")
     return dismissed
 
 async def undismiss_recommendation(
@@ -464,26 +481,37 @@ async def undismiss_recommendation(
         await db.delete(r)
 
     await db.commit()
-    logger.info(f"[RECS-SERVICE] Obra {tmdb_id} restaurada da lista de dispensadas para usuário {user_id}.")
+    logger.info(f"[RECS-SERVICE] Obra {media_type or ''} tmdb_id={tmdb_id} restaurada da lista de dispensadas para usuário {user_id}.")
     return True
+
+async def get_active_dismissed_media_keys(
+    db: AsyncSession,
+    user_id: str,
+) -> Set[Tuple[str, int]]:
+    """
+    Retorna o conjunto de chaves canônicas (media_type, tmdb_id) ativas com dispensa vigente
+    (dentro do prazo de snooze), prevenindo colisão entre filmes e séries com mesmo id.
+    """
+    try:
+        u_uuid = _parse_uuid(user_id)
+        now = datetime.now(timezone.utc)
+        stmt = select(UserDismissedRecommendation.media_type, UserDismissedRecommendation.tmdb_id).where(
+            UserDismissedRecommendation.user_id == u_uuid,
+            UserDismissedRecommendation.expires_at > now,
+        )
+        res = await db.execute(stmt)
+        return {(row[0], row[1]) for row in res.all()}
+    except Exception as e:
+        logger.error(f"[RECS-SERVICE] Erro ao buscar chaves dispensadas para {user_id}: {e}")
+        return set()
 
 async def get_active_dismissed_tmdb_ids(
     db: AsyncSession,
     user_id: str,
 ) -> Set[int]:
     """Retorna o conjunto de tmdb_ids ativos com dispensa vigente (dentro do prazo de snooze)."""
-    try:
-        u_uuid = _parse_uuid(user_id)
-        now = datetime.now(timezone.utc)
-        stmt = select(UserDismissedRecommendation.tmdb_id).where(
-            UserDismissedRecommendation.user_id == u_uuid,
-            UserDismissedRecommendation.expires_at > now,
-        )
-        res = await db.execute(stmt)
-        return set(res.scalars().all())
-    except Exception as e:
-        logger.error(f"[RECS-SERVICE] Erro ao buscar tmdb_ids dispensados para {user_id}: {e}")
-        return set()
+    keys = await get_active_dismissed_media_keys(db, user_id)
+    return {k[1] for k in keys}
 
 async def get_user_dismissed_records(
     db: AsyncSession,

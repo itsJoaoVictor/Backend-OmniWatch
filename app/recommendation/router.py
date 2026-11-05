@@ -7,9 +7,13 @@ from app.core.database import get_db
 from app.core.cache import SimpleTTLCache
 from app.auth.dependencies import get_current_user_id
 from app.users.models import User
-from app.recommendation.orchestrator import get_personalized_recommendations, get_upcoming_recommendations
+from app.recommendation.orchestrator import (
+    get_personalized_recommendations,
+    get_upcoming_recommendations,
+    build_candidate_vector,
+)
 from app.recommendation.matcher import calculate_match_score
-from app.recommendation.vector_builder import WEIGHTS
+from app.recommendation.vector_builder import WEIGHTS, normalize_genre_to_canonical
 from app.details.services import fetch_movie_details, fetch_tv_details
 
 router = APIRouter()
@@ -281,30 +285,20 @@ async def get_item_score(
         else:
             tmdb_data = await fetch_tv_details(tmdb_id)
             
-        candidate_vector = {}
-        candidate_vector[f"type_{media_type}"] = WEIGHTS["media_type"]
-        
-        if tmdb_data.genres:
-            for g in tmdb_data.genres:
-                candidate_vector[f"genre_{g.name.lower()}"] = WEIGHTS["genre"]
-                
-        if tmdb_data.credits:
-            if tmdb_data.credits.crew:
-                for c in tmdb_data.credits.crew:
-                    if c.job in ("Director", "Creator"):
-                        candidate_vector[f"director_{c.name.lower()}"] = WEIGHTS["director"]
-            if tmdb_data.credits.cast:
-                for c in tmdb_data.credits.cast[:10]:
-                    candidate_vector[f"cast_{c.name.lower()}"] = WEIGHTS["cast"]
-                    
-        # Fase 1: Keywords
-        if hasattr(tmdb_data, "keywords") and tmdb_data.keywords:
-            for kw in tmdb_data.keywords:
-                candidate_vector[f"keyword_{kw.lower()}"] = WEIGHTS["keyword"]
-
-        # Fase 2: Original Language
-        if tmdb_data.original_language and tmdb_data.original_language.lower() != "en":
-            candidate_vector[f"lang_{tmdb_data.original_language.lower()}"] = WEIGHTS["language"]
+        candidate_obj = {
+            "id": tmdb_id,
+            "title": getattr(tmdb_data, "title", None) or getattr(tmdb_data, "name", "Mídia"),
+            "name": getattr(tmdb_data, "name", None),
+            "media_type": media_type,
+            "genres": [g.name if hasattr(g, "name") else g for g in tmdb_data.genres] if tmdb_data.genres else [],
+            "keywords": tmdb_data.keywords if hasattr(tmdb_data, "keywords") and tmdb_data.keywords else [],
+            "keywords_list": tmdb_data.keywords if hasattr(tmdb_data, "keywords") and tmdb_data.keywords else [],
+            "credits": tmdb_data.credits.dict() if tmdb_data.credits and hasattr(tmdb_data.credits, "dict") else None,
+            "cast": [c.name for c in tmdb_data.credits.cast[:10]] if tmdb_data.credits and tmdb_data.credits.cast else [],
+            "crew": [c.name for c in tmdb_data.credits.crew if getattr(c, "job", "") in ("Director", "Creator")] if tmdb_data.credits and tmdb_data.credits.crew else [],
+            "original_language": getattr(tmdb_data, "original_language", "") or "",
+        }
+        candidate_vector = build_candidate_vector(candidate_obj)
                     
         # Check if we have local embedding
         from app.media.models import Media as MediaModel
@@ -312,7 +306,7 @@ async def get_item_score(
         local_media_obj = local_media.scalars().first()
         cand_emb = local_media_obj.embedding if local_media_obj else None
 
-        active_personas = [p for p in user.taste_clusters if p.get("is_active", True)] if user.taste_clusters else []
+        active_personas = [p for p in user.taste_clusters if p.get("is_active", True)] if (user.taste_clusters and len(user.taste_clusters) > 1) else []
         best_persona = None
         
         from app.recommendation.embeddings import calculate_cosine_similarity
@@ -355,23 +349,12 @@ async def get_item_score(
         # Enriquecer tags com explicabilidade humana (Porque curtiu X, Talentos, Persona, Microtemas)
         user_list = []
         try:
-            from app.user_list.service import get_user_list
+            from app.tracking.services import get_user_list
             user_list = await get_user_list(db, user.id)
         except Exception:
             pass
 
-        candidate_obj = {
-            "id": tmdb_id,
-            "title": getattr(tmdb_data, "title", None) or getattr(tmdb_data, "name", "Mídia"),
-            "name": getattr(tmdb_data, "name", None),
-            "media_type": media_type,
-            "genres": [g.name for g in tmdb_data.genres] if tmdb_data.genres else [],
-            "keywords": tmdb_data.keywords if hasattr(tmdb_data, "keywords") and tmdb_data.keywords else [],
-            "credits": tmdb_data.credits.dict() if tmdb_data.credits and hasattr(tmdb_data.credits, "dict") else None,
-            "original_language": getattr(tmdb_data, "original_language", None),
-        }
-
-        from app.recommendation.matcher import build_rich_explanation_tags
+        from app.recommendation.matcher import build_rich_explanation_tags, calculate_rewatch_boost
         rich_tags = build_rich_explanation_tags(
             candidate=candidate_obj,
             user_vector=user.feature_vector,
@@ -380,6 +363,15 @@ async def get_item_score(
             target_persona=best_persona,
             fallback_tags=top_tags
         )
+
+        if any(t.startswith("❤️") for t in rich_tags):
+            score = min(100.0, round(score + 4.0, 1))
+
+        rewatch_boost_pts, rewatch_tag = calculate_rewatch_boost(candidate_vector, cand_emb, user_list)
+        if rewatch_boost_pts > 0:
+            score = min(100.0, round(score + rewatch_boost_pts, 1))
+            if rewatch_tag and not any("reassistiu" in t for t in rich_tags):
+                rich_tags = ([rewatch_tag] + rich_tags)[:3]
         
         return {
             "match_score": score,

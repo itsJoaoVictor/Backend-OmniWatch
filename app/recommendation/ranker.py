@@ -15,6 +15,7 @@ from app.recommendation.embeddings import calculate_cosine_similarity
 from app.recommendation.orchestrator import build_candidate_vector
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "lgbm_ranker.pkl")
+ENABLE_LGBM_RANKER = False  # Desabilitado até Etapa 6 (Anomalia 2.1.1 + Ideia 9)
 
 class LightGBMRanker:
     _cached_model = None
@@ -25,6 +26,10 @@ class LightGBMRanker:
         self._load_model()
 
     def _load_model(self):
+        if not ENABLE_LGBM_RANKER:
+            self.model = None
+            return
+
         if not os.path.exists(MODEL_PATH):
             if LightGBMRanker._cached_mtime == 0:
                 print("⚠️ [LightGBM] Arquivo de modelo não encontrado. Usando pesos manuais (fallback).")
@@ -45,7 +50,7 @@ class LightGBMRanker:
             logger.error(f"[LightGBM] Failed to load LightGBM model: {e}")
 
     def is_ready(self) -> bool:
-        return self.model is not None
+        return ENABLE_LGBM_RANKER and self.model is not None
 
     def extract_features(self, user: User, candidate: Dict[str, Any], cand_emb=None) -> List[float]:
         """
@@ -145,14 +150,14 @@ async def train_ranker_model(db: AsyncSession):
             if not item.media:
                 continue
                 
-            # Converter Media para o formato esperado pelo candidate
+            # Converter Media para o formato esperado pelo candidate (sem placeholders arbitrários)
             candidate_dict = {
                 "media_type": item.media.media_type,
                 "genre_ids": [g.get("id") if isinstance(g, dict) else g for g in (item.media.genres or [])],
                 "genres": item.media.genres,
                 "original_language": item.media.original_language,
-                "popularity": 50.0, # Placeholder médio se não tiver no DB
-                "vote_average": 7.0,
+                "popularity": float(getattr(item.media, "popularity", 0.0) or 0.0),
+                "vote_average": float(getattr(item.media, "vote_average", 0.0) or 0.0),
             }
             
             # Positivo
@@ -170,8 +175,8 @@ async def train_ranker_model(db: AsyncSession):
                         "genre_ids": [g.get("id") if isinstance(g, dict) else g for g in (neg_m.genres or [])],
                         "genres": neg_m.genres,
                         "original_language": neg_m.original_language,
-                        "popularity": 20.0,
-                        "vote_average": 5.0,
+                        "popularity": float(getattr(neg_m, "popularity", 0.0) or 0.0),
+                        "vote_average": float(getattr(neg_m, "vote_average", 0.0) or 0.0),
                     }
                     features_neg = ranker.extract_features(user, neg_dict, cand_emb=neg_m.embedding)
                     X_train.append(features_neg)
@@ -210,6 +215,11 @@ async def run_ranker_training_loop(interval_hours: int = 24):
     await asyncio.sleep(5 * 60)
     
     while True:
+        if not ENABLE_LGBM_RANKER:
+            logger.info("[LightGBM] Treinamento do ranker pausado até Etapa 6 (Anomalia 2.1.1 resolvida).")
+            await asyncio.sleep(interval_hours * 3600)
+            continue
+
         try:
             print("Iniciando treinamento automático agendado do LightGBM...")
             async with AsyncSessionLocal() as db:

@@ -92,6 +92,11 @@ async def generate_embedding(text: str) -> Optional[List[float]]:
             if response.status_code == 200:
                 data = response.json()
                 embedding = data["data"][0]["embedding"]
+                if len(embedding) != settings.EMBEDDING_DIM:
+                    logger.warning(
+                        f"[Embeddings] Dimensão de embedding inesperada da API: {len(embedding)} "
+                        f"!= {settings.EMBEDDING_DIM}"
+                    )
                 # Normaliza o vetor para ter norma euclidiana = 1.0
                 vec = np.array(embedding, dtype=np.float32)
                 norm = np.linalg.norm(vec)
@@ -99,10 +104,13 @@ async def generate_embedding(text: str) -> Optional[List[float]]:
                     vec = vec / norm
                 return vec.tolist()
             else:
-                logger.error(f"Erro ao gerar embedding via OpenRouter: {response.status_code} - {response.text}")
+                logger.error(f"[Embeddings] Erro ao gerar embedding via OpenRouter: {response.status_code} - {response.text}")
                 return None
+    except httpx.TimeoutException as te:
+        logger.error(f"[Embeddings] Timeout (>5.0s) ao chamar API de embedding: {te}")
+        return None
     except Exception as e:
-        logger.error(f"Exceção ao chamar API de embedding: {e}")
+        logger.error(f"[Embeddings] Exceção ao chamar API de embedding: {e}")
         return None
 
 
@@ -110,6 +118,7 @@ def calculate_cosine_similarity(vec_a: Optional[List[float]], vec_b: Optional[Li
     """
     Calcula a similaridade de cosseno entre dois vetores normalizados.
     Retorna um valor float entre 0.0 e 1.0.
+    Protegido contra dimensões desalinhadas e vetores nulos.
     """
     if not vec_a or not vec_b:
         return 0.0
@@ -117,6 +126,13 @@ def calculate_cosine_similarity(vec_a: Optional[List[float]], vec_b: Optional[Li
     try:
         a = np.array(vec_a, dtype=np.float32)
         b = np.array(vec_b, dtype=np.float32)
+
+        if a.shape != b.shape:
+            logger.warning(
+                f"[Embeddings] Dimensões incompatíveis em calculate_cosine_similarity: "
+                f"a.shape={a.shape} vs b.shape={b.shape} (esperado: ({settings.EMBEDDING_DIM},))"
+            )
+            return 0.0
 
         norm_a = np.linalg.norm(a)
         norm_b = np.linalg.norm(b)
@@ -127,7 +143,8 @@ def calculate_cosine_similarity(vec_a: Optional[List[float]], vec_b: Optional[Li
         similarity = float(np.dot(a, b) / (norm_a * norm_b))
         # Clampa entre 0.0 e 1.0 para uso no match score
         return max(0.0, min(1.0, similarity))
-    except Exception:
+    except Exception as e:
+        logger.error(f"[Embeddings] Erro ao calcular similaridade de cosseno: {e}")
         return 0.0
 
 
@@ -140,6 +157,7 @@ def update_user_embedding_vector(
     Atualiza o vetor de embedding do usuário de forma incremental e ponderada.
     - Se scale > 0 (gostou), puxa o vetor do usuário em direção ao vetor da obra.
     - Se scale < 0 (não gostou), afasta o vetor do usuário daquela região semântica.
+    Protegido contra incompatibilidade de dimensão vetorial.
     """
     if not media_embedding:
         return current_embedding or []
@@ -152,6 +170,14 @@ def update_user_embedding_vector(
         return (med_vec / norm).tolist() if norm > 0 else []
 
     curr_vec = np.array(current_embedding, dtype=np.float32)
+
+    if curr_vec.shape != med_vec.shape:
+        logger.warning(
+            f"[Embeddings] Dimensões incompatíveis em update_user_embedding_vector: "
+            f"curr_vec={curr_vec.shape} vs med_vec={med_vec.shape} "
+            f"(esperado: ({settings.EMBEDDING_DIM},)). Mantendo current_embedding."
+        )
+        return current_embedding
 
     # Atualização ponderada: U_novo = U_antigo + (scale * M)
     new_vec = curr_vec + (scale * med_vec)

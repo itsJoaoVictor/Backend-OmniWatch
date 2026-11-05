@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +19,7 @@ from app.recommendation.orchestrator import (
     build_candidate_vector,
 )
 from app.recommendation.embeddings import calculate_cosine_similarity
-from app.recommendation.service import get_active_dismissed_tmdb_ids
+from app.recommendation.service import get_active_dismissed_media_keys
 
 logger = logging.getLogger(__name__)
 
@@ -67,37 +67,38 @@ async def get_together_recommendations(
     emb_a = user_a.embedding
     emb_b = user_b.embedding
 
-    # 3. Busca lista de vistos/em andamento e recomendações ocultadas de ambos os usuários
+    # 3. Busca lista de vistos/em andamento e recomendações ocultadas de ambos os usuários usando chave canônica (media_type, tmdb_id)
     list_items_res = await db.execute(
-        select(UserListItem.user_id, Media.tmdb_id, UserListItem.status)
+        select(UserListItem.user_id, Media.media_type, Media.tmdb_id, UserListItem.status)
         .join(Media, UserListItem.media_id == Media.id)
         .where(UserListItem.user_id.in_([current_user_id, friend_id]))
     )
     
-    seen_a: set = set()
-    seen_b: set = set()
-    watchlist_a: set = set()
-    watchlist_b: set = set()
+    seen_a: Set[Tuple[str, int]] = set()
+    seen_b: Set[Tuple[str, int]] = set()
+    watchlist_a: Set[Tuple[str, int]] = set()
+    watchlist_b: Set[Tuple[str, int]] = set()
 
     for row in list_items_res.all():
-        u_id, tmdb_id, item_status = row[0], row[1], row[2]
+        u_id, m_type, tmdb_id, item_status = row[0], row[1], row[2], row[3]
+        item_key = (m_type or "movie", tmdb_id)
         if item_status in ("completed", "watching"):
             if u_id == current_user_id:
-                seen_a.add(tmdb_id)
+                seen_a.add(item_key)
             elif u_id == friend_id:
-                seen_b.add(tmdb_id)
+                seen_b.add(item_key)
         elif item_status == "plan_to_watch":
             if u_id == current_user_id:
-                watchlist_a.add(tmdb_id)
+                watchlist_a.add(item_key)
             elif u_id == friend_id:
-                watchlist_b.add(tmdb_id)
+                watchlist_b.add(item_key)
 
     in_both_watchlists = watchlist_a.intersection(watchlist_b)
 
-    # RN: Recomendações Ocultadas / Dispensadas por A ou por B
+    # RN: Recomendações Ocultadas / Dispensadas por A ou por B (chave composta)
     dismissed_a, dismissed_b = await asyncio.gather(
-        get_active_dismissed_tmdb_ids(db, str(current_user_id)),
-        get_active_dismissed_tmdb_ids(db, str(friend_id)),
+        get_active_dismissed_media_keys(db, str(current_user_id)),
+        get_active_dismissed_media_keys(db, str(friend_id)),
     )
     dismissed_both = dismissed_a.union(dismissed_b)
 
@@ -116,23 +117,32 @@ async def get_together_recommendations(
     cand_results = await asyncio.gather(*cand_tasks, return_exceptions=True)
 
     all_raw_candidates: List[Dict[str, Any]] = []
-    seen_cand_ids: set = set()
+    seen_cand_keys: Set[Tuple[str, int]] = set()
     for res in cand_results:
         if isinstance(res, list):
             for c in res:
                 cid = c.get("id")
-                if cid and cid not in seen_cand_ids:
-                    seen_cand_ids.add(cid)
+                mtype = c.get("media_type") or "movie"
+                ckey = (mtype, cid)
+                if cid and ckey not in seen_cand_keys:
+                    seen_cand_keys.add(ckey)
                     all_raw_candidates.append(c)
 
     # 4.1 Injeta mídias que estão no 'Quero Ver' de ambos os usuários para garantir que participem do ranking
     if in_both_watchlists:
         try:
-            shared_media_stmt = select(Media).where(Media.tmdb_id.in_(in_both_watchlists))
-            shared_media_res = await db.execute(shared_media_stmt)
-            for sm in shared_media_res.scalars().all():
-                if sm.tmdb_id not in seen_cand_ids and sm.tmdb_id not in dismissed_both:
-                    seen_cand_ids.add(sm.tmdb_id)
+            for m_type, tmdb_id in in_both_watchlists:
+                ckey = (m_type, tmdb_id)
+                if ckey in seen_cand_keys or ckey in dismissed_both:
+                    continue
+                shared_media_stmt = select(Media).where(
+                    Media.media_type == m_type,
+                    Media.tmdb_id == tmdb_id
+                )
+                shared_media_res = await db.execute(shared_media_stmt)
+                sm = shared_media_res.scalars().first()
+                if sm:
+                    seen_cand_keys.add(ckey)
                     genre_ids_list = []
                     if sm.genres and isinstance(sm.genres, list):
                         for g in sm.genres:
@@ -157,10 +167,11 @@ async def get_together_recommendations(
     filtered_candidates: List[Dict[str, Any]] = []
     for c in all_raw_candidates:
         tmdb_id = c.get("id")
-        c_type = c.get("media_type")
+        c_type = c.get("media_type") or "movie"
+        cand_key = (c_type, tmdb_id)
 
         # RN: Se for recomendação ocultada por QUALQUER um dos dois usuários, descarta imediatamente
-        if tmdb_id in dismissed_both:
+        if cand_key in dismissed_both:
             continue
 
         # Filtro de tipo de mídia
@@ -179,9 +190,9 @@ async def get_together_recommendations(
             if vote_avg < min_vote_average:
                 continue
 
-        # Filtro de ineditismo
-        watched_by_a = tmdb_id in seen_a
-        watched_by_b = tmdb_id in seen_b
+        # Filtro de ineditismo usando chave canônica
+        watched_by_a = cand_key in seen_a
+        watched_by_b = cand_key in seen_b
 
         if unseen_mode == "both":
             # Inédito para ambos: nenhum dos dois pode ter assistido
@@ -221,17 +232,18 @@ async def get_together_recommendations(
         logger.warning(f"Erro ao enriquecer candidatos: {e}")
         enriched = filtered_candidates
 
-    # Busca embeddings locais se existirem
+    # Busca embeddings locais usando chave composta (media_type, tmdb_id)
     cand_tmdb_ids = [c["id"] for c in enriched if "id" in c]
     if cand_tmdb_ids:
         try:
             media_records = await db.execute(
-                select(Media.tmdb_id, Media.embedding).where(Media.tmdb_id.in_(cand_tmdb_ids))
+                select(Media.media_type, Media.tmdb_id, Media.embedding).where(Media.tmdb_id.in_(cand_tmdb_ids))
             )
-            emb_map = {row[0]: row[1] for row in media_records.all() if row[1]}
+            emb_map = {(row[0], row[1]): row[2] for row in media_records.all() if row[2]}
             for c in enriched:
-                if c.get("id") in emb_map and not c.get("embedding"):
-                    c["embedding"] = emb_map[c["id"]]
+                m_key = (c.get("media_type", "movie"), c.get("id"))
+                if m_key in emb_map and not c.get("embedding"):
+                    c["embedding"] = emb_map[m_key]
         except Exception:
             pass
 

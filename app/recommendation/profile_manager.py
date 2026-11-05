@@ -234,7 +234,9 @@ async def update_user_profile(
             schedule_recommendation_computation,
         )
         if media and getattr(media, "tmdb_id", None):
-            await eject_media_from_user_recommendations(db, user.id, media.tmdb_id)
+            await eject_media_from_user_recommendations(
+                db, user.id, media.tmdb_id, media_type=getattr(media, "media_type", None)
+            )
             notify_user_media_action(user.id, media.tmdb_id, debounce_seconds=35)
         else:
             await mark_user_recommendations_stale(db, user.id)

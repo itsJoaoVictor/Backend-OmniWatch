@@ -40,7 +40,12 @@ GENRE_EMOJIS = {
     "guerra": "⚔️",
     "história": "🏛️",
     "música": "🎵",
-    "faroeste": "🤠"
+    "faroeste": "🤠",
+    "política": "🏛️",
+    "novela": "📺",
+    "infantil": "👶",
+    "reality": "📺",
+    "talk show": "🎙️"
 }
 
 def is_valid_persona_name(name: Optional[str]) -> bool:
@@ -81,18 +86,13 @@ Diretrizes:
 """
 
 def generate_persona_metadata(cluster_media: List[Any]) -> Dict[str, Any]:
+    from app.recommendation.vector_builder import normalize_genre_to_canonical
     genre_counts: Dict[str, int] = {}
     for media in cluster_media:
         if media.genres:
             for g in media.genres:
-                g_name = (g.get("name", "") if isinstance(g, dict) else str(g)).strip().lower()
-                if g_name in ["action & adventure", "ação"]:
-                    genre_counts["Ação"] = genre_counts.get("Ação", 0) + 1
-                    genre_counts["Aventura"] = genre_counts.get("Aventura", 0) + 1
-                elif g_name in ["sci-fi & fantasy", "ficção científica"]:
-                    genre_counts["Ficção Científica"] = genre_counts.get("Ficção Científica", 0) + 1
-                else:
-                    norm = g_name.title()
+                for canonical in normalize_genre_to_canonical(g):
+                    norm = canonical.title()
                     genre_counts[norm] = genre_counts.get(norm, 0) + 1
 
     sorted_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)
@@ -103,17 +103,42 @@ def generate_persona_metadata(cluster_media: List[Any]) -> Dict[str, Any]:
 
     if len(top_genres) >= 2:
         g1, g2 = top_genres[0], top_genres[1]
-        if "Animação" in [g1, g2] and any(x in ["Ação", "Aventura", "Fantasia"] for x in [g1, g2]):
+        g3 = top_genres[2] if len(top_genres) > 2 else None
+
+        if "Animação" in [g1, g2] and any(x in ["Ação", "Aventura", "Fantasia", "Ficção Científica"] for x in [g1, g2]):
             name = "Animes & Animação Épica"
             emoji = "🎨"
-        elif "Comédia" in [g1, g2]:
-            name = "Comédias & Sitcoms"
+        elif g1 == "Comédia":
+            if g2 in ["Romance", "Drama"]:
+                name = f"Comédias & {g2}"
+            else:
+                name = "Comédias & Sitcoms"
             emoji = "😂"
+        elif g2 == "Comédia" and g1 == "Romance":
+            name = "Comédias Românticas"
+            emoji = "❤️"
+        elif "Mistério" in [g1, g2] and "Crime" in [g1, g2]:
+            name = "Suspense & Crime"
+            emoji = "🕵️"
         elif "Mistério" in [g1, g2] or "Crime" in [g1, g2]:
-            name = "Suspense & Mistério"
+            other_g = g1 if g1 not in ["Mistério", "Crime"] else g2
+            name = f"Suspense & {other_g}"
             emoji = "🔍"
+        elif set([g1, g2]) == {"Ação", "Aventura"}:
+            if g3 and g3 not in ["Ação", "Aventura"]:
+                name = f"Ação & {g3}"
+            else:
+                name = "Ação & Aventura Épica"
+            emoji = "🎬"
+        elif "Ficção Científica" in [g1, g2] and "Fantasia" in [g1, g2]:
+            if g3:
+                name = f"Ficção & {g3}"
+            else:
+                name = "Ficção Científica & Fantasia"
+            emoji = "🚀"
         else:
             name = f"{g1} & {g2}"
+            emoji = GENRE_EMOJIS.get(g1.lower(), GENRE_EMOJIS.get(dominant_genre, "✨"))
     elif len(top_genres) == 1:
         name = f"Universo {top_genres[0]}"
     else:
@@ -382,6 +407,7 @@ async def refine_user_clusters_llm_task(user_id: str):
                 llm_results = await fetch_batch_llm_persona_titles(clusters, client)
 
             if llm_results:
+                updated_personas = {}
                 for c in clusters:
                     p_id = c.get("id")
                     if p_id in llm_results:
@@ -395,12 +421,53 @@ async def refine_user_clusters_llm_task(user_id: str):
                             c["tagline"] = meta["tagline"]
                         c["llm_enhanced"] = True
                         c["llm_generated_at"] = datetime.now(timezone.utc).isoformat()
+                        updated_personas[p_id] = (c["name"], c.get("emoji", "✨"), c.get("tagline", ""))
                     c.pop("needs_llm", None)
 
                 user.taste_clusters = list(clusters)
                 flag_modified(user, "taste_clusters")
+
+                # Sincroniza atomicamente no cache de recomendacoes (personas_items e explore_items)
+                if updated_personas:
+                    try:
+                        from app.recommendation.models import UserRecommendation
+                        rec_res = await db.execute(select(UserRecommendation).where(UserRecommendation.user_id == user_id))
+                        rec_record = rec_res.scalars().first()
+                        if rec_record:
+                            # 1. Atualizar personas_items
+                            if rec_record.personas_items:
+                                new_personas_items = []
+                                for p_item in rec_record.personas_items:
+                                    pid = p_item.get("id")
+                                    if pid in updated_personas:
+                                        p_item["name"] = updated_personas[pid][0]
+                                        p_item["emoji"] = updated_personas[pid][1]
+                                        p_item["tagline"] = updated_personas[pid][2]
+                                    new_personas_items.append(p_item)
+                                rec_record.personas_items = new_personas_items
+                                flag_modified(rec_record, "personas_items")
+
+                            # 2. Atualizar tags em explore_items
+                            if rec_record.explore_items:
+                                for exp_item in rec_record.explore_items:
+                                    tags = exp_item.get("match_tags") or []
+                                    new_tags = []
+                                    for t in tags:
+                                        replaced = False
+                                        for pid, (n_name, n_emoji, _) in updated_personas.items():
+                                            if "Para sua faceta" in t:
+                                                new_tags.append(f"{n_emoji} Para sua faceta {n_name}")
+                                                replaced = True
+                                                break
+                                        if not replaced:
+                                            new_tags.append(t)
+                                    exp_item["match_tags"] = new_tags
+                                flag_modified(rec_record, "explore_items")
+                    except Exception as err:
+                        logger.warning(f"[LLM PERSONAS] Erro ao sincronizar cache de recomendacoes: {err}")
+
                 await db.commit()
-                logger.info(f"[LLM PERSONAS] Lote de clusters do usuario {user_id} refinado com sucesso.")
+                logger.info(f"[LLM PERSONAS] Lote de clusters do usuario {user_id} refinado e sincronizado no cache com sucesso.")
             else:
                 for c in clusters:
                     c.pop("needs_llm", None)
@@ -458,7 +525,7 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
         await db.commit()
         return []
 
-    items_with_emb = [it for it in valid_items if it.media.embedding and len(it.media.embedding) == 4096]
+    items_with_emb = [it for it in valid_items if it.media.embedding and len(it.media.embedding) == settings.EMBEDDING_DIM]
     n_items = len(items_with_emb)
 
     if n_items < 3:
@@ -543,7 +610,7 @@ async def compute_user_taste_clusters(db: AsyncSession, user_id: str) -> List[Di
         best_sim = -1.0
         for old_c in old_clusters:
             old_cent = old_c.get("centroid_embedding")
-            if old_cent and len(old_cent) == 4096:
+            if old_cent and len(old_cent) == settings.EMBEDDING_DIM:
                 sim = float(np.dot(centroid_vec, np.array(old_cent)))
                 if sim > best_sim:
                     best_sim = sim

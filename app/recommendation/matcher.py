@@ -18,25 +18,25 @@ def cosine_similarity(v1: Dict[str, float], v2: Dict[str, float]) -> float:
 
 def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str, float]) -> Tuple[float, List[str]]:
     """
-    Calcula o Match Score percentual (0.0 a 100.0) de forma modular calibrada
-    e retorna (match_score, top_contributors).
+    Calcula o Match Score percentual (0.0 a 100.0) com denominador fixo em 100.0
+    e Bayesian Shrinkage Prior (mu_0 = 0.35) para categorias vazias (Ideia 4 + Anomalia 2.1.3).
 
-    Pesos por categoria ativa na obra:
-    - Gêneros compatíveis: até 45%
-    - Tipo de mídia (Filme vs Série): até 10%
-    - Elenco e Direção: até 25%
-    - Palavras-chave e Temas: até 20%
+    Distribuição exata dos 100.0 pontos:
+    - Gêneros compatíveis: até 40.0 pts (prior vazio: 14.0 pts)
+    - Talento (Elenco e Direção): até 25.0 pts (prior vazio: 8.75 pts)
+    - Palavras-chave e Temas: até 20.0 pts (prior vazio: 7.0 pts)
+    - Idioma Original (lang_*): até 10.0 pts (prior vazio / inglês neutro: 7.0 pts)
+    - Formato Proporcional (type_*): até 5.0 pts (distribuição proporcional filme vs série)
+    Total fixo: 40 + 25 + 20 + 10 + 5 = 100.0 pts.
     """
     if not user_vector or not media_vector:
         return 0.0, []
 
     total_score = 0.0
-    active_weight_sum = 0.0
 
-    # 1. Componente de Gêneros (peso 45)
+    # 1. Componente de Gêneros (peso 40.0)
     media_genres = {k: v for k, v in media_vector.items() if k.startswith("genre_")}
     if media_genres:
-        active_weight_sum += 45.0
         user_genres = {k: v for k, v in user_vector.items() if k.startswith("genre_")}
         max_u_genre = max(abs(v) for v in user_genres.values()) if user_genres else 1.0
         if max_u_genre == 0:
@@ -53,72 +53,90 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
 
         g_max_sum = sum(media_genres.values())
         if g_max_sum > 0:
-            genre_ratio = max(0.0, g_match_sum / g_max_sum)
-            total_score += genre_ratio * 45.0
+            genre_ratio = max(0.0, min(1.0, g_match_sum / g_max_sum))
+            total_score += genre_ratio * 40.0
+    else:
+        total_score += 0.35 * 40.0  # Shrinkage prior (14.0 pts)
 
-    # 2. Componente de Tipo de Mídia (peso 10)
-    media_types = {k: v for k, v in media_vector.items() if k.startswith("type_")}
-    if media_types:
-        active_weight_sum += 10.0
-        t_match_sum = 0.0
-        for k, v in media_types.items():
-            u_val = user_vector.get(k, 0.0)
-            if u_val > 0:
-                # Usuário consome e aprecia este formato (filme ou série)
-                t_match_sum += v
-            elif u_val < 0:
-                t_match_sum -= v
+    # 2. Componente de Formato Proporcional (Filme vs Série - peso 5.0)
+    u_movie = max(0.0, user_vector.get("type_movie", 0.0))
+    u_tv = max(0.0, user_vector.get("type_tv", 0.0))
+    total_type = u_movie + u_tv
+    is_movie = any(k == "type_movie" for k in media_vector)
+    is_tv = any(k == "type_tv" for k in media_vector)
+    if total_type > 0:
+        if is_movie:
+            type_ratio = u_movie / total_type
+        elif is_tv:
+            type_ratio = u_tv / total_type
+        else:
+            type_ratio = 0.5
+        total_score += max(0.0, min(1.0, type_ratio)) * 5.0
+    else:
+        total_score += 0.5 * 5.0  # Neutro (2.5 pts)
 
-        t_max_sum = sum(media_types.values())
-        if t_max_sum > 0:
-            type_ratio = max(0.0, t_match_sum / t_max_sum)
-            total_score += type_ratio * 10.0
-
-    # 3. Componente de Elenco e Direção (peso 25)
+    # 3. Componente de Talento: Elenco e Direção (peso 25.0)
     media_people = {k: v for k, v in media_vector.items() if k.startswith("cast_") or k.startswith("director_")}
     if media_people:
-        active_weight_sum += 25.0
         user_people = {k: v for k, v in user_vector.items() if k.startswith("cast_") or k.startswith("director_")}
         max_u_person = max(abs(v) for v in user_people.values()) if user_people else 1.0
         if max_u_person == 0:
             max_u_person = 1.0
 
         matched_ratios = [
-            max(0.0, user_vector[k] / max_u_person)
+            max(0.0, min(1.0, user_vector[k] / max_u_person))
             for k in media_people
             if k in user_vector and user_vector[k] > 0
         ]
-        # Se a obra tem apenas 1 pessoa, ela satura os 25 pontos. Se tiver mais, satura em 2 pessoas (12.5 cada).
         per_person_weight = 25.0 / min(2, len(media_people))
         people_score = min(25.0, sum(matched_ratios) * per_person_weight)
         total_score += people_score
+    else:
+        total_score += 0.35 * 25.0  # Bayesian prior (8.75 pts)
 
-    # 4. Componente de Palavras-chave e Temas (peso 20)
+    # 4. Componente de Palavras-chave e Temas (peso 20.0)
     media_kw = {k: v for k, v in media_vector.items() if k.startswith("keyword_")}
     if media_kw:
-        active_weight_sum += 20.0
         user_kw = {k: v for k, v in user_vector.items() if k.startswith("keyword_")}
         max_u_kw = max(abs(v) for v in user_kw.values()) if user_kw else 1.0
         if max_u_kw == 0:
             max_u_kw = 1.0
 
         matched_kw_ratios = [
-            max(0.0, user_vector[k] / max_u_kw)
+            max(0.0, min(1.0, user_vector[k] / max_u_kw))
             for k in media_kw
             if k in user_vector and user_vector[k] > 0
         ]
-        # Se a obra tem apenas 1 keyword, satura os 20 pontos. Se tiver mais, satura em 2 keywords (10 cada).
         per_kw_weight = 20.0 / min(2, len(media_kw))
         kw_score = min(20.0, sum(matched_kw_ratios) * per_kw_weight)
         total_score += kw_score
-
-    # Normalização em relação às categorias ativas na obra
-    if active_weight_sum > 0:
-        raw_percentage = (total_score / active_weight_sum) * 100.0
     else:
-        raw_percentage = 0.0
+        total_score += 0.35 * 20.0  # Bayesian prior (7.0 pts)
 
-    score = round(max(0.0, min(100.0, raw_percentage)), 1)
+    # 5. Componente de Idioma Original (peso 10.0)
+    media_langs = {k: v for k, v in media_vector.items() if k.startswith("lang_")}
+    if media_langs:
+        user_langs = {k: v for k, v in user_vector.items() if k.startswith("lang_")}
+        max_u_lang = max(abs(v) for v in user_langs.values()) if user_langs else 1.0
+        if max_u_lang == 0:
+            max_u_lang = 1.0
+
+        lang_match_sum = 0.0
+        for k in media_langs:
+            u_val = user_vector.get(k, 0.0)
+            if u_val > 0:
+                lang_match_sum += (u_val / max_u_lang)
+            elif u_val < 0:
+                lang_match_sum -= (abs(u_val) / max_u_lang)
+
+        lang_ratio = max(0.0, min(1.0, lang_match_sum))
+        if lang_ratio == 0.0:
+            lang_ratio = 0.7 if "lang_en" in media_langs else 0.35
+        total_score += lang_ratio * 10.0
+    else:
+        total_score += 0.7 * 10.0  # Prior neutro inglês (7.0 pts)
+
+    score = round(max(0.0, min(100.0, total_score)), 1)
 
     # Identificar principais contribuintes para explicabilidade
     contributors = []

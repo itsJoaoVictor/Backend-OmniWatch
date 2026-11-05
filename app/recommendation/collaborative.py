@@ -1,5 +1,5 @@
 import uuid
-from typing import List, Dict, Any, Set, Optional
+from typing import List, Dict, Any, Set, Optional, Tuple, Union
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -111,19 +111,23 @@ async def find_similar_users(
 async def fetch_collaborative_candidates(
     db: AsyncSession,
     target_user_id: str,
-    seen_tmdb_ids: Set[int],
+    seen_media_keys: Optional[Union[Set[Tuple[str, int]], Set[int]]] = None,
     limit: int = 15,
-    min_similarity: float = 0.20
+    min_similarity: float = 0.20,
+    seen_tmdb_ids: Optional[Set[int]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Busca obras bem avaliadas ou concluídas por usuários com gostos parecidos,
     que o usuário alvo ainda não assistiu nem adicionou à lista.
+    Usa chave canônica (media_type, tmdb_id) para evitar colisões entre filmes e séries.
 
     Garante isolamento total:
     - Nenhum dado pessoal, notas ou avaliações de outros usuários vazam.
     - Apenas os metadados da obra (Media) são retornados formatados como candidatos
       para o orquestrador ranquear com o perfil do próprio usuário.
     """
+    effective_seen_keys = seen_media_keys if seen_media_keys is not None else (seen_tmdb_ids or set())
+
     similar_users = await find_similar_users(
         db, target_user_id, n_neighbors=5, min_similarity=min_similarity
     )
@@ -147,19 +151,19 @@ async def fetch_collaborative_candidates(
     )
     list_items = result.scalars().all()
 
-    # Agrupa obras candidatas e calcula pontuação colaborativa inicial
-    candidate_scores: Dict[int, float] = {}
-    media_map: Dict[int, Any] = {}
+    # Agrupa obras candidatas e calcula pontuação colaborativa inicial usando chave canônica
+    candidate_scores: Dict[Tuple[str, int], float] = {}
+    media_map: Dict[Tuple[str, int], Any] = {}
 
     for item in list_items:
         media = item.media
         if not media or not media.tmdb_id:
             continue
 
-        tmdb_id = media.tmdb_id
+        m_key = (media.media_type or "movie", media.tmdb_id)
 
         # Não recomenda obras que o usuário alvo já assistiu/adicionou
-        if tmdb_id in seen_tmdb_ids:
+        if m_key in effective_seen_keys or media.tmdb_id in effective_seen_keys:
             continue
 
         peer_sim = user_weight_map.get(str(item.user_id), 0.5)
@@ -170,19 +174,19 @@ async def fetch_collaborative_candidates(
         rewatch_factor = (1.0 + min(0.30 * rewatch_cnt, 0.75)) if rewatch_cnt > 0 else 1.0
         item_score = peer_sim * rating_factor * fav_factor * rewatch_factor
 
-        candidate_scores[tmdb_id] = candidate_scores.get(tmdb_id, 0.0) + item_score
-        media_map[tmdb_id] = media
+        candidate_scores[m_key] = candidate_scores.get(m_key, 0.0) + item_score
+        media_map[m_key] = media
 
     # Ordena pelo score colaborativo
-    sorted_tmdb_ids = sorted(
+    sorted_media_keys = sorted(
         candidate_scores.keys(),
-        key=lambda tid: candidate_scores[tid],
+        key=lambda k: candidate_scores[k],
         reverse=True
     )
 
     candidates = []
-    for tmdb_id in sorted_tmdb_ids[:limit]:
-        media = media_map[tmdb_id]
+    for m_key in sorted_media_keys[:limit]:
+        media = media_map[m_key]
 
         genre_ids = []
         if media.genres:
@@ -203,7 +207,7 @@ async def fetch_collaborative_candidates(
             "keywords_list": media.keywords or [],
             "original_language": media.original_language or "",
             "collaborative": True,  # Identificador interno de origem colaborativa
-            "collaborative_score": round(candidate_scores[tmdb_id], 2)
+            "collaborative_score": round(candidate_scores[m_key], 2)
         }
         candidates.append(candidate)
 

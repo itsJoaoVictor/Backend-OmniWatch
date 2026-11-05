@@ -32,5 +32,6 @@ class Settings:
     OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "deepseek/deepseek-v4-flash-0731")
     OPENAI_MODEL_Embedding: str = os.getenv("OPENAI_MODEL_Embedding", "qwen/qwen3-embedding-8b")
+    EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "4096"))
 
 settings = Settings()
