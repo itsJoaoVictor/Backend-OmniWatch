@@ -1,6 +1,6 @@
 import logging
 logger = logging.getLogger(__name__)
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, BackgroundTasks, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Any, Dict, Optional
 from app.core.database import get_db
@@ -29,7 +29,14 @@ from app.recommendation.service import (
     get_user_dismissed_records,
     get_active_dismissed_tmdb_ids,
     MAX_STALE_SECONDS,
+    sanitize_recommendation_item,
+    sanitize_recommendation_list,
+    check_is_bloated,
+    cleanup_bloated_user_record,
 )
+
+RECS_CACHE_HEADER = "private, max-age=180, stale-while-revalidate=300"
+_seen_ids_cache = SimpleTTLCache(ttl_seconds=30)
 
 class DismissRecommendationRequest(BaseModel):
     tmdb_id: int
@@ -54,9 +61,14 @@ class TelemetryBatchRequest(BaseModel):
     events: List[TelemetryEventItem]
 
 async def _get_user_seen_tmdb_ids(db: AsyncSession, user_id: str) -> set:
+    user_key = str(user_id)
+    cached_val, is_stale = _seen_ids_cache.get_with_status(user_key)
+    if not is_stale and cached_val is not None:
+        return cached_val
+
     try:
         import uuid
-        target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+        target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(user_key)
         from app.media.models import Media
         from app.tracking.models import UserListItem
         from sqlalchemy.future import select
@@ -69,13 +81,16 @@ async def _get_user_seen_tmdb_ids(db: AsyncSession, user_id: str) -> set:
         result = await db.execute(stmt)
         seen = set(result.scalars().all())
         dismissed = await get_active_dismissed_tmdb_ids(db, user_id)
-        return seen.union(dismissed)
+        all_seen = seen.union(dismissed)
+        _seen_ids_cache.set(user_key, all_seen)
+        return all_seen
     except Exception as e:
         logger.warning(f"Erro ao obter seen_tmdb_ids para {user_id}: {e}")
         return set()
 
 @router.get("/explore", response_model=List[Any])
 async def get_explore_recommendations(
+    response: Response,
     background_tasks: BackgroundTasks,
     limit: int = Query(50, ge=1, le=100),
     persona_id: Optional[str] = Query(None, description="Filtra recomendações para uma Persona/Cluster específico"),
@@ -92,6 +107,9 @@ async def get_explore_recommendations(
             items = (res.get("explore_items") if res else [])
         else:
             items = record.explore_items
+            if check_is_bloated(items):
+                background_tasks.add_task(cleanup_bloated_user_record, current_user_id)
+
             now = datetime.now(timezone.utc)
             is_expired = (
                 record.last_generated_at is None
@@ -104,6 +122,8 @@ async def get_explore_recommendations(
         if seen_ids and items:
             items = [it for it in items if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
 
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
+
         if persona_id:
             personas = record.personas_items if record else []
             target = next((p for p in personas if p.get("id") == persona_id), None)
@@ -111,19 +131,20 @@ async def get_explore_recommendations(
                 p_recs = target["recommendations"]
                 if seen_ids:
                     p_recs = [it for it in p_recs if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
-                return p_recs[:limit]
+                return sanitize_recommendation_list(p_recs[:limit])
             raw = await get_personalized_recommendations(db, current_user_id, top_k=limit, persona_id=persona_id)
             if seen_ids:
                 raw = [it for it in raw if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
-            return raw[:limit]
+            return sanitize_recommendation_list(raw[:limit])
 
-        return items[:limit]
+        return sanitize_recommendation_list(items[:limit])
     except Exception as e:
         logger.exception(e)
         raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
 
 @router.get("/explore/recent-vibe", response_model=List[Any])
 async def get_recent_vibe_endpoint(
+    response: Response,
     background_tasks: BackgroundTasks,
     limit: int = Query(20, ge=1, le=50),
     current_user_id: str = Depends(get_current_user_id),
@@ -152,13 +173,15 @@ async def get_recent_vibe_endpoint(
         if seen_ids and items:
             items = [it for it in items if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
 
-        return items[:limit]
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
+        return sanitize_recommendation_list(items[:limit])
     except Exception as e:
         logger.exception(e)
         raise HTTPException(status_code=500, detail='Ocorreu um erro interno ao processar a solicitação.')
 
 @router.get("/personas", response_model=List[Any])
 async def get_user_personas(
+    response: Response,
     background_tasks: BackgroundTasks,
     top_k: int = Query(15, ge=1, le=30),
     current_user_id: str = Depends(get_current_user_id),
@@ -173,6 +196,9 @@ async def get_user_personas(
             personas = (res.get("personas_items", []) if res else [])
         else:
             personas = record.personas_items
+            if personas and any(check_is_bloated(p.get("recommendations")) for p in personas if isinstance(p, dict)):
+                background_tasks.add_task(cleanup_bloated_user_record, current_user_id)
+
             now = datetime.now(timezone.utc)
             is_expired = (
                 record.last_generated_at is None
@@ -188,8 +214,10 @@ async def get_user_personas(
             if isinstance(recs, list):
                 if seen_ids:
                     recs = [it for it in recs if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
-                p_copy["recommendations"] = recs[:top_k]
+                p_copy["recommendations"] = sanitize_recommendation_list(recs[:top_k])
             result.append(p_copy)
+
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
         return result
     except Exception as e:
         logger.exception(e)
@@ -197,6 +225,7 @@ async def get_user_personas(
 
 @router.get("/upcoming", response_model=Dict[str, Any])
 async def get_upcoming_recommendations_endpoint(
+    response: Response,
     background_tasks: BackgroundTasks,
     limit: int = Query(20, ge=1, le=50),
     current_user_id: str = Depends(get_current_user_id),
@@ -224,7 +253,7 @@ async def get_upcoming_recommendations_endpoint(
                 schedule_recommendation_computation(current_user_id)
 
         movies = upcoming.get("movies") or []
-        tv = upcoming.get("tv") or []
+        tv = upcoming.get("tv") or upcoming.get("series") or []
         if seen_ids:
             movies = [it for it in movies if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
             tv = [it for it in tv if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
@@ -233,9 +262,14 @@ async def get_upcoming_recommendations_endpoint(
         movies = [it for it in movies if str(it.get("release_date") or "").strip() >= today_str]
         tv = [it for it in tv if str(it.get("first_air_date") or "").strip() >= today_str]
 
+        clean_movies = sanitize_recommendation_list(movies[:limit])
+        clean_tv = sanitize_recommendation_list(tv[:limit])
+
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
         return {
-            "movies": movies[:limit],
-            "tv": tv[:limit]
+            "movies": clean_movies,
+            "tv": clean_tv,
+            "series": clean_tv
         }
     except Exception as e:
         logger.exception(e)
@@ -243,6 +277,7 @@ async def get_upcoming_recommendations_endpoint(
 
 @router.get("/feed", response_model=Dict[str, Any])
 async def get_explore_feed(
+    response: Response,
     background_tasks: BackgroundTasks,
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
@@ -271,6 +306,9 @@ async def get_explore_feed(
             is_stale = record.is_stale
             last_gen = record.last_generated_at.isoformat() if record.last_generated_at else None
 
+            if check_is_bloated(explore):
+                background_tasks.add_task(cleanup_bloated_user_record, current_user_id)
+
             now = datetime.now(timezone.utc)
             is_expired = (
                 record.last_generated_at is None
@@ -292,12 +330,22 @@ async def get_explore_feed(
             personas = new_personas
 
         up_movies = [it for it in (upcoming.get("movies") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids and str(it.get("release_date") or "").strip() >= today_str]
-        up_tv = [it for it in (upcoming.get("tv") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids and str(it.get("first_air_date") or "").strip() >= today_str]
-        upcoming = {"movies": up_movies, "tv": up_tv}
+        up_tv = [it for it in (upcoming.get("tv") or upcoming.get("series") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids and str(it.get("first_air_date") or "").strip() >= today_str]
+        
+        clean_explore = sanitize_recommendation_list(explore)
+        clean_recent_vibe = sanitize_recommendation_list(recent_vibe)
+        for p in personas:
+            if isinstance(p, dict) and p.get("recommendations"):
+                sanitize_recommendation_list(p["recommendations"])
+        clean_up_movies = sanitize_recommendation_list(up_movies)
+        clean_up_tv = sanitize_recommendation_list(up_tv)
 
+        upcoming = {"movies": clean_up_movies, "tv": clean_up_tv, "series": clean_up_tv}
+
+        response.headers["Cache-Control"] = RECS_CACHE_HEADER
         return {
-            "explore": explore,
-            "recent_vibe": recent_vibe,
+            "explore": clean_explore,
+            "recent_vibe": clean_recent_vibe,
             "upcoming": upcoming,
             "personas": personas,
             "is_stale": is_stale,
@@ -526,6 +574,8 @@ async def dismiss_recommendation_endpoint(
         except Exception as te:
             logger.warning(f"Erro ao registrar telemetria de dismiss: {te}")
 
+        _seen_ids_cache.delete_prefix(str(current_user_id))
+
         return {
             "status": "success",
             "message": "Recomendação dispensada com sucesso.",
@@ -552,6 +602,7 @@ async def undismiss_recommendation_endpoint(
             tmdb_id=payload.tmdb_id,
             media_type=payload.media_type
         )
+        _seen_ids_cache.delete_prefix(str(current_user_id))
         return {
             "status": "success" if success else "not_found",
             "restored": success,

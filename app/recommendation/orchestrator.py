@@ -1066,13 +1066,19 @@ async def get_personalized_recommendations(
     # Ordena o carrossel do maior % para o menor dentro do conjunto selecionado
     diverse_recommendations.sort(key=lambda x: x.get("match_score", 0), reverse=True)
 
-    # Limpa dados internos temporários antes de retornar
+    # Limpa dados internos temporários antes de retornar (O(1) por chave, eliminando embeddings vazados)
     for item in diverse_recommendations:
+        item.pop("embedding", None)
         item.pop("_candidate_vector", None)
+        item.pop("candidate_vector", None)
         item.pop("_best_persona_id", None)
         item.pop("_ml_score", None)
         item.pop("_rrf_score", None)
         item.pop("_channels", None)
+        item.pop("cast", None)
+        item.pop("crew", None)
+        item.pop("softcore", None)
+        item.pop("adult", None)
 
     return diverse_recommendations
 
@@ -1444,16 +1450,23 @@ async def get_upcoming_recommendations(
     scored_movies.sort(key=lambda x: x.get("match_score", 0), reverse=True)
     scored_tv.sort(key=lambda x: x.get("match_score", 0), reverse=True)
 
-    # Limpeza de campos internos
+    # Limpeza de campos internos e embeddings
     for item in scored_movies + scored_tv:
+        item.pop("embedding", None)
         item.pop("_candidate_vector", None)
+        item.pop("candidate_vector", None)
         item.pop("_best_persona_id", None)
         item.pop("_ml_score", None)
         item.pop("_rrf_score", None)
+        item.pop("cast", None)
+        item.pop("crew", None)
+        item.pop("softcore", None)
+        item.pop("adult", None)
 
     return {
         "movies": scored_movies[:top_k_per_type],
-        "series": scored_tv[:top_k_per_type]
+        "series": scored_tv[:top_k_per_type],
+        "tv": scored_tv[:top_k_per_type],
     }
 
 
@@ -1594,10 +1607,16 @@ async def get_recent_vibe_recommendations(
     diverse_vibe.sort(key=lambda x: x.get("match_score", 0), reverse=True)
 
     for it in diverse_vibe:
+        it.pop("embedding", None)
         it.pop("_candidate_vector", None)
+        it.pop("candidate_vector", None)
         it.pop("_best_persona_id", None)
         it.pop("_ml_score", None)
         it.pop("_rrf_score", None)
+        it.pop("cast", None)
+        it.pop("crew", None)
+        it.pop("softcore", None)
+        it.pop("adult", None)
 
     return diverse_vibe
 

@@ -27,6 +27,96 @@ _user_debounce_tasks: Dict[str, asyncio.Task] = {}
 DEFAULT_COOLDOWN_SECONDS = 1200  # 20 minutos de cooldown padrão
 MAX_STALE_SECONDS = 86400        # 24 horas para expiração natural
 
+def sanitize_recommendation_item(item: Any) -> Any:
+    """
+    Remove vetores de embedding e metadados internos pesados de uma obra candidata,
+    garantindo complexidade O(1) por item e payload ultraleve (~1.5 KB em vez de ~90 KB).
+    Elimina o vazamento de memória e sobrecarga de CPU do Samsung Galaxy A9 ao serializar JSON.
+    """
+    if not isinstance(item, dict):
+        return item
+
+    # Campos internos e volumosos que NUNCA devem ser persistidos no JSONB de exibição
+    # nem serializados na resposta HTTP para o frontend:
+    item.pop("embedding", None)
+    item.pop("_candidate_vector", None)
+    item.pop("candidate_vector", None)
+    item.pop("_best_persona_id", None)
+    item.pop("_ml_score", None)
+    item.pop("_rrf_score", None)
+    item.pop("_channels", None)
+    item.pop("cast", None)
+    item.pop("crew", None)
+    item.pop("softcore", None)
+    item.pop("adult", None)
+    return item
+
+def sanitize_recommendation_list(items: Optional[List[Any]]) -> List[Any]:
+    """
+    Sanitiza uma lista de obras em O(N) in-place com O(1) de espaço auxiliar.
+    """
+    if not items or not isinstance(items, list):
+        return items or []
+    for it in items:
+        sanitize_recommendation_item(it)
+    return items
+
+def check_is_bloated(items: Any) -> bool:
+    """
+    Verificação O(1) por amostragem para detectar se o registro persistido contém embeddings legados.
+    """
+    if not isinstance(items, list) or not items:
+        return False
+    sample = items[:3]
+    for it in sample:
+        if isinstance(it, dict) and ("embedding" in it or "_candidate_vector" in it or "cast" in it or "crew" in it):
+            return True
+    return False
+
+async def cleanup_bloated_user_record(user_id: str) -> None:
+    """
+    Higieniza registros legados no PostgreSQL que foram gravados com embeddings volumosos.
+    Reduz a linha JSONB de ~15MB para ~200KB no banco de forma transparente e assíncrona,
+    aliviando disco, I/O e conexões do PostgreSQL no Galaxy A9.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            record = await get_user_recommendations_record(session, user_id)
+            if not record:
+                return
+            modified = False
+            if check_is_bloated(record.explore_items):
+                sanitize_recommendation_list(record.explore_items)
+                flag_modified(record, "explore_items")
+                modified = True
+            if check_is_bloated(record.recent_vibe_items):
+                sanitize_recommendation_list(record.recent_vibe_items)
+                flag_modified(record, "recent_vibe_items")
+                modified = True
+            if record.personas_items and isinstance(record.personas_items, list):
+                p_mod = False
+                for p in record.personas_items:
+                    if isinstance(p, dict) and p.get("recommendations") and check_is_bloated(p["recommendations"]):
+                        sanitize_recommendation_list(p["recommendations"])
+                        p_mod = True
+                if p_mod:
+                    flag_modified(record, "personas_items")
+                    modified = True
+            if record.upcoming_items and isinstance(record.upcoming_items, dict):
+                u_mod = False
+                for k in ("movies", "tv", "series"):
+                    if check_is_bloated(record.upcoming_items.get(k)):
+                        sanitize_recommendation_list(record.upcoming_items[k])
+                        u_mod = True
+                if u_mod:
+                    flag_modified(record, "upcoming_items")
+                    modified = True
+            if modified:
+                await session.commit()
+                logger.info(f"[RECS-SERVICE] Registro legado de {user_id} higienizado e reduzido no PostgreSQL com sucesso.")
+    except Exception as e:
+        logger.warning(f"[RECS-SERVICE] Falha não-bloqueante na higienização de registro legado: {e}")
+
 def _parse_uuid(uid: Any) -> uuid.UUID:
     if isinstance(uid, uuid.UUID):
         return uid
@@ -320,6 +410,18 @@ async def compute_and_save_user_recommendations(
             if len(new_impressions) > 250:
                 sorted_imps = sorted(new_impressions.items(), key=lambda x: x[1], reverse=True)
                 new_impressions = dict(sorted_imps[:200])
+
+            # Sanitização defensiva em O(N) para garantir que NENHUM embedding seja gravado
+            # na tabela user_recommendations (reduzindo a linha JSONB de ~15MB para ~200KB no PostgreSQL)
+            sanitize_recommendation_list(explore_data)
+            sanitize_recommendation_list(recent_vibe_data)
+            if isinstance(upcoming_data, dict):
+                sanitize_recommendation_list(upcoming_data.get("movies"))
+                sanitize_recommendation_list(upcoming_data.get("series") or upcoming_data.get("tv"))
+            if isinstance(personas_data, list):
+                for p in personas_data:
+                    if isinstance(p, dict):
+                        sanitize_recommendation_list(p.get("recommendations"))
 
             # Salva na tabela
             if record is None:

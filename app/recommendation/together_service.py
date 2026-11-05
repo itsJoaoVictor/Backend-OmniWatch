@@ -20,7 +20,7 @@ from app.recommendation.orchestrator import (
     apply_fast_dpp_reranking,
 )
 from app.recommendation.embeddings import calculate_cosine_similarity
-from app.recommendation.service import get_active_dismissed_media_keys
+from app.recommendation.service import get_active_dismissed_media_keys, sanitize_recommendation_item
 
 logger = logging.getLogger(__name__)
 
@@ -388,8 +388,7 @@ async def get_together_recommendations(
     final_items = must_include + dpp_selected
 
     for it in final_items:
-        it.pop("_candidate_vector", None)
-        it.pop("embedding", None)
+        sanitize_recommendation_item(it)
 
     return {
         "friend": {
