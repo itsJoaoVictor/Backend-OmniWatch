@@ -473,6 +473,10 @@ async def compute_and_save_user_recommendations(
                 sorted_imps = sorted(new_impressions.items(), key=lambda x: x[1], reverse=True)
                 new_impressions = dict(sorted_imps[:200])
 
+            # Verifica elegibilidade real de Vibe Recente (completed/watching <= 30 dias)
+            from app.recommendation.profile_manager import user_has_recent_vibe_activity
+            has_recent_vibe_eligible = await user_has_recent_vibe_activity(session, user_id_str, max_age_days=30.0)
+
             # Sanitização defensiva em O(N) para garantir que NENHUM embedding seja gravado
             # na tabela user_recommendations (reduzindo a linha JSONB de ~15MB para ~200KB no PostgreSQL)
             # Protege contra sobrescrita por resultado vazio (ex.: falha transitoria do TMDB)
@@ -480,7 +484,7 @@ async def compute_and_save_user_recommendations(
                 if not explore_data and record.explore_items:
                     logger.warning(f"[RECS-SERVICE] explore vazio para {user_id_str}; mantendo versao anterior.")
                     explore_data = record.explore_items
-                if not recent_vibe_data and getattr(record, "recent_vibe_items", None):
+                if has_recent_vibe_eligible and not recent_vibe_data and getattr(record, "recent_vibe_items", None):
                     recent_vibe_data = record.recent_vibe_items
                 if not personas_data and record.personas_items:
                     personas_data = record.personas_items
@@ -511,7 +515,7 @@ async def compute_and_save_user_recommendations(
                 upcoming_data.get("movies") or upcoming_data.get("series") or upcoming_data.get("tv")
             )
             should_remain_stale = bool(
-                has_user_items and (not explore_data or final_up_empty or not recent_vibe_data)
+                has_user_items and (not explore_data or final_up_empty or (has_recent_vibe_eligible and not recent_vibe_data))
             )
 
             # Salva na tabela
@@ -612,12 +616,17 @@ async def run_recommendations_daily_sync_loop(interval_hours: int = 24):
                     recs_res = await session.execute(select(UserRecommendation))
                     recs_by_uid = {str(r.user_id): r for r in recs_res.scalars().all()}
 
+                    from app.recommendation.profile_manager import user_has_recent_vibe_activity
                     user_ids = []
                     for uid in candidate_uids:
                         rec = recs_by_uid.get(uid)
-                        if rec is None or rec.is_stale or not rec.explore_items or not getattr(rec, "recent_vibe_items", None):
+                        if rec is None or rec.is_stale or not rec.explore_items:
                             user_ids.append(uid)
                             continue
+                        if not getattr(rec, "recent_vibe_items", None):
+                            if await user_has_recent_vibe_activity(session, uid, max_age_days=30.0):
+                                user_ids.append(uid)
+                                continue
                         up = rec.upcoming_items if isinstance(rec.upcoming_items, dict) else {}
                         if not (up.get("movies") or up.get("tv") or up.get("series")):
                             user_ids.append(uid)

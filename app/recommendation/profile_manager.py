@@ -285,52 +285,95 @@ async def update_user_profile(
         logger.warning(f"Erro ao agendar atualização de recomendações para {user.id}: {e}")
 
 
+def _extract_item_activity_date(it: UserListItem) -> datetime:
+    """Retorna o timestamp mais recente de consumo da obra (incluindo progresso de episódios)."""
+    candidates: List[datetime] = []
+    for dt in (getattr(it, "last_watched_at", None), getattr(it, "updated_at", None), getattr(it, "created_at", None)):
+        if dt is not None:
+            candidates.append(dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt)
+
+    episodes = getattr(it, "episodes", None) or []
+    for ep in episodes:
+        ep_dt = getattr(ep, "watched_at", None)
+        if ep_dt is not None:
+            candidates.append(ep_dt.replace(tzinfo=timezone.utc) if ep_dt.tzinfo is None else ep_dt)
+
+    return max(candidates) if candidates else datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+async def user_has_recent_vibe_activity(
+    db: AsyncSession,
+    user_id: Any,
+    max_age_days: float = 30.0,
+) -> bool:
+    """
+    Verifica rapidamente se o usuário possui pelo menos 1 obra com status
+    'completed' ou 'watching' movimentada nos últimos `max_age_days` dias.
+    """
+    import uuid
+    from datetime import timedelta
+
+    try:
+        target_uuid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+    except Exception:
+        return False
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    from sqlalchemy import or_
+    from app.tracking.models import UserEpisodeProgress
+
+    stmt = (
+        select(UserListItem.id)
+        .outerjoin(UserEpisodeProgress, UserEpisodeProgress.user_list_item_id == UserListItem.id)
+        .where(
+            UserListItem.user_id == target_uuid,
+            UserListItem.status.in_(("completed", "watching")),
+            or_(
+                UserListItem.rating.is_(None),
+                UserListItem.rating >= 2.5,
+            ),
+            or_(
+                UserListItem.last_watched_at >= cutoff,
+                UserListItem.updated_at >= cutoff,
+                UserListItem.created_at >= cutoff,
+                UserEpisodeProgress.watched_at >= cutoff,
+            ),
+        )
+        .limit(1)
+    )
+    res = await db.execute(stmt)
+    return res.scalar_one_or_none() is not None
+
+
 def compute_recent_vibe_profile(
     list_items: List[UserListItem],
-    half_life_days: float = 21.0,
-    max_age_days: float = 45.0,
+    half_life_days: float = 14.0,
+    max_age_days: float = 30.0,
 ) -> Tuple[Dict[str, float], Optional[List[float]], List[Tuple[str, int]]]:
     """
-    Calcula o perfil Rocchio de memória curta (janela móvel com meia-vida de 21 dias)
-    para alimentar o carrossel 'Na Sua Vibe Recente' sem contaminar o perfil permanente (Ideia 5).
+    Calcula o perfil Rocchio de memória curta restrito ESTRITAMENTE a obras
+    com status 'completed' ou 'watching' nos últimos `max_age_days` (30 dias).
+    Passando de 30 dias, a obra não entra na vibe recente (sem fallback antigo).
     Retorna (vibe_feature_vector, vibe_embedding, recent_seed_keys).
     """
     now = datetime.now(timezone.utc)
+    sorted_items = sorted(list_items, key=_extract_item_activity_date, reverse=True)
 
-    def get_item_date(it: UserListItem) -> datetime:
-        dt = it.last_watched_at or it.updated_at or it.created_at
-        if dt and dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt or datetime.fromtimestamp(0, tz=timezone.utc)
-
-    sorted_items = sorted(list_items, key=get_item_date, reverse=True)
-
-    # Filtra itens recentes positivos (<= max_age_days)
+    # Filtra estritamente status ('completed', 'watching') positivos com idade <= max_age_days (30 dias)
     recent_candidates: List[UserListItem] = []
     for it in sorted_items:
+        if getattr(it, "status", None) not in ("completed", "watching"):
+            continue
         media = getattr(it, "media", None)
         if not media or not getattr(media, "tmdb_id", None):
             continue
         scale = calculate_rating_scale(it.rating, it.status, rewatch_count=getattr(it, "rewatch_count", 0) or 0)
         if scale <= 0:
             continue
-        dt = get_item_date(it)
+        dt = _extract_item_activity_date(it)
         age_days = (now - dt).total_seconds() / 86400.0
         if age_days <= max_age_days:
             recent_candidates.append(it)
-
-    # Fallback gracioso: se houver pouca atividade nos últimos 45 dias, usa os últimos 4 itens positivos
-    if len(recent_candidates) < 3:
-        for it in sorted_items:
-            if it not in recent_candidates:
-                media = getattr(it, "media", None)
-                if not media or not getattr(media, "tmdb_id", None):
-                    continue
-                scale = calculate_rating_scale(it.rating, it.status, rewatch_count=getattr(it, "rewatch_count", 0) or 0)
-                if scale > 0:
-                    recent_candidates.append(it)
-            if len(recent_candidates) >= 4:
-                break
 
     if not recent_candidates:
         return {}, None, []
@@ -347,7 +390,7 @@ def compute_recent_vibe_profile(
         if t_id:
             seed_keys.append((m_type, t_id))
 
-        action_date = get_item_date(item)
+        action_date = _extract_item_activity_date(item)
         time_decay = calculate_time_decay(action_date, half_life_days=half_life_days)
         rating_scale = calculate_rating_scale(item.rating, item.status, rewatch_count=getattr(item, "rewatch_count", 0) or 0)
         fav_mod = 2.0 if item.is_favorite else 1.0

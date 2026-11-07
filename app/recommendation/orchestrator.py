@@ -48,7 +48,8 @@ async def fetch_discover_candidates(
     user_vector: Dict[str, float],
     db=None,
     user_id: str = None,
-    persona_id: Optional[str] = None
+    persona_id: Optional[str] = None,
+    allowed_media_keys: Optional[Set[Tuple[str, int]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Recuperação Multi-Funil de Candidatos TMDB (Sub-etapa 2.1 + Ideia 9):
@@ -87,13 +88,16 @@ async def fetch_discover_candidates(
                             if _name and _gid:
                                 live_genre_name_to_id[_name] = _gid
 
+                if allowed_media_keys is not None and (media.media_type, media.tmdb_id) not in allowed_media_keys:
+                    continue
+
                 is_fav = getattr(list_item, "is_favorite", False)
                 rating = getattr(list_item, "rating", 0.0) or 0.0
                 rewatch = getattr(list_item, "rewatch_count", 0) or 0
 
-                # Âncoras de ouro: favoritas, ratings >= 4.0, ou reassistidas
-                if is_fav or rating >= 4.0 or rewatch > 0:
-                    priority = (3.0 if is_fav else 0.0) + rating + (2.0 if rewatch > 0 else 0.0)
+                # Âncoras de ouro: favoritas, ratings >= 4.0, reassistidas, ou seeds explícitas da vibe recente
+                if is_fav or rating >= 4.0 or rewatch > 0 or allowed_media_keys is not None:
+                    priority = (3.0 if is_fav else 0.0) + (rating or 3.5) + (2.0 if rewatch > 0 else 0.0)
                     golden_anchors.append((priority, media.media_type, media.tmdb_id))
 
                 if getattr(media, "collection_tmdb_id", None):
@@ -235,7 +239,7 @@ async def fetch_discover_candidates(
             "sort_by": "popularity.desc",
             "page": 1
         }))
-        if not persona_id:
+        if not persona_id and allowed_media_keys is None:
             funnel_4_tasks.append(fetch_endpoint(client, "/trending/all/week", None, {"page": 1}))
 
         res_f1, res_f2, res_f3, res_f4 = await asyncio.gather(
@@ -1710,12 +1714,12 @@ async def get_recent_vibe_recommendations(
     if not list_items:
         return []
 
-    # 2. Constrói perfil de memória curta Rocchio (21 dias)
+    # 2. Constrói perfil de memória curta Rocchio restrito a 'completed'/'watching' <= 30 dias
     vibe_vector, vibe_embedding, seed_keys = compute_recent_vibe_profile(
-        list_items, half_life_days=21.0, max_age_days=45.0
+        list_items, half_life_days=14.0, max_age_days=30.0
     )
 
-    if not vibe_vector:
+    if not vibe_vector or not seed_keys:
         return []
 
     # 3. Conjunto de obras já assistidas / dispensadas para filtragem
@@ -1729,9 +1733,14 @@ async def get_recent_vibe_recommendations(
     dismissed_keys = await get_active_dismissed_media_keys(db, str(user_id))
     excluded_keys = seen_keys.union(dismissed_keys)
 
-    # 4. Recuperação de Candidatos para a Vibe
-    # Funil A: Discover baseado no vetor da vibe
-    discover_candidates = await fetch_discover_candidates(vibe_vector, db=db, user_id=str(user_id))
+    # 4. Recuperação de Candidatos para a Vibe (âncoras restritas APENAS aos seeds <= 30 dias)
+    # Funil A: Discover baseado exclusivamente no vetor e nas obras elegíveis da vibe (<= 30 dias)
+    discover_candidates = await fetch_discover_candidates(
+        vibe_vector,
+        db=db,
+        user_id=str(user_id),
+        allowed_media_keys=set(seed_keys),
+    )
 
     # Funil B: Recomendações TMDB a partir dos top seeds recentes (com Bearer Auth + Retry contra 429/timeout)
     recommended_candidates: List[Dict[str, Any]] = []

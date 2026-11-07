@@ -191,7 +191,11 @@ async def get_recent_vibe_endpoint(
         record = await get_user_recommendations_record(db, current_user_id)
         seen_ids = await _get_user_seen_tmdb_ids(db, current_user_id)
 
-        if not record or not getattr(record, "recent_vibe_items", None):
+        from app.recommendation.profile_manager import user_has_recent_vibe_activity
+        has_vibe_cached = bool(record and getattr(record, "recent_vibe_items", None))
+        needs_vibe_compute = not record or (not has_vibe_cached and await user_has_recent_vibe_activity(db, current_user_id, max_age_days=30.0))
+
+        if needs_vibe_compute:
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
             items = (res.get("recent_vibe_items") if res else [])
             record = await get_user_recommendations_record(db, current_user_id)
@@ -372,7 +376,11 @@ async def get_explore_feed(
             is_expired = _is_record_expired(record, now)
             up_dict = upcoming if isinstance(upcoming, dict) else {}
             has_upcoming = bool(up_dict.get("movies") or up_dict.get("tv") or up_dict.get("series"))
-            is_incomplete = bool(seen_ids) and (not explore or not recent_vibe or not has_upcoming)
+            vibe_unexpectedly_empty = False
+            if bool(seen_ids) and not recent_vibe:
+                from app.recommendation.profile_manager import user_has_recent_vibe_activity
+                vibe_unexpectedly_empty = await user_has_recent_vibe_activity(db, current_user_id, max_age_days=30.0)
+            is_incomplete = bool(seen_ids) and (not explore or vibe_unexpectedly_empty or not has_upcoming)
 
             if is_incomplete:
                 uid_str = str(current_user_id)
@@ -419,7 +427,12 @@ async def get_explore_feed(
 
         upcoming = {"movies": clean_up_movies, "tv": clean_up_tv, "series": clean_up_tv}
 
-        if bool(seen_ids) and (not clean_explore or not clean_recent_vibe or not (clean_up_movies or clean_up_tv)):
+        post_vibe_missing = False
+        if bool(seen_ids) and not clean_recent_vibe:
+            from app.recommendation.profile_manager import user_has_recent_vibe_activity
+            post_vibe_missing = await user_has_recent_vibe_activity(db, current_user_id, max_age_days=30.0)
+
+        if bool(seen_ids) and (not clean_explore or post_vibe_missing or not (clean_up_movies or clean_up_tv)):
             uid_str = str(current_user_id)
             now_mono = time.monotonic()
             if now_mono - _incomplete_heal_timestamps.get(uid_str, 0.0) > 180.0:
