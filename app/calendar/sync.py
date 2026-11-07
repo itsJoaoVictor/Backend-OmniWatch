@@ -10,6 +10,7 @@ from app.media.models import Media, MediaRelease
 from app.tracking.models import UserListItem, UserEpisodeProgress
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.core.tmdb_client import tmdb_get_json
 
 async def sync_single_media_release(db: AsyncSession, media_id: str):
     """Fetches and updates release/episode data for a single media item."""
@@ -19,102 +20,90 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
     
     if not media:
         return
-        
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {settings.TMDB_API_KEY}"
-    }
 
-    async with httpx.AsyncClient() as client:
-        try:
-            if media.media_type == "movie":
-                url = f"{settings.TMDB_BASE_URL}/movie/{media.tmdb_id}"
-                response = await client.get(url, headers=headers, params={"language": "pt-BR"}, timeout=10.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    rel_date_str = data.get("release_date")
-                    if rel_date_str:
-                        media.release_date = rel_date_str
-                        try:
-                            r_date = datetime.strptime(rel_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                            await db.execute(delete(MediaRelease).where(MediaRelease.media_id == media.id))
-                            
-                            new_release = MediaRelease(
-                                media_id=media.id,
-                                title=media.title,
-                                description=f"Lancamento do filme {media.title}",
-                                release_date=r_date,
-                            )
-                            db.add(new_release)
-                        except ValueError:
-                            pass
-            elif media.media_type == "tv":
-                url = f"{settings.TMDB_BASE_URL}/tv/{media.tmdb_id}"
-                params = {"language": "pt-BR"}
-                response = await client.get(url, headers=headers, params=params, timeout=10.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    first_air_date = data.get("first_air_date")
-                    if first_air_date:
-                        media.release_date = first_air_date
-                    next_episode = data.get("next_episode_to_air")
-                    
-                    await db.execute(delete(MediaRelease).where(MediaRelease.media_id == media.id))
+    try:
+        if media.media_type == "movie":
+            data = await tmdb_get_json(f"/movie/{media.tmdb_id}", params={"language": "pt-BR"}, timeout=12.0)
+            if data:
+                rel_date_str = data.get("release_date")
+                if rel_date_str:
+                    media.release_date = rel_date_str
+                    try:
+                        r_date = datetime.strptime(rel_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        await db.execute(delete(MediaRelease).where(MediaRelease.media_id == media.id))
+                        
+                        new_release = MediaRelease(
+                            media_id=media.id,
+                            title=media.title,
+                            description=f"Lancamento do filme {media.title}",
+                            release_date=r_date,
+                        )
+                        db.add(new_release)
+                    except ValueError:
+                        pass
+        elif media.media_type == "tv":
+            params = {"language": "pt-BR"}
+            data = await tmdb_get_json(f"/tv/{media.tmdb_id}", params=params, timeout=12.0)
+            if data:
+                first_air_date = data.get("first_air_date")
+                if first_air_date:
+                    media.release_date = first_air_date
+                next_episode = data.get("next_episode_to_air")
+                
+                await db.execute(delete(MediaRelease).where(MediaRelease.media_id == media.id))
 
-                    synced_season_episodes = False
-                    if next_episode and next_episode.get("season_number") is not None:
+                synced_season_episodes = False
+                if next_episode and next_episode.get("season_number") is not None:
+                    s_num = next_episode.get("season_number")
+                    # Busca os episódios completos da temporada para registrar todos os episódios futuros confirmados
+                    s_data = await tmdb_get_json(f"/tv/{media.tmdb_id}/season/{s_num}", params=params, timeout=12.0)
+                    if s_data:
+                        from app.core.utils import get_server_today
+                        today_str = get_server_today().strftime("%Y-%m-%d")
+                        for ep in s_data.get("episodes", []):
+                            ep_air_date = ep.get("air_date")
+                            if ep_air_date and ep_air_date >= today_str:
+                                try:
+                                    r_date = datetime.strptime(ep_air_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                                    e_num = ep.get("episode_number")
+                                    ep_title = ep.get("name") or f"Episódio {e_num}"
+                                    ep_desc = ep.get("overview", "")
+                                    
+                                    new_release = MediaRelease(
+                                        media_id=media.id,
+                                        title=f"T{s_num}E{e_num} - {ep_title}",
+                                        description=ep_desc,
+                                        release_date=r_date,
+                                        season_number=s_num,
+                                        episode_number=e_num
+                                    )
+                                    db.add(new_release)
+                                    synced_season_episodes = True
+                                except ValueError:
+                                    pass
+
+                # Fallback de segurança se a busca da temporada não trouxer episódios futuros
+                if not synced_season_episodes and next_episode and next_episode.get("air_date"):
+                    try:
+                        r_date = datetime.strptime(next_episode.get("air_date"), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        ep_title = next_episode.get("name", "Novo Episodio")
+                        ep_desc = next_episode.get("overview", "")
                         s_num = next_episode.get("season_number")
-                        # Busca os episódios completos da temporada para registrar todos os episódios futuros confirmados
-                        url_season = f"{settings.TMDB_BASE_URL}/tv/{media.tmdb_id}/season/{s_num}"
-                        res_season = await client.get(url_season, headers=headers, params=params, timeout=10.0)
-                        if res_season.status_code == 200:
-                            s_data = res_season.json()
-                            from app.core.utils import get_server_today
-                            today_str = get_server_today().strftime("%Y-%m-%d")
-                            for ep in s_data.get("episodes", []):
-                                ep_air_date = ep.get("air_date")
-                                if ep_air_date and ep_air_date >= today_str:
-                                    try:
-                                        r_date = datetime.strptime(ep_air_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                                        e_num = ep.get("episode_number")
-                                        ep_title = ep.get("name") or f"Episódio {e_num}"
-                                        ep_desc = ep.get("overview", "")
-                                        
-                                        new_release = MediaRelease(
-                                            media_id=media.id,
-                                            title=f"T{s_num}E{e_num} - {ep_title}",
-                                            description=ep_desc,
-                                            release_date=r_date,
-                                            season_number=s_num,
-                                            episode_number=e_num
-                                        )
-                                        db.add(new_release)
-                                        synced_season_episodes = True
-                                    except ValueError:
-                                        pass
-
-                    # Fallback de segurança se a busca da temporada não trouxer episódios futuros
-                    if not synced_season_episodes and next_episode and next_episode.get("air_date"):
-                        try:
-                            r_date = datetime.strptime(next_episode.get("air_date"), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                            ep_title = next_episode.get("name", "Novo Episodio")
-                            ep_desc = next_episode.get("overview", "")
-                            s_num = next_episode.get("season_number")
-                            e_num = next_episode.get("episode_number")
-                            
-                            new_release = MediaRelease(
-                                media_id=media.id,
-                                title=f"T{s_num}E{e_num} - {ep_title}",
-                                description=ep_desc,
-                                release_date=r_date,
-                                season_number=s_num,
-                                episode_number=e_num
-                            )
-                            db.add(new_release)
-                        except ValueError:
-                            pass
-        except Exception as e:
-            print(f"Error syncing media {media.id}: {e}")
+                        e_num = next_episode.get("episode_number")
+                        
+                        new_release = MediaRelease(
+                            media_id=media.id,
+                            title=f"T{s_num}E{e_num} - {ep_title}",
+                            description=ep_desc,
+                            release_date=r_date,
+                            season_number=s_num,
+                            episode_number=e_num
+                        )
+                        db.add(new_release)
+                    except ValueError:
+                        pass
+    except Exception as e:
+        print(f"Error syncing media {media.id}: {e}")
             
     await db.commit()
 
@@ -156,40 +145,25 @@ async def revert_completed_shows(db: AsyncSession):
 async def fetch_changed_tmdb_ids(media_type: str, start_date: str, end_date: str) -> List[int]:
     """Fetches all changed TMDB IDs for a given media type within a date range."""
     changed_ids = set()
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {settings.TMDB_API_KEY}"
-    }
-    
-    url = f"{settings.TMDB_BASE_URL}/{media_type}/changes"
-    
-    async with httpx.AsyncClient() as client:
-        page = 1
-        total_pages = 1
-        
-        while page <= total_pages:
-            params = {
-                "start_date": start_date,
-                "end_date": end_date,
-                "page": page
-            }
-            try:
-                response = await client.get(url, headers=headers, params=params, timeout=10.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    results = data.get("results", [])
-                    for item in results:
-                        if "id" in item:
-                            changed_ids.add(item["id"])
-                    
-                    total_pages = data.get("total_pages", 1)
-                    page += 1
-                else:
-                    break
-            except Exception as e:
-                print(f"Error fetching {media_type} changes page {page}: {e}")
-                break
-                
+    endpoint = f"/{media_type}/changes"
+    page = 1
+    total_pages = 1
+
+    while page <= total_pages:
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "page": page
+        }
+        data = await tmdb_get_json(endpoint, params=params, timeout=12.0)
+        if not data:
+            break
+        for item in data.get("results", []):
+            if "id" in item:
+                changed_ids.add(item["id"])
+        total_pages = data.get("total_pages", 1)
+        page += 1
+
     return list(changed_ids)
 
 async def promote_upcoming_media(db: AsyncSession):
@@ -295,9 +269,11 @@ async def migrate_existing_future_media():
     except Exception as e:
         print(f"[OmniWatch Startup] Falha na sincronização de status de títulos: {e}")
 
-async def run_calendar_sync_loop(interval_hours: int = 24):
+async def run_calendar_sync_loop(interval_hours: int = 24, initial_delay_seconds: int = 25):
     """Background task to sync calendar data using the TMDB Changes API."""
     print("Calendar sync loop started.")
+    if initial_delay_seconds > 0:
+        await asyncio.sleep(initial_delay_seconds)
     while True:
         try:
             print("Running scheduled calendar sync...")

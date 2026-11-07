@@ -546,6 +546,7 @@ async def sync_all_active_collections():
             for col in active_collections:
                 try:
                     await sync_collection_from_tmdb(db, col.tmdb_id)
+                    await asyncio.sleep(0.5)
                 except Exception as ex:
                     logger.error(f"Failed to sync collection {col.tmdb_id} ({col.name}): {ex}")
 
@@ -554,12 +555,14 @@ async def sync_all_active_collections():
         logger.error(f"Error in sync_all_active_collections loop: {e}")
 
 
-async def run_collection_sync_loop(interval_hours: int = 24):
+async def run_collection_sync_loop(interval_hours: int = 24, initial_delay_seconds: int = 110):
     """Periodic loop running every interval_hours."""
+    if initial_delay_seconds > 0:
+        await asyncio.sleep(initial_delay_seconds)
     while True:
         try:
-            await asyncio.sleep(interval_hours * 3600)
             await sync_all_active_collections()
+            await asyncio.sleep(interval_hours * 3600)
         except asyncio.CancelledError:
             logger.info("Collection sync loop cancelled.")
             break
@@ -855,6 +858,7 @@ async def scan_all_users_collection_suggestions():
             try:
                 async with AsyncSessionLocal() as session:
                     await generate_user_collection_suggestions(session, uid)
+                await asyncio.sleep(0.8)
             except Exception as ex:
                 logger.error(f"[COLLECTION-SUGGESTIONS] Erro ao escanear coleções para {uid}: {ex}")
         logger.info("[COLLECTION-SUGGESTIONS] Varredura periódica concluída com sucesso.")
@@ -862,12 +866,14 @@ async def scan_all_users_collection_suggestions():
         logger.error(f"[COLLECTION-SUGGESTIONS] Falha na rotina scan_all_users_collection_suggestions: {e}")
 
 
-async def run_collection_suggestions_loop(interval_hours: int = 24):
+async def run_collection_suggestions_loop(interval_hours: int = 24, initial_delay_seconds: int = 45):
     """Loop diário em background para manter sugestões de coleções atualizadas."""
+    if initial_delay_seconds > 0:
+        await asyncio.sleep(initial_delay_seconds)
     while True:
         try:
-            await asyncio.sleep(interval_hours * 3600)
             await scan_all_users_collection_suggestions()
+            await asyncio.sleep(interval_hours * 3600)
         except asyncio.CancelledError:
             logger.info("Loop de sugestões de coleções cancelado.")
             break

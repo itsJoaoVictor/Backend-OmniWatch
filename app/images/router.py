@@ -88,21 +88,33 @@ async def ensure_image_cached(path: Optional[str], size: str = "w342") -> Option
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) OmniWatch/1.0"
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(tmdb_url, headers=headers)
-            if resp.status_code == 200:
-                with open(cache_file_path, "wb") as f:
-                    f.write(resp.content)
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                resp = await client.get(tmdb_url, headers=headers)
+                if resp.status_code == 200:
+                    with open(cache_file_path, "wb") as f:
+                        f.write(resp.content)
 
-                # Verifica se ultrapassou a cota de 500 MB
-                cleanup_cache_if_needed()
-                return cache_file_path
-            else:
+                    # Verifica se ultrapassou a cota de 500 MB
+                    cleanup_cache_if_needed()
+                    return cache_file_path
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    import asyncio
+                    await asyncio.sleep(0.7 * (2 ** attempt))
+                    continue
                 return None
-    except Exception as e:
-        print(f"[ImageCache] Falha ao pré-carregar {clean_path}: {e}")
-        return None
+        except (httpx.TimeoutException, httpx.TransportError, httpx.RequestError) as e:
+            if attempt < 2:
+                import asyncio
+                await asyncio.sleep(0.7 * (2 ** attempt))
+                continue
+            print(f"[ImageCache] Falha ao pré-carregar {clean_path}: {type(e).__name__}: {e}")
+            return None
+        except Exception as e:
+            print(f"[ImageCache] Falha ao pré-carregar {clean_path}: {e}")
+            return None
+    return None
 
 @router.get("/proxy")
 async def proxy_image(

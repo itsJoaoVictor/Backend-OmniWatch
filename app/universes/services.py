@@ -32,7 +32,7 @@ from app.tracking.models import UserListItem
 from app.tracking.schemas import UserListItemCreate
 from app.tracking.services import add_to_list, invalidate_user_stats_cache
 from app.core.utils import is_date_released
-from app.details.services import get_tmdb_client
+from app.core.tmdb_client import get_tmdb_client, tmdb_get_json
 
 logger = logging.getLogger(__name__)
 
@@ -48,24 +48,10 @@ _pending_universe_scans: Dict[str, asyncio.Task] = {}
 
 class _TMDBHelper:
     async def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        if not settings.TMDB_API_KEY:
-            return None
-        url = f"{settings.TMDB_BASE_URL}{endpoint}"
         req_params: Dict[str, Any] = {"language": "pt-BR"}
         if params:
             req_params.update(params)
-        headers = {
-            "accept": "application/json",
-            "Authorization": f"Bearer {settings.TMDB_API_KEY}",
-        }
-        try:
-            client = get_tmdb_client()
-            resp = await client.get(url, headers=headers, params=req_params, timeout=10.0)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            logger.debug(f"TMDB request failed for {endpoint}: {e}")
-        return None
+        return await tmdb_get_json(endpoint, params=req_params, timeout=12.0)
 
     async def get_collection_details(self, collection_id: int) -> Optional[Dict[str, Any]]:
         return await self._get(f"/collection/{collection_id}", params={"language": "pt-BR"})
@@ -74,23 +60,38 @@ class _TMDBHelper:
 tmdb_client = _TMDBHelper()
 
 
-async def _sparql_post(query: str, timeout: float = 25.0) -> List[Dict[str, Any]]:
-    """Executa uma query SPARQL no Wikidata via POST com otimizador explícito."""
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.post(
-                WIKIDATA_SPARQL_URL,
-                data={"query": query, "format": "json"},
-                headers=WIKIDATA_HEADERS,
-            )
-            if resp.status_code != 200:
+async def _sparql_post(query: str, timeout: float = 25.0, max_attempts: int = 3) -> List[Dict[str, Any]]:
+    """Executa uma query SPARQL no Wikidata via POST com otimizador explícito e retry contra 429/timeout."""
+    for attempt in range(max_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                resp = await client.post(
+                    WIKIDATA_SPARQL_URL,
+                    data={"query": query, "format": "json"},
+                    headers=WIKIDATA_HEADERS,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("results", {}).get("bindings", [])
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
+                    delay = 1.5 * (2 ** attempt)
+                    logger.warning(f"[Wikidata-RETRY] HTTP {resp.status_code} (tentativa {attempt + 1}/{max_attempts}) — aguardando {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    continue
                 logger.warning(f"Wikidata SPARQL retornou HTTP {resp.status_code}")
                 return []
-            data = resp.json()
-            return data.get("results", {}).get("bindings", [])
-    except Exception as e:
-        logger.warning(f"Falha ao consultar Wikidata SPARQL: {e}")
-        return []
+        except (httpx.TimeoutException, httpx.TransportError, httpx.RequestError) as e:
+            if attempt < max_attempts - 1:
+                delay = 1.5 * (2 ** attempt)
+                logger.warning(f"[Wikidata-RETRY] {type(e).__name__} (tentativa {attempt + 1}/{max_attempts}) — aguardando {delay:.1f}s")
+                await asyncio.sleep(delay)
+                continue
+            logger.warning(f"Falha ao consultar Wikidata SPARQL: {type(e).__name__}: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"Falha ao consultar Wikidata SPARQL: {e}")
+            return []
+    return []
 
 
 async def _wikidata_step1_find_candidates(
@@ -2089,9 +2090,10 @@ async def scan_all_users_universe_suggestions():
             logger.error(f"Erro ao pré-computar universos para usuário {uid}: {e}")
 
 
-async def run_universe_suggestions_loop(interval_hours: int = 6):
+async def run_universe_suggestions_loop(interval_hours: int = 6, initial_delay_seconds: int = 75):
     """Loop em background para manter as sugestões de universos atualizadas."""
-    await asyncio.sleep(8)
+    if initial_delay_seconds > 0:
+        await asyncio.sleep(initial_delay_seconds)
     while True:
         try:
             logger.info("Iniciando varredura em background de sugestões de universos...")
@@ -2102,9 +2104,10 @@ async def run_universe_suggestions_loop(interval_hours: int = 6):
         await asyncio.sleep(interval_hours * 3600)
 
 
-async def run_universe_sync_loop(interval_hours: int = 12):
+async def run_universe_sync_loop(interval_hours: int = 12, initial_delay_seconds: int = 135):
     """Loop periódico para sincronizar universos seguidos com novas estreias/anúncios."""
-    await asyncio.sleep(60)
+    if initial_delay_seconds > 0:
+        await asyncio.sleep(initial_delay_seconds)
     while True:
         try:
             async with AsyncSessionLocal() as db:

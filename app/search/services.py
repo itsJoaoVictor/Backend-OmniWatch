@@ -2,6 +2,7 @@ import httpx
 from fastapi import HTTPException
 from app.core.config import settings
 from app.core.cache import search_cache
+from app.core.tmdb_client import tmdb_request
 from app.search.schemas import SearchMultiResponse, SearchItem
 import urllib.parse
 
@@ -30,10 +31,9 @@ async def fetch_search_multi(query: str, page: int = 1) -> SearchMultiResponse:
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
+        response = await tmdb_request(url, params=params, timeout=12.0)
+        response.raise_for_status()
+        data = response.json()
     except httpx.HTTPError as e:
         if cached_data:
             return SearchMultiResponse(**cached_data)

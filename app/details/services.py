@@ -3,17 +3,7 @@ from fastapi import HTTPException
 from app.core.config import settings
 from typing import Optional
 from app.core.cache import details_cache
-
-_tmdb_client: Optional[httpx.AsyncClient] = None
-
-def get_tmdb_client() -> httpx.AsyncClient:
-    global _tmdb_client
-    if _tmdb_client is None or _tmdb_client.is_closed:
-        _tmdb_client = httpx.AsyncClient(
-            timeout=10.0,
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
-        )
-    return _tmdb_client
+from app.core.tmdb_client import get_tmdb_client, tmdb_request
 from app.details.schemas import (
     MovieDetailsResponse, 
     TvSeriesDetailsResponse,
@@ -66,15 +56,14 @@ async def fetch_movie_details(movie_id: int) -> MovieDetailsResponse:
     }
 
     try:
-        client = get_tmdb_client()
-        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        response = await tmdb_request(url, params=params, timeout=12.0)
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="Filme não encontrado.")
         response.raise_for_status()
         data = response.json()
         if not data.get("title") or _is_non_latin(data.get("title", "")):
             try:
-                en_resp = await client.get(url, headers=headers, params={**params, "language": "en-US"}, timeout=6.0)
+                en_resp = await tmdb_request(url, params={**params, "language": "en-US"}, timeout=8.0)
                 if en_resp.status_code == 200:
                     en_data = en_resp.json()
                     en_title = en_data.get("title")
@@ -237,15 +226,14 @@ async def fetch_tv_details(series_id: int) -> TvSeriesDetailsResponse:
     }
 
     try:
-        client = get_tmdb_client()
-        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        response = await tmdb_request(url, params=params, timeout=12.0)
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="Série não encontrada.")
         response.raise_for_status()
         data = response.json()
         if not data.get("name") or _is_non_latin(data.get("name", "")):
             try:
-                en_resp = await client.get(url, headers=headers, params={**params, "language": "en-US"}, timeout=6.0)
+                en_resp = await tmdb_request(url, params={**params, "language": "en-US"}, timeout=8.0)
                 if en_resp.status_code == 200:
                     en_data = en_resp.json()
                     en_name = en_data.get("name")
@@ -430,8 +418,7 @@ async def fetch_season_details(series_id: int, season_number: int) -> SeasonDeta
     }
 
     try:
-        client = get_tmdb_client()
-        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        response = await tmdb_request(url, params=params, timeout=12.0)
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="Temporada não encontrada.")
         response.raise_for_status()
@@ -517,8 +504,7 @@ async def fetch_episode_details(series_id: int, season_number: int, episode_numb
     }
 
     try:
-        client = get_tmdb_client()
-        response = await client.get(url, headers=headers, params=params, timeout=3.0)
+        response = await tmdb_request(url, params=params, timeout=10.0)
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="Episódio não encontrado.")
         response.raise_for_status()
@@ -571,15 +557,14 @@ async def fetch_collection_details(collection_id: int) -> CollectionResponse:
     }
 
     try:
-        client = get_tmdb_client()
-        response = await client.get(url, headers=headers, params=params, timeout=10.0)
+        response = await tmdb_request(url, params=params, timeout=12.0)
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="Coleção não encontrada.")
         response.raise_for_status()
         data = response.json()
         if not data.get("name") or _is_non_latin(data.get("name", "")):
             try:
-                en_resp = await client.get(url, headers=headers, params={**params, "language": "en-US"}, timeout=6.0)
+                en_resp = await tmdb_request(url, params={**params, "language": "en-US"}, timeout=8.0)
                 if en_resp.status_code == 200:
                     en_data = en_resp.json()
                     en_name = en_data.get("name")
@@ -594,7 +579,7 @@ async def fetch_collection_details(collection_id: int) -> CollectionResponse:
         en_parts_by_id = {}
         if has_non_latin_parts:
             try:
-                en_col_resp = await client.get(url, headers=headers, params={**params, "language": "en-US"}, timeout=6.0)
+                en_col_resp = await tmdb_request(url, params={**params, "language": "en-US"}, timeout=8.0)
                 if en_col_resp.status_code == 200:
                     for ep in en_col_resp.json().get("parts", []):
                         if ep.get("id") and ep.get("title") and not _is_non_latin(ep["title"]):

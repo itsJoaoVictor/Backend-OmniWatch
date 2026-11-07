@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, BackgroundTasks, Response, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,6 +70,15 @@ class RefreshExploreBatchRequest(BaseModel):
     limit: int = 24
 
 _seen_ids_locks: Dict[str, asyncio.Lock] = {}
+_incomplete_heal_timestamps: Dict[str, float] = {}
+
+
+def _is_record_expired(record: Any, now: datetime) -> bool:
+    """Verifica expiração de 24h protegendo também contra clock skew (last_generated_at no futuro)."""
+    if not record or record.last_generated_at is None:
+        return True
+    elapsed = (now - record.last_generated_at).total_seconds()
+    return elapsed > MAX_STALE_SECONDS or elapsed < -60
 
 async def _get_user_seen_tmdb_ids(db: AsyncSession, user_id: str) -> set:
     user_key = str(user_id)
@@ -130,10 +140,7 @@ async def get_explore_recommendations(
                 background_tasks.add_task(cleanup_bloated_user_record, current_user_id)
 
             now = datetime.now(timezone.utc)
-            is_expired = (
-                record.last_generated_at is None
-                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
-            )
+            is_expired = _is_record_expired(record, now)
             if record.is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
@@ -191,10 +198,7 @@ async def get_recent_vibe_endpoint(
         else:
             items = record.recent_vibe_items or []
             now = datetime.now(timezone.utc)
-            is_expired = (
-                record.last_generated_at is None
-                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
-            )
+            is_expired = _is_record_expired(record, now)
             if record.is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
@@ -238,10 +242,7 @@ async def get_user_personas(
                 background_tasks.add_task(cleanup_bloated_user_record, current_user_id)
 
             now = datetime.now(timezone.utc)
-            is_expired = (
-                record.last_generated_at is None
-                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
-            )
+            is_expired = _is_record_expired(record, now)
             if record.is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
@@ -286,17 +287,17 @@ async def get_upcoming_recommendations_endpoint(
         record = await get_user_recommendations_record(db, current_user_id)
         seen_ids = await _get_user_seen_tmdb_ids(db, current_user_id)
 
-        if not record or not record.upcoming_items:
+        up_raw = record.upcoming_items if (record and isinstance(record.upcoming_items, dict)) else {}
+        has_upcoming_items = bool(up_raw.get("movies") or up_raw.get("tv") or up_raw.get("series"))
+
+        if not record or not has_upcoming_items:
             res = await compute_and_save_user_recommendations(current_user_id, force=True)
             upcoming = (res.get("upcoming_items", {}) if res else {"movies": [], "tv": []})
             record = await get_user_recommendations_record(db, current_user_id)
         else:
             upcoming = record.upcoming_items
             now = datetime.now(timezone.utc)
-            is_expired = (
-                record.last_generated_at is None
-                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
-            )
+            is_expired = _is_record_expired(record, now)
             if record.is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
@@ -317,7 +318,7 @@ async def get_upcoming_recommendations_endpoint(
             tv = [it for it in tv if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids]
 
         movies = [it for it in movies if str(it.get("release_date") or "").strip() >= today_str]
-        tv = [it for it in tv if str(it.get("first_air_date") or "").strip() >= today_str]
+        tv = [it for it in tv if str(it.get("first_air_date") or it.get("release_date") or "").strip() >= today_str]
 
         clean_movies = sanitize_recommendation_list(movies[:limit])
         clean_tv = sanitize_recommendation_list(tv[:limit])
@@ -368,11 +369,20 @@ async def get_explore_feed(
                 background_tasks.add_task(cleanup_bloated_user_record, current_user_id)
 
             now = datetime.now(timezone.utc)
-            is_expired = (
-                record.last_generated_at is None
-                or (now - record.last_generated_at).total_seconds() > MAX_STALE_SECONDS
-            )
-            if is_stale or is_expired:
+            is_expired = _is_record_expired(record, now)
+            up_dict = upcoming if isinstance(upcoming, dict) else {}
+            has_upcoming = bool(up_dict.get("movies") or up_dict.get("tv") or up_dict.get("series"))
+            is_incomplete = bool(seen_ids) and (not explore or not recent_vibe or not has_upcoming)
+
+            if is_incomplete:
+                uid_str = str(current_user_id)
+                now_mono = time.monotonic()
+                if now_mono - _incomplete_heal_timestamps.get(uid_str, 0.0) > 180.0:
+                    _incomplete_heal_timestamps[uid_str] = now_mono
+                    logger.info(f"[FEED-HEAL] Seção incompleta detectada para {uid_str}; agendando recálculo forçado.")
+                    schedule_recommendation_computation(current_user_id, force=True)
+                is_stale = True
+            elif is_stale or is_expired:
                 schedule_recommendation_computation(current_user_id)
 
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -382,7 +392,7 @@ async def get_explore_feed(
         response.headers["ETag"] = etag
         response.headers["Cache-Control"] = RECS_CACHE_HEADER
 
-        if check_etag_match(request.headers.get("if-none-match"), etag):
+        if not is_stale and check_etag_match(request.headers.get("if-none-match"), etag):
             return Response(status_code=304, headers={"ETag": etag, "Cache-Control": RECS_CACHE_HEADER})
 
         if seen_ids:
@@ -397,7 +407,7 @@ async def get_explore_feed(
             personas = new_personas
 
         up_movies = [it for it in (upcoming.get("movies") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids and str(it.get("release_date") or "").strip() >= today_str]
-        up_tv = [it for it in (upcoming.get("tv") or upcoming.get("series") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids and str(it.get("first_air_date") or "").strip() >= today_str]
+        up_tv = [it for it in (upcoming.get("tv") or upcoming.get("series") or []) if it.get("id") not in seen_ids and it.get("tmdb_id") not in seen_ids and str(it.get("first_air_date") or it.get("release_date") or "").strip() >= today_str]
         
         clean_explore = sanitize_recommendation_list(explore)
         clean_recent_vibe = sanitize_recommendation_list(recent_vibe)
@@ -408,6 +418,15 @@ async def get_explore_feed(
         clean_up_tv = sanitize_recommendation_list(up_tv)
 
         upcoming = {"movies": clean_up_movies, "tv": clean_up_tv, "series": clean_up_tv}
+
+        if bool(seen_ids) and (not clean_explore or not clean_recent_vibe or not (clean_up_movies or clean_up_tv)):
+            uid_str = str(current_user_id)
+            now_mono = time.monotonic()
+            if now_mono - _incomplete_heal_timestamps.get(uid_str, 0.0) > 180.0:
+                _incomplete_heal_timestamps[uid_str] = now_mono
+                logger.info(f"[FEED-HEAL] Pós-filtro com seção vazia para {uid_str}; agendando recálculo forçado.")
+                schedule_recommendation_computation(current_user_id, force=True)
+            is_stale = True
 
         return {
             "explore": clean_explore,

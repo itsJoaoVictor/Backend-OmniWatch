@@ -45,22 +45,23 @@ async def lifespan(app: FastAPI):
     # Aplica migrações do banco de dados automaticamente no startup
     await run_auto_migrations()
 
-    # Sincroniza e migra títulos futuros para 'upcoming' automaticamente no startup
-    await migrate_existing_future_media()
+    async def _delayed_future_media_migration():
+        await asyncio.sleep(12)
+        await migrate_existing_future_media()
 
-    # Executa scan de sugestões de coleções e universos em background logo no startup
-    asyncio.create_task(scan_all_users_collection_suggestions())
-    asyncio.create_task(scan_all_users_universe_suggestions())
-
-    # Start background tasks
-    sync_task = asyncio.create_task(run_collection_sync_loop(interval_hours=24))
-    col_sugg_task = asyncio.create_task(run_collection_suggestions_loop(interval_hours=24))
-    univ_sync_task = asyncio.create_task(run_universe_sync_loop(interval_hours=24))
-    univ_sugg_task = asyncio.create_task(run_universe_suggestions_loop(interval_hours=24))
-    ranker_task = asyncio.create_task(run_ranker_training_loop(interval_hours=24))
-    cal_sync_task = asyncio.create_task(run_calendar_sync_loop(interval_hours=24))
+    # Rotinas escalonadas em background para evitar rajadas concorrentes (429/timeout) no TMDB durante o boot:
+    # t=6s: heal/sync de recomendações | t=12s: migração future_media | t=25s: calendário
+    # t=45s: sugestões de coleções | t=75s: sugestões de universos | t=110s: sync coleções | t=135s: sync universos | t=180s: ranker
+    fut_mig_task = asyncio.create_task(_delayed_future_media_migration())
     recs_sync_task = asyncio.create_task(run_recommendations_daily_sync_loop(interval_hours=24))
+    cal_sync_task = asyncio.create_task(run_calendar_sync_loop(interval_hours=24, initial_delay_seconds=25))
+    col_sugg_task = asyncio.create_task(run_collection_suggestions_loop(interval_hours=24, initial_delay_seconds=45))
+    univ_sugg_task = asyncio.create_task(run_universe_suggestions_loop(interval_hours=24, initial_delay_seconds=75))
+    sync_task = asyncio.create_task(run_collection_sync_loop(interval_hours=24, initial_delay_seconds=110))
+    univ_sync_task = asyncio.create_task(run_universe_sync_loop(interval_hours=24, initial_delay_seconds=135))
+    ranker_task = asyncio.create_task(run_ranker_training_loop(interval_hours=24))
     yield
+    fut_mig_task.cancel()
     sync_task.cancel()
     col_sugg_task.cancel()
     univ_sync_task.cancel()
@@ -70,6 +71,7 @@ async def lifespan(app: FastAPI):
     recs_sync_task.cancel()
     try:
         await asyncio.gather(
+            fut_mig_task,
             sync_task,
             col_sugg_task,
             univ_sync_task,

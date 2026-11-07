@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from fastapi import HTTPException
 from app.core.config import settings
 from app.core.cache import details_cache
+from app.core.tmdb_client import tmdb_request
 from app.person.schemas import PersonDetailsResponse, PersonCastItem, PersonDiscoverResponse
 from app.recommendation.orchestrator import GENRE_MAP
 from app.recommendation.matcher import calculate_match_score
@@ -46,12 +47,11 @@ async def fetch_person_details(person_id: int) -> PersonDetailsResponse:
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Pessoa não encontrada.")
-            response.raise_for_status()
-            data = response.json()
+        response = await tmdb_request(url, params=params, timeout=12.0)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Pessoa não encontrada.")
+        response.raise_for_status()
+        data = response.json()
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Pessoa não encontrada.")

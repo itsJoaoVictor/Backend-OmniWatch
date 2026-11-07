@@ -346,14 +346,28 @@ async def fetch_batch_llm_persona_titles(personas: List[Dict[str, Any]], client:
     }
 
     try:
-        resp = await client.post(
-            f"{settings.OPENAI_BASE_URL}/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=25.0
-        )
-        if resp.status_code != 200:
-            logger.warning(f"OpenRouter LLM batch status {resp.status_code}: {resp.text}")
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = await client.post(
+                    f"{settings.OPENAI_BASE_URL}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=35.0
+                )
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    logger.warning(f"[Personas-LLM] HTTP {resp.status_code} (tentativa {attempt + 1}/3); retentando...")
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+            except (httpx.TimeoutException, httpx.TransportError, httpx.RequestError) as net_err:
+                if attempt < 2:
+                    logger.warning(f"[Personas-LLM] {type(net_err).__name__} (tentativa {attempt + 1}/3); retentando...")
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+        if resp is None or resp.status_code != 200:
+            logger.warning(f"OpenRouter LLM batch status {resp.status_code if resp else 'None'}: {resp.text if resp else ''}")
             return {}
 
         data = resp.json()

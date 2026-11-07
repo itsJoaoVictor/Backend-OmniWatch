@@ -396,6 +396,7 @@ async def compute_and_save_user_recommendations(
                     "explore_items": record.explore_items,
                     "upcoming_items": record.upcoming_items,
                     "personas_items": record.personas_items,
+                    "recent_vibe_items": getattr(record, "recent_vibe_items", []) or [],
                 }
         return None
 
@@ -409,10 +410,11 @@ async def compute_and_save_user_recommendations(
             now = datetime.now(timezone.utc)
 
             # Verifica cooldown se não for forçado e se já houver dados válidos
+            # (0 <= elapsed protege contra clock skew quando last_generated_at ficou no futuro)
             if not force and record and record.last_generated_at:
                 elapsed = (now - record.last_generated_at).total_seconds()
                 has_data = bool(record.explore_items or record.personas_items)
-                if elapsed < cooldown_seconds and has_data:
+                if 0 <= elapsed < cooldown_seconds and has_data:
                     logger.info(
                         f"[RECS-SERVICE] Usuário {user_id_str} em cooldown ({elapsed:.0f}s / {cooldown_seconds}s). Mantendo is_stale=True."
                     )
@@ -422,6 +424,7 @@ async def compute_and_save_user_recommendations(
                         "explore_items": record.explore_items,
                         "upcoming_items": record.upcoming_items,
                         "personas_items": record.personas_items,
+                        "recent_vibe_items": getattr(record, "recent_vibe_items", []) or [],
                     }
 
             logger.info(f"[RECS-SERVICE] Iniciando geração completa de recomendações para o usuário {user_id_str}...")
@@ -499,6 +502,18 @@ async def compute_and_save_user_recommendations(
                     if isinstance(p, dict):
                         sanitize_recommendation_list(p.get("recommendations"))
 
+            # Verifica se o usuário possui itens na biblioteca e se alguma seção crítica ficou vazia
+            from app.tracking.models import UserListItem
+            has_user_items = bool(
+                (await session.execute(select(UserListItem.id).where(UserListItem.user_id == _parse_uuid(user_id_str)).limit(1))).scalar_one_or_none()
+            )
+            final_up_empty = not isinstance(upcoming_data, dict) or not (
+                upcoming_data.get("movies") or upcoming_data.get("series") or upcoming_data.get("tv")
+            )
+            should_remain_stale = bool(
+                has_user_items and (not explore_data or final_up_empty or not recent_vibe_data)
+            )
+
             # Salva na tabela
             if record is None:
                 record = UserRecommendation(
@@ -508,7 +523,7 @@ async def compute_and_save_user_recommendations(
                     personas_items=personas_data,
                     recent_vibe_items=recent_vibe_data,
                     impressions=new_impressions,
-                    is_stale=False,
+                    is_stale=should_remain_stale,
                     last_generated_at=now,
                 )
                 session.add(record)
@@ -518,7 +533,7 @@ async def compute_and_save_user_recommendations(
                 record.personas_items = personas_data
                 record.recent_vibe_items = recent_vibe_data
                 record.impressions = new_impressions
-                record.is_stale = False
+                record.is_stale = should_remain_stale
                 record.last_generated_at = now
                 flag_modified(record, "explore_items")
                 flag_modified(record, "upcoming_items")
@@ -577,29 +592,61 @@ async def run_recommendations_daily_sync_loop(interval_hours: int = 24):
     Loop periódico de 24 horas que atualiza as recomendações de todos os usuários
     no banco de dados em segundo plano, garantindo que mesmo usuários inativos
     tenham recomendações frescas com novidades do TMDB todos os dias.
+    No boot inicial (t=6s), cura prioritariamente registros ausentes, stale ou incompletos.
     """
     from app.users.models import User
+    from app.tracking.models import UserListItem
     logger.info(f"[RECS-CRON] Iniciando rotina diária de recomendações (intervalo: {interval_hours}h)...")
     
-    # Aguarda 60s após startup para não disputar recursos com a inicialização
-    await asyncio.sleep(60)
+    await asyncio.sleep(6)
+    first_boot_pass = True
 
     while True:
         try:
+            now = datetime.now(timezone.utc)
             async with AsyncSessionLocal() as session:
-                result = await session.execute(select(User.id))
-                user_ids = [str(uid) for uid in result.scalars().all()]
+                if first_boot_pass:
+                    # No boot, foca apenas em usuários com itens na lista cujo cache está ausente, expirado, stale ou incompleto
+                    active_res = await session.execute(select(UserListItem.user_id).distinct())
+                    candidate_uids = [str(r[0]) for r in active_res.all() if r[0]]
+                    recs_res = await session.execute(select(UserRecommendation))
+                    recs_by_uid = {str(r.user_id): r for r in recs_res.scalars().all()}
 
-            logger.info(f"[RECS-CRON] Sincronização diária disparada para {len(user_ids)} usuários.")
-            for uid in user_ids:
-                try:
-                    await compute_and_save_user_recommendations(uid, force=True)
-                    # Pausa de 3s entre usuários para respeitar rate-limit do TMDB
-                    await asyncio.sleep(3)
-                except Exception as err:
-                    logger.warning(f"[RECS-CRON] Erro ao sincronizar recomendações para usuário {uid}: {err}")
+                    user_ids = []
+                    for uid in candidate_uids:
+                        rec = recs_by_uid.get(uid)
+                        if rec is None or rec.is_stale or not rec.explore_items or not getattr(rec, "recent_vibe_items", None):
+                            user_ids.append(uid)
+                            continue
+                        up = rec.upcoming_items if isinstance(rec.upcoming_items, dict) else {}
+                        if not (up.get("movies") or up.get("tv") or up.get("series")):
+                            user_ids.append(uid)
+                            continue
+                        if rec.last_generated_at is None:
+                            user_ids.append(uid)
+                            continue
+                        elapsed = (now - rec.last_generated_at).total_seconds()
+                        if elapsed > interval_hours * 3600 or elapsed < -60:
+                            user_ids.append(uid)
+                else:
+                    result = await session.execute(select(User.id))
+                    user_ids = [str(uid) for uid in result.scalars().all()]
 
-            logger.info("[RECS-CRON] Ciclo diário de recomendações finalizado com sucesso.")
+            if user_ids:
+                logger.info(
+                    f"[RECS-CRON] {'Heal de boot' if first_boot_pass else 'Sincronização diária'} disparado para {len(user_ids)} usuários."
+                )
+                for uid in user_ids:
+                    try:
+                        await compute_and_save_user_recommendations(uid, force=True)
+                        await asyncio.sleep(4)
+                    except Exception as err:
+                        logger.warning(f"[RECS-CRON] Erro ao sincronizar recomendações para usuário {uid}: {err}")
+                logger.info("[RECS-CRON] Ciclo de recomendações finalizado com sucesso.")
+            else:
+                logger.info("[RECS-CRON] Todos os registros de recomendações já estão completos no boot.")
+
+            first_boot_pass = False
         except asyncio.CancelledError:
             logger.info("[RECS-CRON] Loop de recomendações cancelado.")
             break

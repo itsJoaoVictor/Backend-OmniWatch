@@ -129,33 +129,30 @@ async def fetch_discover_candidates(
         "Authorization": f"Bearer {settings.TMDB_API_KEY}"
     }
 
-    async def fetch_endpoint(client: httpx.AsyncClient, endpoint: str, media_type: Optional[str], params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        url = f"{settings.TMDB_BASE_URL}{endpoint}"
+    async def fetch_endpoint(_client: Any, endpoint: str, media_type: Optional[str], params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        from app.core.tmdb_client import tmdb_get_json
         default_params = {"language": "pt-BR", "page": 1}
         default_params.update(params)
-        try:
-            response = await client.get(url, headers=headers, params=default_params, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            if "results" in data:
-                raw_list = data.get("results", [])
-            elif "parts" in data:
-                raw_list = data.get("parts", [])
-                for r in raw_list:
-                    r["media_type"] = "movie"
-            elif "crew" in data:
-                raw_list = [c for c in data.get("crew", []) if c.get("job") == "Director"]
-            else:
-                raw_list = []
-
-            for r in raw_list:
-                if media_type:
-                    r["media_type"] = media_type
-                elif "media_type" not in r:
-                    r["media_type"] = "movie" if "title" in r else "tv"
-            return raw_list
-        except Exception:
+        data = await tmdb_get_json(endpoint, params=default_params, timeout=12.0)
+        if not data:
             return []
+        if "results" in data:
+            raw_list = data.get("results", [])
+        elif "parts" in data:
+            raw_list = data.get("parts", [])
+            for r in raw_list:
+                r["media_type"] = "movie"
+        elif "crew" in data:
+            raw_list = [c for c in data.get("crew", []) if c.get("job") == "Director"]
+        else:
+            raw_list = []
+
+        for r in raw_list:
+            if media_type:
+                r["media_type"] = media_type
+            elif "media_type" not in r:
+                r["media_type"] = "movie" if "title" in r else "tv"
+        return raw_list
 
     async with httpx.AsyncClient() as client:
         # === FUNIL 1: Grafo Comportamental Direto (35%) ===
@@ -440,7 +437,9 @@ async def enrich_candidates_with_details(
                 candidate["backdrop_path"] = getattr(details, "backdrop_path", None)
                 candidate["vote_average"] = getattr(details, "vote_average", 0.0) or candidate.get("vote_average") or 0.0
                 candidate["vote_count"] = getattr(details, "vote_count", 0) or candidate.get("vote_count") or 0
-                candidate["release_date"] = getattr(details, "first_air_date", "") or candidate.get("release_date") or candidate.get("first_air_date") or ""
+                air_date = getattr(details, "first_air_date", "") or candidate.get("first_air_date") or candidate.get("release_date") or ""
+                candidate["first_air_date"] = air_date
+                candidate["release_date"] = air_date
                 candidate["cast"] = [c.name for c in details.credits.cast[:10]] if details.credits and details.credits.cast else []
                 candidate["crew"] = [c.name for c in details.credits.crew if getattr(c, "job", "") in ("Director", "Creator")] if details.credits and details.credits.crew else []
                 candidate["keywords_list"] = details.keywords if hasattr(details, "keywords") else []
@@ -1413,23 +1412,20 @@ async def fetch_upcoming_candidates(user_vector: Dict[str, float], db=None, user
         "Authorization": f"Bearer {settings.TMDB_API_KEY}"
     }
 
-    async def fetch_endpoint(client: httpx.AsyncClient, endpoint: str, media_type: Optional[str], params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        url = f"{settings.TMDB_BASE_URL}{endpoint}"
+    async def fetch_endpoint(_client: Any, endpoint: str, media_type: Optional[str], params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        from app.core.tmdb_client import tmdb_get_json
         default_params = {"language": "pt-BR", "page": 1}
         default_params.update(params)
-        try:
-            response = await client.get(url, headers=headers, params=default_params, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            results = data.get("results", [])
-            for r in results:
-                if media_type:
-                    r["media_type"] = media_type
-                elif "media_type" not in r:
-                    r["media_type"] = "movie" if "title" in r else "tv"
-            return results
-        except Exception:
+        data = await tmdb_get_json(endpoint, params=default_params, timeout=12.0)
+        if not data:
             return []
+        results = data.get("results", [])
+        for r in results:
+            if media_type:
+                r["media_type"] = media_type
+            elif "media_type" not in r:
+                r["media_type"] = "movie" if "title" in r else "tv"
+        return results
 
     tasks = []
     async with httpx.AsyncClient() as client:
@@ -1737,44 +1733,55 @@ async def get_recent_vibe_recommendations(
     # Funil A: Discover baseado no vetor da vibe
     discover_candidates = await fetch_discover_candidates(vibe_vector, db=db, user_id=str(user_id))
 
-    # Funil B: Recomendações TMDB a partir dos top seeds recentes
+    # Funil B: Recomendações TMDB a partir dos top seeds recentes (com Bearer Auth + Retry contra 429/timeout)
     recommended_candidates: List[Dict[str, Any]] = []
-    top_seeds = seed_keys[:3]
+    top_seeds = seed_keys[:4]
     if top_seeds:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            for m_type, s_id in top_seeds:
-                endpoint = "movie" if m_type == "movie" else "tv"
-                url = f"https://api.themoviedb.org/3/{endpoint}/{s_id}/recommendations"
-                params = {"api_key": settings.TMDB_API_KEY, "language": "pt-BR", "page": 1}
-                try:
-                    r = await client.get(url, params=params)
-                    if r.status_code == 200:
-                        results = r.json().get("results", [])
-                        for item in results[:10]:
-                            item["media_type"] = m_type
-                            recommended_candidates.append(item)
-                except Exception:
-                    pass
+        from app.core.tmdb_client import tmdb_get_json
 
-    # Junta e desduplica
+        async def _fetch_seed_recs(m_type: str, s_id: int) -> List[Dict[str, Any]]:
+            endpoint = "movie" if m_type == "movie" else "tv"
+            data = await tmdb_get_json(
+                f"/{endpoint}/{s_id}/recommendations",
+                params={"language": "pt-BR", "page": 1},
+                timeout=12.0,
+            )
+            if not data:
+                return []
+            out: List[Dict[str, Any]] = []
+            for item in data.get("results", [])[:12]:
+                item["media_type"] = m_type
+                out.append(item)
+            return out
+
+        seed_batches = await asyncio.gather(*[_fetch_seed_recs(mt, sid) for mt, sid in top_seeds], return_exceptions=True)
+        for batch in seed_batches:
+            if isinstance(batch, list):
+                recommended_candidates.extend(batch)
+
+    # Junta e desduplica (prioriza seeds diretos da vibe recente + discover da vibe)
     combined_raw: List[Dict[str, Any]] = []
+    fallback_raw: List[Dict[str, Any]] = []
     seen_in_vibe: Set[Tuple[str, int]] = set()
 
-    for c in (discover_candidates + recommended_candidates):
+    for c in (recommended_candidates + discover_candidates):
         cid = c.get("id")
         ctype = c.get("media_type") or "movie"
         ckey = (ctype, cid)
         if not cid or ckey in excluded_keys or ckey in seen_in_vibe:
             continue
 
-        # Filtros básicos de qualidade mínima (vote_count >= 60, vote_avg >= 5.5)
         v_count = c.get("vote_count", 0) or 0
         v_avg = c.get("vote_average", 0.0) or 0.0
-        if v_count < 60 or v_avg < 5.5:
-            continue
+        if v_count >= 60 and v_avg >= 5.8:
+            seen_in_vibe.add(ckey)
+            combined_raw.append(c)
+        elif v_count >= 20 and v_avg >= 5.5:
+            seen_in_vibe.add(ckey)
+            fallback_raw.append(c)
 
-        seen_in_vibe.add(ckey)
-        combined_raw.append(c)
+    if len(combined_raw) < top_k and fallback_raw:
+        combined_raw.extend(fallback_raw[: max(0, top_k * 2 - len(combined_raw))])
 
     if not combined_raw:
         return []

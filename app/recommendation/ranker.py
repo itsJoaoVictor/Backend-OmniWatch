@@ -703,7 +703,7 @@ async def run_ranker_training_loop(interval_hours: int = 24):
     import asyncio
     from app.core.database import AsyncSessionLocal
 
-    await asyncio.sleep(60)
+    await asyncio.sleep(180)
 
     while True:
         if not ENABLE_LGBM_RANKER:
