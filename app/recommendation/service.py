@@ -450,7 +450,8 @@ async def compute_and_save_user_recommendations(
                 upcoming_data = record.upcoming_items if record else {}
 
             try:
-                personas_data = await get_persona_recommendations(session, user_id_str, top_k_per_persona=15)
+                _explore_keys = {(it.get("media_type", "movie"), it.get("id")) for it in (explore_data or []) if isinstance(it, dict)}
+                personas_data = await get_persona_recommendations(session, user_id_str, top_k_per_persona=15, exclude_keys=_explore_keys)
             except Exception as e:
                 logger.error(f"[RECS-SERVICE] Erro ao gerar persona_recommendations para {user_id_str}: {e}")
                 personas_data = record.personas_items if record else []
@@ -471,6 +472,23 @@ async def compute_and_save_user_recommendations(
 
             # Sanitização defensiva em O(N) para garantir que NENHUM embedding seja gravado
             # na tabela user_recommendations (reduzindo a linha JSONB de ~15MB para ~200KB no PostgreSQL)
+            # Protege contra sobrescrita por resultado vazio (ex.: falha transitoria do TMDB)
+            if record is not None:
+                if not explore_data and record.explore_items:
+                    logger.warning(f"[RECS-SERVICE] explore vazio para {user_id_str}; mantendo versao anterior.")
+                    explore_data = record.explore_items
+                if not recent_vibe_data and getattr(record, "recent_vibe_items", None):
+                    recent_vibe_data = record.recent_vibe_items
+                if not personas_data and record.personas_items:
+                    personas_data = record.personas_items
+                _up_empty = not isinstance(upcoming_data, dict) or not (
+                    upcoming_data.get("movies") or upcoming_data.get("series") or upcoming_data.get("tv")
+                )
+                _old_up = record.upcoming_items
+                if _up_empty and isinstance(_old_up, dict) and (_old_up.get("movies") or _old_up.get("series") or _old_up.get("tv")):
+                    logger.warning(f"[RECS-SERVICE] upcoming vazio para {user_id_str}; mantendo versao anterior.")
+                    upcoming_data = _old_up
+
             sanitize_recommendation_list(explore_data)
             sanitize_recommendation_list(recent_vibe_data)
             if isinstance(upcoming_data, dict):
@@ -892,13 +910,13 @@ async def refresh_explore_media_batch(
 
     collab_cands: List[Dict[str, Any]] = []
     try:
-        raw_collab = await fetch_collaborative_candidates(
+        collab_cands = await fetch_collaborative_candidates(
             db=db,
             target_user_id=str(user_id),
             seen_media_keys=all_excluded,
-            limit=30,
+            limit=36,
+            media_type_filter=media_type,
         )
-        collab_cands = [c for c in raw_collab if c.get("media_type", "movie") == media_type]
     except Exception:
         collab_cands = []
 

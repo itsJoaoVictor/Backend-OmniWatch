@@ -84,6 +84,7 @@ class MovieDetailsResponse(BaseModel):
     status: str
     runtime: int
     vote_average: float
+    vote_count: int = 0
     genres: List[GenreItem]
     production_companies: List[ProductionCompanyItem] = []
     belongs_to_collection: Optional[CollectionItem] = None
@@ -146,6 +147,7 @@ class TvSeriesDetailsResponse(BaseModel):
     number_of_seasons: int
     number_of_episodes: int
     vote_average: float
+    vote_count: int = 0
     genres: List[GenreItem]
     episode_run_time: List[int] = []
     networks: List[NetworkItem] = []

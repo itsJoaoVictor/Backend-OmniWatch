@@ -2,6 +2,13 @@ import math
 from typing import List, Dict, Any, Union
 from app.media.models import Media
 
+# Keywords tecnicas/de producao que nao expressam gosto tematico
+NOISE_KEYWORDS = {
+    "sequel", "aftercreditsstinger", "duringcreditsstinger", "prequel", "remake", "reboot",
+    "based on comic", "based on novel or book", "woman director", "3d", "imax", "spin off",
+    "post-credits scene", "mid-credits scene", "duringcreditsstinger ", "based on true story",
+}
+
 WEIGHTS = {
     "genre": 1.5,
     "director": 1.2,
@@ -198,7 +205,7 @@ def build_sparse_vector(media: Media) -> Dict[str, float]:
         for kw in media.keywords:
             if kw:
                 kw_clean = str(kw).lower().strip()
-                if kw_clean:
+                if kw_clean and kw_clean not in NOISE_KEYWORDS:
                     vector[f"keyword_{kw_clean}"] = WEIGHTS["keyword"]
 
     # --- Fase 2: Idioma Original Emergente ---

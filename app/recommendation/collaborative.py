@@ -217,6 +217,7 @@ async def fetch_collaborative_candidates(
     limit: int = 60,
     min_similarity: float = 0.15,
     seen_tmdb_ids: Optional[Set[int]] = None,
+    media_type_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Canal 3 de Recuperação Colaborativa Implícita (Sub-etapa 5.2 + Ideia 9):
@@ -239,15 +240,18 @@ async def fetch_collaborative_candidates(
     if target_uuid in user_map and user_item_matrix is not None:
         target_idx = user_map[target_uuid]
         try:
+            fetch_n = limit * 4 if media_type_filter else limit * 2
             ids, scores = model.recommend(
                 target_idx,
                 user_item_matrix[target_idx],
-                N=limit * 2,
+                N=fetch_n,
                 filter_already_liked_items=True
             )
             for item_idx, score in zip(ids, scores):
                 m_key = rev_item_map.get(int(item_idx))
                 if m_key and m_key not in effective_seen_keys:
+                    if media_type_filter and m_key[0] != media_type_filter:
+                        continue
                     recommended_keys_with_score.append((m_key, float(score)))
         except Exception as e:
             logger.warning(f"[ALS] Erro no recommend direto: {e}")
@@ -265,22 +269,29 @@ async def fetch_collaborative_candidates(
             if liked_media_ids:
                 media_stmt = select(Media.media_type, Media.tmdb_id).where(Media.id.in_(liked_media_ids))
                 m_res = await db.execute(media_stmt)
-                user_seed_keys = [(r[0] or "movie", r[1]) for r in m_res.all() if r[1]]
+                user_seed_keys = [
+                    (r[0] or "movie", r[1]) for r in m_res.all()
+                    if r[1] and (not media_type_filter or (r[0] or "movie") == media_type_filter)
+                ]
 
                 # Mapeia para índices do modelo
                 seed_indices = [_ITEM_MAP[k] for k in user_seed_keys if k in _ITEM_MAP]
                 if seed_indices:
-                    sim_ids, sim_scores = model.similar_items(seed_indices[:3], N=limit)
+                    sim_ids, sim_scores = model.similar_items(seed_indices[:4], N=limit * 2)
                     if sim_ids.ndim == 2:
                         for row_ids, row_scs in zip(sim_ids, sim_scores):
                             for s_id, s_sc in zip(row_ids, row_scs):
                                 m_k = rev_item_map.get(int(s_id))
                                 if m_k and m_k not in effective_seen_keys:
+                                    if media_type_filter and m_k[0] != media_type_filter:
+                                        continue
                                     recommended_keys_with_score.append((m_k, float(s_sc)))
                     else:
                         for s_id, s_sc in zip(sim_ids, sim_scores):
                             m_k = rev_item_map.get(int(s_id))
                             if m_k and m_k not in effective_seen_keys:
+                                if media_type_filter and m_k[0] != media_type_filter:
+                                    continue
                                 recommended_keys_with_score.append((m_k, float(s_sc)))
         except Exception as e:
             logger.warning(f"[ALS] Erro no item-to-item fallback: {e}")
@@ -330,6 +341,8 @@ async def fetch_collaborative_candidates(
             "keywords_list": m.keywords or [],
             "original_language": m.original_language or "",
             "release_date": m.release_date or "",
+            "vote_average": float(m.vote_average or 0.0),
+            "vote_count": int(m.vote_count or 0),
             "embedding": m.embedding,
             "collaborative": True,
             "collaborative_score": round(float(best_collab[k]), 4),

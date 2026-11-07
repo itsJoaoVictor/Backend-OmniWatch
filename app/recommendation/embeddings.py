@@ -123,8 +123,20 @@ async def generate_embeddings_batch(texts: List[str], chunk_size: int = 32) -> L
         }
 
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(url, headers=headers, json=payload, timeout=15.0)
+            response = None
+            for _attempt in range(2):
+                try:
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(url, headers=headers, json=payload, timeout=45.0)
+                    if response.status_code < 500 and response.status_code != 429:
+                        break
+                except httpx.TimeoutException as _te:
+                    logger.warning(f"[Embeddings] Timeout ({type(_te).__name__}) tentativa {_attempt + 1}/2")
+                    response = None
+                    await asyncio.sleep(1.0)
+            if response is None:
+                raise RuntimeError("timeout apos 2 tentativas")
+            if True:
                 if response.status_code == 200:
                     data = response.json()
                     results_data = data.get("data", [])
@@ -141,7 +153,7 @@ async def generate_embeddings_batch(texts: List[str], chunk_size: int = 32) -> L
                 else:
                     logger.error(f"[Embeddings] Erro batch OpenRouter: {response.status_code} - {response.text}")
         except Exception as e:
-            logger.error(f"[Embeddings] Exceção em generate_embeddings_batch: {e}")
+            logger.error(f"[Embeddings] Exceção em generate_embeddings_batch: {type(e).__name__}: {e}")
 
     return all_embeddings
 

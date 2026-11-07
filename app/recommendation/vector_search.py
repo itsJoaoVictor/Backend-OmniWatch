@@ -254,10 +254,13 @@ async def search_semantic_candidates(
 
     # Produto interno de matriz M @ q em O(M) SIMD
     similarities = np.dot(_CACHED_MATRIX, q_normed)
+    if media_type_filter:
+        type_mask = np.array([k[0] == media_type_filter for k in _CACHED_KEYS], dtype=bool)
+        similarities = np.where(type_mask, similarities, -np.inf)
     total_rows = len(similarities)
 
     # Usa np.argpartition em O(M) quando o alvo é menor que o catálogo total
-    target_k = min(total_rows, (limit * 2 if media_type_filter else limit) + len(excluded) + 16)
+    target_k = min(total_rows, limit + len(excluded) + 16)
     if target_k < total_rows:
         part_idx = np.argpartition(-similarities, target_k - 1)[:target_k]
         top_indices = part_idx[np.argsort(-similarities[part_idx])]

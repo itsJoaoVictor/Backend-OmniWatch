@@ -118,9 +118,11 @@ async def fetch_discover_candidates(
 
     without_genres_str = ",".join(set(dealbreaker_genre_ids)) if dealbreaker_genre_ids else None
 
-    # Ordena âncoras de ouro
+    # Ordena âncoras de ouro separadas por formato (Filmes e Séries não disputam vagas de âncora)
     golden_anchors.sort(key=lambda x: x[0], reverse=True)
-    top_anchors = golden_anchors[:5]
+    top_movie_anchors = [a for a in golden_anchors if a[1] == "movie"][:4]
+    top_tv_anchors = [a for a in golden_anchors if a[1] == "tv"][:4]
+    top_anchors = top_movie_anchors + top_tv_anchors
 
     headers = {
         "accept": "application/json",
@@ -259,26 +261,29 @@ async def fetch_discover_candidates(
     def ingest_funnel_results(results_batch: Any, weight: float):
         if not isinstance(results_batch, (list, tuple)):
             return
-        flat_list = []
         for b in results_batch:
-            if isinstance(b, list):
-                flat_list.extend(b)
-        for rank_idx, c in enumerate(flat_list):
-            cid = c.get("id")
-            mtype = c.get("media_type", "movie")
-            if not cid:
+            if not isinstance(b, list):
                 continue
+            rank_by_type = {"movie": 0, "tv": 0}
+            for c in b:
+                cid = c.get("id")
+                mtype = c.get("media_type", "movie")
+                if not cid or mtype not in ("movie", "tv"):
+                    continue
 
-            # Filtro de tração mínima para candidatos gerais já lançados (elimina ruído com 0 ou 1 voto)
-            vc = float(c.get("vote_count", 0) or 0)
-            r_date = c.get("release_date") or c.get("first_air_date")
-            is_past = bool(r_date and len(str(r_date)) >= 4 and str(r_date)[:4].isdigit())
-            if is_past and vc < (20.0 if mtype == "movie" else 15.0):
-                continue
-            key = (mtype, cid)
-            if key not in candidate_map:
-                candidate_map[key] = c
-            rrf_scores[key] = rrf_scores.get(key, 0.0) + (weight / (k_rrf + rank_idx + 1))
+                # Filtro de tração mínima para candidatos gerais já lançados (elimina ruído com 0 ou 1 voto)
+                vc = float(c.get("vote_count", 0) or 0)
+                r_date = c.get("release_date") or c.get("first_air_date")
+                is_past = bool(r_date and len(str(r_date)) >= 4 and str(r_date)[:4].isdigit())
+                if is_past and vc < (20.0 if mtype == "movie" else 15.0):
+                    continue
+
+                rank_idx = rank_by_type[mtype]
+                rank_by_type[mtype] += 1
+                key = (mtype, cid)
+                if key not in candidate_map:
+                    candidate_map[key] = c
+                rrf_scores[key] = rrf_scores.get(key, 0.0) + (weight / (k_rrf + rank_idx + 1))
 
     ingest_funnel_results(res_f1, w_f1)
     ingest_funnel_results(res_f2, w_f2)
@@ -286,15 +291,19 @@ async def fetch_discover_candidates(
     ingest_funnel_results(res_f4, w_f4)
 
     sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
-    candidates = []
+    movie_cands: List[Dict[str, Any]] = []
+    tv_cands: List[Dict[str, Any]] = []
     for key in sorted_keys:
         c = candidate_map[key]
         c["_rrf_score"] = rrf_scores[key]
-        candidates.append(c)
-        if len(candidates) >= 180:
+        if key[0] == "movie" and len(movie_cands) < 100:
+            movie_cands.append(c)
+        elif key[0] == "tv" and len(tv_cands) < 100:
+            tv_cands.append(c)
+        if len(movie_cands) >= 100 and len(tv_cands) >= 100:
             break
 
-    return candidates
+    return movie_cands + tv_cands
 
 
 async def enrich_candidates_with_details(
@@ -376,7 +385,7 @@ async def enrich_candidates_with_details(
     sorted_movies = compute_rrf_ranking(movies)
     sorted_tv = compute_rrf_ranking(tv)
 
-    top_candidates = sorted_movies[:25] + sorted_tv[:25]
+    top_candidates = sorted_movies[:70] + sorted_tv[:70]
 
     async def enrich_one(candidate: Dict[str, Any]) -> Dict[str, Any]:
         tmdb_id = candidate.get("id")
@@ -412,13 +421,15 @@ async def enrich_candidates_with_details(
                 candidate["overview"] = getattr(details, "overview", "")
                 candidate["poster_path"] = getattr(details, "poster_path", None)
                 candidate["backdrop_path"] = getattr(details, "backdrop_path", None)
-                candidate["vote_average"] = getattr(details, "vote_average", 0.0)
-                candidate["vote_count"] = getattr(details, "vote_count", 0)
-                candidate["release_date"] = getattr(details, "release_date", "")
+                candidate["vote_average"] = getattr(details, "vote_average", 0.0) or candidate.get("vote_average") or 0.0
+                candidate["vote_count"] = getattr(details, "vote_count", 0) or candidate.get("vote_count") or 0
+                candidate["release_date"] = getattr(details, "release_date", "") or candidate.get("release_date") or candidate.get("first_air_date") or ""
                 candidate["cast"] = [c.name for c in details.credits.cast[:10]] if details.credits and details.credits.cast else []
                 candidate["crew"] = [c.name for c in details.credits.crew if getattr(c, "job", "") in ("Director", "Creator")] if details.credits and details.credits.crew else []
                 candidate["keywords_list"] = details.keywords if hasattr(details, "keywords") else []
                 candidate["original_language"] = getattr(details, "original_language", "") or ""
+                if not candidate.get("genre_ids") and getattr(details, "genres", None):
+                    candidate["genre_ids"] = [getattr(g, "id", 0) for g in details.genres if getattr(g, "id", None)]
                 if hasattr(details, "watch_providers") and details.watch_providers:
                     candidate["watch_providers_br"] = [wp.provider_name for wp in details.watch_providers if hasattr(wp, "provider_name")]
             else:
@@ -427,13 +438,15 @@ async def enrich_candidates_with_details(
                 candidate["overview"] = getattr(details, "overview", "")
                 candidate["poster_path"] = getattr(details, "poster_path", None)
                 candidate["backdrop_path"] = getattr(details, "backdrop_path", None)
-                candidate["vote_average"] = getattr(details, "vote_average", 0.0)
-                candidate["vote_count"] = getattr(details, "vote_count", 0)
-                candidate["release_date"] = getattr(details, "first_air_date", "")
+                candidate["vote_average"] = getattr(details, "vote_average", 0.0) or candidate.get("vote_average") or 0.0
+                candidate["vote_count"] = getattr(details, "vote_count", 0) or candidate.get("vote_count") or 0
+                candidate["release_date"] = getattr(details, "first_air_date", "") or candidate.get("release_date") or candidate.get("first_air_date") or ""
                 candidate["cast"] = [c.name for c in details.credits.cast[:10]] if details.credits and details.credits.cast else []
                 candidate["crew"] = [c.name for c in details.credits.crew if getattr(c, "job", "") in ("Director", "Creator")] if details.credits and details.credits.crew else []
                 candidate["keywords_list"] = details.keywords if hasattr(details, "keywords") else []
                 candidate["original_language"] = getattr(details, "original_language", "") or ""
+                if not candidate.get("genre_ids") and getattr(details, "genres", None):
+                    candidate["genre_ids"] = [getattr(g, "id", 0) for g in details.genres if getattr(g, "id", None)]
                 if hasattr(details, "watch_providers") and details.watch_providers:
                     candidate["watch_providers_br"] = [wp.provider_name for wp in details.watch_providers if hasattr(wp, "provider_name")]
         except Exception:
@@ -761,6 +774,74 @@ def reciprocal_rank_fusion(
     return merged
 
 
+def _damped_quality(c: Dict[str, Any]) -> float:
+    va = float(c.get("vote_average") or 0.0)
+    vc = float(c.get("vote_count") or 0.0)
+    return (va * vc + 6.5 * 50.0) / (vc + 50.0)
+
+
+def _franchise_key(c: Dict[str, Any]) -> Optional[str]:
+    col = c.get("belongs_to_collection")
+    if isinstance(col, dict) and col.get("id"):
+        key = f"col:{col['id']}"
+    else:
+        key = None
+    kws = " ".join(str(k).lower() for k in (c.get("keywords_list") or []))
+    if "marvel cinematic universe" in kws or "mcu" in kws.split():
+        return "universe:mcu"
+    if key:
+        return key
+    title = str(c.get("title") or c.get("name") or "")
+    return f"title:{title.split(':')[0].strip().lower()}" if ":" in title else None
+
+
+def _cap_per_franchise(items: List[Dict[str, Any]], limit: int, max_per: int = 5) -> List[Dict[str, Any]]:
+    """Maximo `max_per` (5) obras por franquia/universo, preservando a ordem."""
+    counts: Dict[str, int] = {}
+    out: List[Dict[str, Any]] = []
+    for c in items:
+        fk = _franchise_key(c)
+        if fk:
+            if counts.get(fk, 0) >= max_per:
+                continue
+            counts[fk] = counts.get(fk, 0) + 1
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _apply_quality_floor(pool: List[Dict[str, Any]], min_needed: int, mtype: str) -> List[Dict[str, Any]]:
+    """Piso: nota >= 6.5 e >=100 votos (>=50 series). Relaxa se sobrar pouco."""
+    min_votes = 100 if mtype == "movie" else 50
+    ok = [c for c in pool if float(c.get("vote_average") or 0) >= 6.5 and int(c.get("vote_count") or 0) >= min_votes]
+    if len(ok) >= min_needed:
+        return ok
+    relaxed = [c for c in pool if float(c.get("vote_average") or 0) >= 6.0 and int(c.get("vote_count") or 0) >= 30]
+    return relaxed if len(relaxed) >= min_needed else (relaxed or pool)
+
+
+def _pick_discovery(rest: List[Dict[str, Any]], user_vector: Dict[str, float], n: int) -> List[Dict[str, Any]]:
+    """Descoberta adjacente: boa qualidade mas fora do eixo mais consumido (genero/idioma menos frequentes)."""
+    if n <= 0 or not rest:
+        return []
+    top_genres = {k for k, _ in sorted(((k, v) for k, v in user_vector.items() if k.startswith("genre_")), key=lambda x: -x[1])[:4]}
+    top_langs = {k for k, _ in sorted(((k, v) for k, v in user_vector.items() if k.startswith("lang_")), key=lambda x: -x[1])[:2]}
+
+    def novelty(c: Dict[str, Any]) -> float:
+        genres = set()
+        for g in list(c.get("genre_ids", [])) + list(c.get("genres", [])):
+            for canon in normalize_genre_to_canonical(g):
+                genres.add(f"genre_{canon}")
+        n_new = len(genres - top_genres)
+        lang_new = 1 if f"lang_{c.get('original_language', '')}" not in top_langs else 0
+        return n_new + 1.5 * lang_new
+
+    ranked = sorted(rest, key=lambda c: (novelty(c) > 0, _damped_quality(c)), reverse=True)
+    return [c for c in ranked if novelty(c) > 0][:n]
+
+
+
 async def get_personalized_recommendations(
     db: AsyncSession,
     user_id: str,
@@ -787,26 +868,34 @@ async def get_personalized_recommendations(
             user_embedding = target_persona.get("centroid_embedding") or user_embedding
         discover_candidates = await fetch_discover_candidates(user_vector, db=db, user_id=user_id, persona_id=persona_id)
     elif user_taste_clusters and len(user_taste_clusters) > 1:
-        # Pescaria Multi-Persona para o Carrossel Geral: busca candidatos para cada faceta do usuario
-        tasks = [
+        # Pescaria Multi-Persona para o Carrossel Geral: busca candidatos para o perfil geral + cada faceta
+        tasks = [fetch_discover_candidates(user_vector, db=db, user_id=user_id)]
+        tasks.extend([
             fetch_discover_candidates(p.get("feature_vector") or user_vector, db=db, user_id=user_id, persona_id=p.get("id"))
             for p in user_taste_clusters
-        ]
-        tasks.append(fetch_discover_candidates(user_vector, db=db, user_id=user_id))
+        ])
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        merged_discover = []
-        seen_cand_keys = set()
-        for res in results:
-            if isinstance(res, list):
-                for c in res:
-                    cid = c.get("id")
-                    mtype = c.get("media_type", "movie")
-                    ckey = (mtype, cid)
-                    if cid and ckey not in seen_cand_keys:
-                        merged_discover.append(c)
-                        seen_cand_keys.add(ckey)
-        discover_candidates = merged_discover
+        # Intercala em round-robin separadamente por formato (movie e tv) para nenhuma faceta dominar o topo
+        def _round_robin_by_type(batches: List[Any], mtype: str) -> List[Dict[str, Any]]:
+            lists = [
+                [c for c in res if c.get("media_type", "movie") == mtype]
+                for res in batches if isinstance(res, list)
+            ]
+            merged: List[Dict[str, Any]] = []
+            seen_ids: Set[int] = set()
+            max_len = max((len(lst) for lst in lists), default=0)
+            for idx in range(max_len):
+                for lst in lists:
+                    if idx < len(lst):
+                        c = lst[idx]
+                        cid = c.get("id")
+                        if cid and cid not in seen_ids:
+                            seen_ids.add(cid)
+                            merged.append(c)
+            return merged
+
+        discover_candidates = _round_robin_by_type(results, "movie") + _round_robin_by_type(results, "tv")
     else:
         discover_candidates = await fetch_discover_candidates(user_vector, db=db, user_id=user_id)
 
@@ -852,50 +941,72 @@ async def get_personalized_recommendations(
         except Exception:
             pass
 
-    filtered_discover = [
+    filtered_discover_movies = [
         c for c in discover_candidates
-        if (c.get("media_type", "movie"), c.get("id")) not in seen_media_keys
+        if c.get("media_type", "movie") == "movie" and ("movie", c.get("id")) not in seen_media_keys
+    ]
+    filtered_discover_tv = [
+        c for c in discover_candidates
+        if c.get("media_type") == "tv" and ("tv", c.get("id")) not in seen_media_keys
     ]
 
-    # === CANAL 1: Retrieval Semântico / ANN (Sub-etapa 5.1 + Ideia 2) ===
+    # === CANAIS INDEPENDENTES POR SESSÃO: FILMES (movie) vs SÉRIES (tv) ===
     from app.recommendation.vector_search import search_semantic_candidates
-    try:
-        semantic_candidates = await search_semantic_candidates(
-            db=db,
-            query_embedding=user_embedding,
-            excluded_keys=seen_media_keys,
-            limit=80
-        )
-    except Exception as e:
-        logger.warning(f"Erro no Canal Semântico ANN: {e}")
-        semantic_candidates = []
-
-    # === CANAL 3: Filtragem Colaborativa Implícita ALS (Sub-etapa 5.2 + Ideia 9) ===
     from app.recommendation.collaborative import fetch_collaborative_candidates
-    try:
-        collab_candidates = await fetch_collaborative_candidates(
-            db=db,
-            target_user_id=user_id,
-            seen_media_keys=seen_media_keys,
-            limit=60
-        )
-    except Exception as e:
-        logger.warning(f"Erro no Canal Colaborativo ALS: {e}")
-        collab_candidates = []
 
-    # === FUSÃO RRF (Reciprocal Rank Fusion) DOS 3 CANAIS (Sub-etapa 5.2 + Ideia 9) ===
-    channel_inputs = []
-    if semantic_candidates:
-        channel_inputs.append(("semantic", semantic_candidates, 1.0))
-    if filtered_discover:
-        channel_inputs.append(("discover", filtered_discover, 1.0))
-    if collab_candidates:
-        channel_inputs.append(("collaborative", collab_candidates, 1.2))
+    async def _safe_semantic(mtype: str) -> List[Dict[str, Any]]:
+        try:
+            return await search_semantic_candidates(
+                db=db,
+                query_embedding=user_embedding,
+                excluded_keys=seen_media_keys,
+                limit=60,
+                media_type_filter=mtype,
+            )
+        except Exception as e:
+            logger.warning(f"Erro no Canal Semântico ANN ({mtype}): {e}")
+            return []
 
-    if channel_inputs:
-        all_candidates = reciprocal_rank_fusion(channel_inputs, k_constant=60, top_n=150)
-    else:
-        all_candidates = []
+    async def _safe_collab(mtype: str) -> List[Dict[str, Any]]:
+        try:
+            return await fetch_collaborative_candidates(
+                db=db,
+                target_user_id=user_id,
+                seen_media_keys=seen_media_keys,
+                limit=45,
+                media_type_filter=mtype,
+            )
+        except Exception as e:
+            logger.warning(f"Erro no Canal Colaborativo ALS ({mtype}): {e}")
+            return []
+
+    semantic_movies, semantic_tv, collab_movies, collab_tv = await asyncio.gather(
+        _safe_semantic("movie"),
+        _safe_semantic("tv"),
+        _safe_collab("movie"),
+        _safe_collab("tv"),
+    )
+
+    # Fusão RRF independente para Filmes e para Séries (zero competição entre formatos)
+    movie_channels = []
+    if semantic_movies:
+        movie_channels.append(("semantic", semantic_movies, 1.0))
+    if filtered_discover_movies:
+        movie_channels.append(("discover", filtered_discover_movies, 1.0))
+    if collab_movies:
+        movie_channels.append(("collaborative", collab_movies, 1.2))
+
+    tv_channels = []
+    if semantic_tv:
+        tv_channels.append(("semantic", semantic_tv, 1.0))
+    if filtered_discover_tv:
+        tv_channels.append(("discover", filtered_discover_tv, 1.0))
+    if collab_tv:
+        tv_channels.append(("collaborative", collab_tv, 1.2))
+
+    movie_candidates = reciprocal_rank_fusion(movie_channels, k_constant=60, top_n=90) if movie_channels else []
+    tv_candidates = reciprocal_rank_fusion(tv_channels, k_constant=60, top_n=90) if tv_channels else []
+    all_candidates = movie_candidates + tv_candidates
 
     if not all_candidates:
         return []
@@ -903,8 +1014,8 @@ async def get_personalized_recommendations(
     seen_candidate_keys = {(c.get("media_type", "movie"), c.get("id")) for c in all_candidates if "id" in c}
 
     # 3. Enriquece apenas candidatos rasos que não possuem metadados completos
-    to_enrich = [c for c in all_candidates if not (c.get("cast") and c.get("keywords_list"))]
-    already_enriched = [c for c in all_candidates if (c.get("cast") and c.get("keywords_list"))]
+    to_enrich = [c for c in all_candidates if not (c.get("cast") and c.get("keywords_list")) or not c.get("vote_count")]
+    already_enriched = [c for c in all_candidates if (c.get("cast") and c.get("keywords_list")) and c.get("vote_count")]
 
     enriched_discover = await enrich_candidates_with_details(
         to_enrich,
@@ -920,11 +1031,23 @@ async def get_personalized_recommendations(
         try:
             from app.media.models import Media as MediaModel
             media_records = await db.execute(
-                select(MediaModel.media_type, MediaModel.tmdb_id, MediaModel.embedding).where(
+                select(MediaModel.media_type, MediaModel.tmdb_id, MediaModel.embedding,
+                       MediaModel.vote_average, MediaModel.vote_count, MediaModel.release_date).where(
                     MediaModel.tmdb_id.in_(candidate_tmdb_ids)
                 )
             )
-            emb_map = {(row[0], row[1]): row[2] for row in media_records.all() if row[2]}
+            _rows = media_records.all()
+            emb_map = {(row[0], row[1]): row[2] for row in _rows if row[2]}
+            _meta = {(row[0], row[1]): row for row in _rows}
+            for c in total_candidates:
+                _r = _meta.get((c.get("media_type", "movie"), c.get("id")))
+                if _r is not None:
+                    if not c.get("vote_average") and _r[3]:
+                        c["vote_average"] = float(_r[3])
+                    if not c.get("vote_count") and _r[4]:
+                        c["vote_count"] = int(_r[4])
+                    if not c.get("release_date") and not c.get("first_air_date") and _r[5]:
+                        c["release_date"] = str(_r[5])
             for c in total_candidates:
                 m_key = (c.get("media_type", "movie"), c.get("id"))
                 if m_key in emb_map and not c.get("embedding"):
@@ -1048,22 +1171,55 @@ async def get_personalized_recommendations(
                 selected_ids.add(item["id"])
         return selected
 
-    movies_pool = [c for c in scored_candidates if c.get("media_type") == "movie"]
-    tv_pool = [c for c in scored_candidates if c.get("media_type") == "tv"]
-    
-    selected_movies = select_diverse(movies_pool, target_each)
-    selected_tv = select_diverse(tv_pool, target_each)
-    
-    if len(selected_movies) < target_each:
-        rem_tv = [c for c in tv_pool if c not in selected_tv]
-        selected_tv.extend(apply_mmr_reranking(rem_tv, lambda_param=0.65, top_k=target_each - len(selected_movies)))
-    elif len(selected_tv) < target_each:
-        rem_movies = [c for c in movies_pool if c not in selected_movies]
-        selected_movies.extend(apply_mmr_reranking(rem_movies, lambda_param=0.65, top_k=target_each - len(selected_tv)))
-        
-    diverse_recommendations = selected_movies + selected_tv
+    raw_movies = [c for c in scored_candidates if c.get("media_type") == "movie"]
+    raw_tv = [c for c in scored_candidates if c.get("media_type") == "tv"]
 
-    # Ordena o carrossel do maior % para o menor dentro do conjunto selecionado
+    def select_mixed(pool: List[Dict[str, Any]], target: int) -> List[Dict[str, Any]]:
+        """Mix ~70% afinidade / ~20% descoberta adjacente / ~10% surpresa, com teto por franquia."""
+        if not pool:
+            return []
+        n_aff = max(1, int(round(target * 0.7)))
+        n_disc = int(round(target * 0.2))
+        picked = _cap_per_franchise(select_diverse(pool, n_aff * 2), n_aff)
+        chosen_ids = {c["id"] for c in picked}
+        rest = [c for c in pool if c["id"] not in chosen_ids]
+        disc = _pick_discovery(rest, user_vector, n_disc)
+        picked.extend(disc)
+        chosen_ids |= {c["id"] for c in disc}
+        # surpresa: maior nota/qualidade entre o restante, independente de afinidade
+        rest = [c for c in pool if c["id"] not in chosen_ids]
+        surprise = sorted(rest, key=_damped_quality, reverse=True)[: max(0, target - len(picked))]
+        picked.extend(surprise)
+        return _cap_per_franchise(picked, target)
+
+    def _finalize_media_section(raw_pool: List[Dict[str, Any]], target: int, mtype: str) -> List[Dict[str, Any]]:
+        """Seleciona, limita franquias e reabastece de forma 100% isolada por tipo (movie vs tv)."""
+        if target <= 0 or not raw_pool:
+            return []
+        filtered_pool = _apply_quality_floor(raw_pool, target, mtype)
+        picked = select_mixed(filtered_pool, target)
+        picked.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+        picked = _cap_per_franchise(picked, target)
+        if len(picked) < target:
+            have_ids = {c.get("id") for c in picked}
+            left = [
+                c for c in raw_pool
+                if c.get("id") not in have_ids
+                and float(c.get("vote_average") or 0) >= 6.0
+                and int(c.get("vote_count") or 0) >= 30
+            ]
+            left.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+            picked = _cap_per_franchise(picked + left, target)
+        picked.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+        return picked
+
+    target_movies = top_k // 2
+    target_tv = top_k - target_movies
+
+    selected_movies = _finalize_media_section(raw_movies, target_movies, "movie")
+    selected_tv = _finalize_media_section(raw_tv, target_tv, "tv")
+
+    diverse_recommendations = selected_movies + selected_tv
     diverse_recommendations.sort(key=lambda x: x.get("match_score", 0), reverse=True)
 
     # Limpa dados internos temporários antes de retornar (O(1) por chave, eliminando embeddings vazados)
@@ -1086,7 +1242,8 @@ async def get_personalized_recommendations(
 async def get_persona_recommendations(
     db: AsyncSession,
     user_id: str,
-    top_k_per_persona: int = 15
+    top_k_per_persona: int = 15,
+    exclude_keys: Optional[Set[Tuple[str, int]]] = None
 ) -> List[Dict[str, Any]]:
     """
     V2 — Perfis Multi-Cluster:
@@ -1107,14 +1264,62 @@ async def get_persona_recommendations(
         return []
 
     persona_carousels = []
+    excluded: Set[Tuple[str, int]] = set(exclude_keys or set())
+
+    def _norm_title(c: Dict[str, Any]) -> str:
+        return str(c.get("title") or c.get("name") or "").strip().lower()
+
+    def _genre_set(genres_like) -> Set[str]:
+        out: Set[str] = set()
+        for g in genres_like or []:
+            for canon in normalize_genre_to_canonical(g):
+                out.add(canon)
+        return out
+
+    # 1) Busca candidatos de cada faceta
+    raw_by_persona: Dict[Any, List[Dict[str, Any]]] = {}
+    for p in clusters:
+        raw_by_persona[p.get("id")] = await get_personalized_recommendations(
+            db=db, user_id=user_id, top_k=top_k_per_persona * 3, persona_id=p.get("id")
+        )
+
+    # 2) Atribuicao exclusiva: cada obra vai para a faceta com melhor coerencia tematica
+    persona_genres = {p.get("id"): _genre_set(p.get("top_genres", [])) for p in clusters}
+
+    def _adjusted(c: Dict[str, Any], pid) -> float:
+        pg = persona_genres.get(pid) or set()
+        cg = _genre_set(list(c.get("genre_ids", [])) + list(c.get("genres", [])))
+        overlap = len(pg & cg) / max(1, len(pg))
+        if pg and not (pg & cg):
+            return -1.0  # incoerente com o tema da faceta
+        return float(c.get("match_score", 0.0)) * (0.6 + 0.4 * overlap) + 10.0 * overlap
+
+    best: Dict[Tuple[str, str], Tuple[float, Any, Dict[str, Any]]] = {}
+    for pid, recs_p in raw_by_persona.items():
+        for c in recs_p:
+            key = (c.get("media_type", "movie"), c.get("id"))
+            if key in excluded:
+                continue
+            sc = _adjusted(c, pid)
+            if sc < 0:
+                continue
+            tkey = (c.get("media_type", "movie"), _norm_title(c))
+            if tkey not in best or sc > best[tkey][0]:
+                best[tkey] = (sc, pid, c)
+
+    assigned: Dict[Any, List[Tuple[float, Dict[str, Any]]]] = {p.get("id"): [] for p in clusters}
+    for sc, pid, c in best.values():
+        assigned[pid].append((sc, c))
+
+    final_by_persona: Dict[Any, List[Dict[str, Any]]] = {}
+    for p in clusters:
+        pid = p.get("id")
+        ordered = [c for _, c in sorted(assigned[pid], key=lambda x: x[0], reverse=True)]
+        final_by_persona[pid] = _cap_per_franchise(ordered, top_k_per_persona, max_per=3)
+
     for p in clusters:
         p_id = p.get("id")
-        recs = await get_personalized_recommendations(
-            db=db,
-            user_id=user_id,
-            top_k=top_k_per_persona,
-            persona_id=p_id
-        )
+        recs = final_by_persona.get(p_id, [])
         persona_carousels.append({
             "id": p_id,
             "name": p.get("name"),
@@ -1166,12 +1371,22 @@ async def fetch_upcoming_candidates(user_vector: Dict[str, float], db=None, user
                                 live_genre_name_to_id[_name] = _gid
 
                 weight = 2 if list_item.is_favorite or (list_item.rating and list_item.rating >= 4.0) else 1
+                def _pid(entry):
+                    if isinstance(entry, dict):
+                        v = entry.get("person_id") or entry.get("id")
+                        return str(v) if v else None
+                    return str(entry) if entry else None
+
                 if media.crew_ids and isinstance(media.crew_ids, list):
-                    for cid in media.crew_ids[:5]:
-                        crew_counter[str(cid)] = crew_counter.get(str(cid), 0) + weight
+                    for entry in media.crew_ids[:5]:
+                        cid = _pid(entry)
+                        if cid:
+                            crew_counter[cid] = crew_counter.get(cid, 0) + weight
                 if media.cast_ids and isinstance(media.cast_ids, list):
-                    for cid in media.cast_ids[:5]:
-                        cast_counter[str(cid)] = cast_counter.get(str(cid), 0) + weight
+                    for entry in media.cast_ids[:5]:
+                        cid = _pid(entry)
+                        if cid:
+                            cast_counter[cid] = cast_counter.get(cid, 0) + weight
 
             favorite_crew_ids = [k for k, _ in sorted(crew_counter.items(), key=lambda x: x[1], reverse=True)[:5]]
             favorite_cast_ids = [k for k, _ in sorted(cast_counter.items(), key=lambda x: x[1], reverse=True)[:5]]
