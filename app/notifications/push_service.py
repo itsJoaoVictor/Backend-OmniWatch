@@ -143,6 +143,8 @@ async def send_web_push_notification(
             data=payload,
             vapid_private_key=vapid_obj,
             vapid_claims={"sub": VAPID_CLAIMS_EMAIL},
+            ttl=86400,  # 24 horas de retenção para garantir entrega mesmo com aparelho dormindo
+            headers={"Urgency": "high"},  # Acorda o Android Doze mode imediatamente
             timeout=8
         )
 
