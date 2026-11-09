@@ -133,3 +133,17 @@ async def get_my_releases(
     releases = result.scalars().all()
 
     return releases
+
+
+@router.post("/check-releases-notification")
+async def trigger_releases_notification(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Verifica e dispara as notificações de estreias e lançamentos de episódios de hoje.
+    """
+    from app.calendar.sync import promote_upcoming_media, notify_today_releases
+    await promote_upcoming_media(db)
+    await notify_today_releases(db)
+    return {"success": True, "message": "Verificação de lançamentos de hoje executada com sucesso."}

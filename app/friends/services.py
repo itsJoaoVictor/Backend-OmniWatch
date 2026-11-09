@@ -904,11 +904,13 @@ async def send_friend_recommendations(
         )
         db.add(notif)
 
+        poster_icon = f"https://image.tmdb.org/t/p/w185{media.poster_path}" if (media and media.poster_path) else None
         trigger_web_push_background(
             user_id=recipient_id,
             title=f"🎬 Indicação de {sender_display}",
             body=notif_msg,
-            url="/my-list?tab=recommendations"
+            url="/my-list?tab=recommendations",
+            icon=poster_icon
         )
 
     await db.commit()

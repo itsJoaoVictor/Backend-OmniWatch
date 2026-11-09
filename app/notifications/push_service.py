@@ -88,7 +88,9 @@ async def send_web_push_notification(
     title: str,
     body: str,
     url: str = "/my-list?tab=recommendations",
-    tag: Optional[str] = None
+    tag: Optional[str] = None,
+    icon: Optional[str] = None,
+    image: Optional[str] = None,
 ) -> tuple[int, Optional[str]]:
     """
     Envia uma notificação Web Push para todos os aparelhos registrados de um usuário.
@@ -111,16 +113,20 @@ async def send_web_push_notification(
     if not subscriptions:
         return 0, "Nenhum aparelho ativo encontrado para este usuário."
 
-    payload = json.dumps({
+    payload_dict = {
         "title": title,
         "body": body,
-        "icon": "/icon-192x192.png",
+        "icon": icon or "/icon-192x192.png",
         "badge": "/icon-192x192.png",
         "data": {
             "url": url,
         },
         "tag": tag or f"omniwatch-{uuid.uuid4().hex[:8]}"
-    })
+    }
+    if image:
+        payload_dict["image"] = image
+
+    payload = json.dumps(payload_dict)
 
     success_count = 0
     expired_endpoints = []
@@ -178,7 +184,9 @@ def trigger_web_push_background(
     title: str,
     body: str,
     url: str = "/my-list?tab=recommendations",
-    tag: Optional[str] = None
+    tag: Optional[str] = None,
+    icon: Optional[str] = None,
+    image: Optional[str] = None,
 ):
     """
     Dispara o envio de Web Push em uma task assíncrona em background com sessão própria.
@@ -192,7 +200,9 @@ def trigger_web_push_background(
                     title=title,
                     body=body,
                     url=url,
-                    tag=tag
+                    tag=tag,
+                    icon=icon,
+                    image=image
                 )
             except Exception as e:
                 logger.error(f"Falha na task de background Web Push: {e}")

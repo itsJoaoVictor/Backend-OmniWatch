@@ -169,10 +169,11 @@ async def fetch_changed_tmdb_ids(media_type: str, start_date: str, end_date: str
 async def promote_upcoming_media(db: AsyncSession):
     """
     Promove mídias com status 'upcoming' para 'plan_to_watch' quando a data de lançamento for atingida (release_date <= hoje),
-    e gera uma notificação amigável na central de notificações do usuário.
+    e gera uma notificação amigável na central de notificações do usuário e via Web Push com pôster.
     """
     from app.core.utils import is_date_released
     from app.notifications.models import Notification
+    from app.notifications.push_service import trigger_web_push_background
     from sqlalchemy.orm import selectinload
     
     stmt = (
@@ -190,19 +191,195 @@ async def promote_upcoming_media(db: AsyncSession):
             item.status = "plan_to_watch"
             promoted_count += 1
             
-            # Notifica o usuário
+            # Notifica o usuário na central in-app
             media_tipo = "O filme" if item.media.media_type == "movie" else "A série"
+            notif_title = f"Estreia: {item.media.title}!"
+            notif_msg = f"{media_tipo} '{item.media.title}' estreou hoje e agora está disponível na sua lista Quero Ver!"
             new_notif = Notification(
                 user_id=item.user_id,
                 media_id=item.media.id,
-                title=f"Estreia: {item.media.title}!",
-                message=f"{media_tipo} '{item.media.title}' estreou hoje e agora está disponível na sua lista Quero Ver!"
+                title=notif_title,
+                message=notif_msg
             )
             db.add(new_notif)
+
+            # Envia Web Push com o pôster oficial TMDB como ícone
+            poster_icon = f"https://image.tmdb.org/t/p/w185{item.media.poster_path}" if item.media.poster_path else None
+            target_url = f"/{'movie' if item.media.media_type == 'movie' else 'tv'}/{item.media.tmdb_id}"
+            trigger_web_push_background(
+                user_id=item.user_id,
+                title=f"Estreia: {item.media.title} 🎬",
+                body=notif_msg,
+                url=target_url,
+                icon=poster_icon,
+                tag=f"premiere-{item.media.id}"
+            )
             
     if promoted_count > 0:
         await db.commit()
         print(f"Promoted {promoted_count} items from 'upcoming' to 'plan_to_watch'.")
+
+
+async def notify_today_releases(db: AsyncSession):
+    """
+    Identifica lançamentos agendados para hoje (novos episódios de séries e filmes)
+    para cada usuário que acompanha os títulos na sua lista (watching ou plan_to_watch).
+
+    Regras de Anti-Spam e Concentração:
+    - Agrupamento por série: se uma série lança múltiplos episódios no mesmo dia (ex: Fool Night com 12 episódios),
+      gera UMA única notificação concentrada: 'Fool Night: 12 novos episódios (T1E1 a T1E12) já disponíveis!'.
+    - Agrupamento do usuário: se o usuário tem até 2 séries/filmes lançando hoje, despacha 1 push individual para cada
+      com o pôster oficial TMDB como ícone. Se o usuário tiver 3 ou mais títulos lançando no mesmo dia,
+      condensa em um resumo diário para não inundar a barra de notificações do celular.
+    - Idempotência: verifica notificações já registradas para o usuário no dia de hoje, garantindo que o push
+      nunca seja enviado duas vezes para o mesmo título no mesmo dia.
+    """
+    from collections import defaultdict
+    from app.core.utils import get_server_today
+    from app.notifications.models import Notification
+    from app.notifications.push_service import trigger_web_push_background
+    from sqlalchemy.orm import joinedload
+
+    today = get_server_today()
+    start_today = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=timezone.utc)
+    end_today = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=timezone.utc)
+
+    # 1. Busca todos os MediaReleases com data de hoje
+    stmt_releases = (
+        select(MediaRelease)
+        .options(joinedload(MediaRelease.media))
+        .where(MediaRelease.release_date >= start_today, MediaRelease.release_date <= end_today)
+    )
+    res_releases = await db.execute(stmt_releases)
+    today_releases = res_releases.scalars().all()
+    if not today_releases:
+        return
+
+    # Agrupa episódios/lançamentos por media_id
+    releases_by_media = defaultdict(list)
+    for r in today_releases:
+        releases_by_media[r.media_id].append(r)
+
+    tracked_media_ids = list(releases_by_media.keys())
+    if not tracked_media_ids:
+        return
+
+    # 2. Busca usuários que acompanham essas mídias (watching ou plan_to_watch)
+    stmt_user_items = (
+        select(UserListItem)
+        .options(joinedload(UserListItem.media))
+        .where(
+            UserListItem.media_id.in_(tracked_media_ids),
+            UserListItem.status.in_(["watching", "plan_to_watch"])
+        )
+    )
+    res_items = await db.execute(stmt_user_items)
+    user_items = res_items.scalars().all()
+    if not user_items:
+        return
+
+    # Agrupa mídias por usuário
+    user_media_map = defaultdict(list)
+    for item in user_items:
+        if item.media:
+            user_media_map[item.user_id].append(item.media)
+
+    # 3. Processa cada usuário com regras de anti-spam e idempotência
+    for user_id, medias in user_media_map.items():
+        # Busca mídias já notificadas hoje para esse usuário
+        stmt_notified = select(Notification.media_id).where(
+            Notification.user_id == user_id,
+            Notification.created_at >= start_today,
+            Notification.media_id.in_([m.id for m in medias])
+        )
+        res_notified = await db.execute(stmt_notified)
+        already_notified_ids = set(res_notified.scalars().all())
+
+        pending_medias = [m for m in medias if m.id not in already_notified_ids]
+        if not pending_medias:
+            continue
+
+        # Regra Anti-Spam:
+        # Até 2 títulos no dia: 1 push para cada com pôster oficial
+        # 3 ou mais títulos no dia: resumo concentrado
+        if len(pending_medias) <= 2:
+            for media in pending_medias:
+                rels = releases_by_media[media.id]
+                poster_icon = f"https://image.tmdb.org/t/p/w185{media.poster_path}" if media.poster_path else None
+                target_url = f"/{'movie' if media.media_type == 'movie' else 'tv'}/{media.tmdb_id}"
+
+                if media.media_type == "movie":
+                    title = f"Estreia de Hoje: {media.title} 🍿"
+                    msg = f"O filme '{media.title}' estreia hoje! Confira no seu calendário."
+                else:
+                    if len(rels) == 1:
+                        rel = rels[0]
+                        ep_label = rel.title or (f"T{rel.season_number}E{rel.episode_number}" if rel.season_number else "")
+                        title = f"Novo Episódio: {media.title} 🎬"
+                        msg = f"O episódio {ep_label} estreou hoje! Confira no calendário."
+                    else:
+                        s_nums = sorted(list(set(r.season_number for r in rels if r.season_number is not None)))
+                        ep_nums = [r.episode_number for r in rels if r.episode_number is not None]
+                        season_prefix = f"T{s_nums[0]}" if s_nums else ""
+                        if ep_nums:
+                            min_ep, max_ep = min(ep_nums), max(ep_nums)
+                            range_str = f"{season_prefix}E{min_ep} a {season_prefix}E{max_ep}" if min_ep != max_ep else f"{season_prefix}E{min_ep}"
+                        else:
+                            range_str = f"{len(rels)} episódios"
+
+                        title = f"Novos Episódios: {media.title} 🎬"
+                        msg = f"{len(rels)} novos episódios ({range_str}) acabaram de estrear hoje!"
+
+                # Registra na central de notificações in-app
+                db_notif = Notification(
+                    user_id=user_id,
+                    media_id=media.id,
+                    title=title,
+                    message=msg
+                )
+                db.add(db_notif)
+
+                # Dispara Web Push
+                trigger_web_push_background(
+                    user_id=user_id,
+                    title=title,
+                    body=msg,
+                    url=target_url,
+                    icon=poster_icon,
+                    tag=f"release-{media.id}-{today.strftime('%Y%m%d')}"
+                )
+        else:
+            names = [m.title for m in pending_medias]
+            if len(names) <= 3:
+                names_str = ", ".join(names[:-1]) + " e " + names[-1]
+            else:
+                names_str = f"{names[0]}, {names[1]} e mais {len(names)-2} títulos"
+
+            title = f"Lançamentos de Hoje no OmniWatch ({len(pending_medias)} títulos) 🎬"
+            msg = f"{len(pending_medias)} títulos da sua lista têm novidades hoje: {names_str}. Confira no calendário!"
+            first_poster = f"https://image.tmdb.org/t/p/w185{pending_medias[0].poster_path}" if pending_medias[0].poster_path else None
+
+            # Registra no banco para cada mídia (para constar nas notificações in-app)
+            for m in pending_medias:
+                db.add(Notification(
+                    user_id=user_id,
+                    media_id=m.id,
+                    title=f"Lançamento: {m.title}",
+                    message="Novos episódios já disponíveis no calendário.",
+                    is_read=False
+                ))
+
+            # Dispara APENAS UM Web Push concentrado para o usuário
+            trigger_web_push_background(
+                user_id=user_id,
+                title=title,
+                body=msg,
+                url="/calendar",
+                icon=first_poster,
+                tag=f"releases-daily-{user_id}-{today.strftime('%Y%m%d')}"
+            )
+
+    await db.commit()
 
 async def migrate_existing_future_media():
     """
@@ -317,6 +494,9 @@ async def run_calendar_sync_loop(interval_hours: int = 24, initial_delay_seconds
 
                 # 5. Promove itens 'upcoming' que estrearam e notifica os usuários
                 await promote_upcoming_media(db)
+
+                # 6. Notifica lançamentos de hoje (episódios de séries e filmes) com anti-spam
+                await notify_today_releases(db)
                     
             print("Calendar sync complete.")
         except Exception as e:
