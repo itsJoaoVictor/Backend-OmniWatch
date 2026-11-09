@@ -9,6 +9,7 @@ from fastapi import HTTPException, status
 from app.users.models import User
 from app.friends.models import Friendship, FriendRecommendation
 from app.notifications.models import Notification
+from app.notifications.push_service import trigger_web_push_background
 from app.media.models import Media
 from app.tracking.models import UserListItem, UserEpisodeProgress
 from app.friends.schemas import (
@@ -902,6 +903,13 @@ async def send_friend_recommendations(
             media_id=media.id if media else None
         )
         db.add(notif)
+
+        trigger_web_push_background(
+            user_id=recipient_id,
+            title=f"🎬 Indicação de {sender_display}",
+            body=notif_msg,
+            url="/my-list?tab=recommendations"
+        )
 
     await db.commit()
 
