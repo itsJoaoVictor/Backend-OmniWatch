@@ -72,3 +72,46 @@ class FriendFeedResponse(BaseModel):
     limit: int
     has_more: bool
     next_cursor: Optional[str] = None
+
+class FriendEligibilityItem(BaseModel):
+    id: uuid.UUID
+    name: str
+    username: Optional[str] = None
+    email: Optional[str] = None
+    is_eligible: bool
+    ineligible_reason: Optional[str] = None  # "ALREADY_WATCHED", "ALREADY_IN_LIST", "PENDING_RECOMMENDATION"
+
+    model_config = {"from_attributes": True}
+
+class SendRecommendationRequest(BaseModel):
+    recipient_ids: List[uuid.UUID]
+    tmdb_id: int
+    media_type: str
+    media_title: str
+    media_poster_path: Optional[str] = None
+    media_release_date: Optional[str] = None
+    media_vote_average: Optional[float] = None
+    message: Optional[str] = None
+
+class FriendRecommendationResponse(BaseModel):
+    id: uuid.UUID
+    sender: UserSummary
+    recipient: UserSummary
+    media_type: str
+    tmdb_id: int
+    media_title: str
+    media_poster_path: Optional[str] = None
+    media_release_date: Optional[str] = None
+    media_vote_average: Optional[float] = None
+    message: Optional[str] = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    in_user_list: bool = False
+    user_list_status: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+class UpdateRecommendationStatusRequest(BaseModel):
+    status: str
+

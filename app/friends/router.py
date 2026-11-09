@@ -13,7 +13,11 @@ from app.friends.schemas import (
     FriendUserResponse,
     FriendRequestsResponse,
     SendFriendRequest,
-    FriendFeedResponse
+    FriendFeedResponse,
+    FriendEligibilityItem,
+    SendRecommendationRequest,
+    FriendRecommendationResponse,
+    UpdateRecommendationStatusRequest
 )
 from app.friends.services import (
     search_users,
@@ -24,7 +28,11 @@ from app.friends.services import (
     reject_friend_request,
     cancel_friend_request,
     remove_friend,
-    get_friend_feed
+    get_friend_feed,
+    get_recommendation_eligibility,
+    send_friend_recommendations,
+    get_received_recommendations,
+    update_recommendation_status
 )
 
 router = APIRouter(prefix="/friends", tags=["friends"])
@@ -154,3 +162,48 @@ async def delete_friend(
 ):
     u_uuid = parse_uuid(current_user_id)
     return await remove_friend(db, friendship_id, u_uuid)
+
+
+@router.get("/recommendations/eligibility", response_model=List[FriendEligibilityItem])
+async def check_recommendation_eligibility(
+    tmdb_id: int = Query(...),
+    media_type: str = Query(...),
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    u_uuid = parse_uuid(current_user_id)
+    return await get_recommendation_eligibility(db, u_uuid, tmdb_id, media_type)
+
+
+@router.post("/recommendations", response_model=List[FriendRecommendationResponse], status_code=status.HTTP_201_CREATED)
+async def create_recommendation(
+    payload: SendRecommendationRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    u_uuid = parse_uuid(current_user_id)
+    return await send_friend_recommendations(db, u_uuid, payload)
+
+
+@router.get("/recommendations/received", response_model=List[FriendRecommendationResponse])
+async def list_received_recommendations(
+    status: str = Query("pending", pattern="^(pending|history)$"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    u_uuid = parse_uuid(current_user_id)
+    return await get_received_recommendations(db, u_uuid, status_filter=status, limit=limit, offset=offset)
+
+
+@router.patch("/recommendations/{recommendation_id}/status", response_model=FriendRecommendationResponse)
+async def update_status(
+    recommendation_id: uuid.UUID,
+    payload: UpdateRecommendationStatusRequest,
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    u_uuid = parse_uuid(current_user_id)
+    return await update_recommendation_status(db, u_uuid, recommendation_id, payload.status)
+

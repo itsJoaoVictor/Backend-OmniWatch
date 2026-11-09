@@ -30,6 +30,7 @@ from app.tracking import models as tracking_models
 from app.notifications import models as notifications_models
 from app.media_collections import models as media_collections_models
 from app.recommendation import models as recommendation_models
+from app.friends import models as friends_models
 
 target_metadata = Base.metadata
 config.set_main_option("sqlalchemy.url", DATABASE_URL)

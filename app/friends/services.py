@@ -7,7 +7,7 @@ from sqlalchemy import or_, and_, func
 from fastapi import HTTPException, status
 
 from app.users.models import User
-from app.friends.models import Friendship
+from app.friends.models import Friendship, FriendRecommendation
 from app.notifications.models import Notification
 from app.media.models import Media
 from app.tracking.models import UserListItem, UserEpisodeProgress
@@ -18,7 +18,10 @@ from app.friends.schemas import (
     FriendRequestsResponse,
     UserSummary,
     FriendFeedItem,
-    FriendFeedResponse
+    FriendFeedResponse,
+    FriendEligibilityItem,
+    SendRecommendationRequest,
+    FriendRecommendationResponse
 )
 
 async def search_users(
@@ -743,3 +746,338 @@ async def get_friend_feed(
         has_more=has_more,
         next_cursor=next_cursor
     )
+
+
+async def get_recommendation_eligibility(
+    db: AsyncSession,
+    current_user_id: uuid.UUID,
+    tmdb_id: int,
+    media_type: str
+) -> List[FriendEligibilityItem]:
+    # 1. Obter amigos aceitos
+    friends = await get_friends_list(db, current_user_id)
+    if not friends:
+        return []
+
+    friend_ids = [f.id for f in friends]
+
+    # 2. Verificar se a mídia existe no banco local
+    media_res = await db.execute(
+        select(Media).where(Media.tmdb_id == tmdb_id, Media.media_type == media_type)
+    )
+    media = media_res.scalar_one_or_none()
+
+    # 3. Mapear status de lista dos amigos
+    list_status_by_user = {}
+    if media:
+        list_res = await db.execute(
+            select(UserListItem).where(
+                UserListItem.user_id.in_(friend_ids),
+                UserListItem.media_id == media.id
+            )
+        )
+        for item in list_res.scalars().all():
+            list_status_by_user[item.user_id] = item.status
+
+    # 4. Verificar se já existe recomendação pendente enviada por este usuário
+    pending_recs_res = await db.execute(
+        select(FriendRecommendation.recipient_id).where(
+            FriendRecommendation.sender_id == current_user_id,
+            FriendRecommendation.recipient_id.in_(friend_ids),
+            FriendRecommendation.tmdb_id == tmdb_id,
+            FriendRecommendation.media_type == media_type,
+            FriendRecommendation.status == "pending"
+        )
+    )
+    pending_recipient_ids = set(pending_recs_res.scalars().all())
+
+    # 5. Montar lista de elegibilidade
+    results: List[FriendEligibilityItem] = []
+    for f in friends:
+        ineligible_reason = None
+        if f.id in pending_recipient_ids:
+            ineligible_reason = "PENDING_RECOMMENDATION"
+        elif f.id in list_status_by_user:
+            st = list_status_by_user[f.id]
+            if st in ("completed", "watched"):
+                ineligible_reason = "ALREADY_WATCHED"
+            else:
+                ineligible_reason = "ALREADY_IN_LIST"
+
+        results.append(
+            FriendEligibilityItem(
+                id=f.id,
+                name=f.name,
+                username=f.username,
+                email=f.email,
+                is_eligible=(ineligible_reason is None),
+                ineligible_reason=ineligible_reason
+            )
+        )
+
+    return results
+
+
+async def send_friend_recommendations(
+    db: AsyncSession,
+    current_user_id: uuid.UUID,
+    payload: SendRecommendationRequest
+) -> List[FriendRecommendationResponse]:
+    if not payload.recipient_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selecione ao menos um amigo para enviar a indicação."
+        )
+
+    curr_res = await db.execute(select(User).where(User.id == current_user_id))
+    current_user = curr_res.scalar_one_or_none()
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuário não encontrado.")
+
+    eligibility_list = await get_recommendation_eligibility(
+        db, current_user_id, payload.tmdb_id, payload.media_type
+    )
+    eligibility_map = {item.id: item for item in eligibility_list}
+
+    recipients_res = await db.execute(
+        select(User).where(User.id.in_(payload.recipient_ids))
+    )
+    recipients_dict = {u.id: u for u in recipients_res.scalars().all()}
+
+    media_res = await db.execute(
+        select(Media).where(Media.tmdb_id == payload.tmdb_id, Media.media_type == payload.media_type)
+    )
+    media = media_res.scalar_one_or_none()
+
+    clean_message = payload.message.strip() if payload.message else None
+    if clean_message and len(clean_message) > 280:
+        clean_message = clean_message[:280]
+
+    sender_display = f"@{current_user.username}" if current_user.username else current_user.name
+    created_recs = []
+
+    for recipient_id in payload.recipient_ids:
+        eligibility = eligibility_map.get(recipient_id)
+        if not eligibility:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"O usuário {recipient_id} não é seu amigo."
+            )
+        if not eligibility.is_eligible:
+            reason_map = {
+                "ALREADY_WATCHED": "já assistiu",
+                "ALREADY_IN_LIST": "já tem na lista",
+                "PENDING_RECOMMENDATION": "já possui uma indicação pendente"
+            }
+            msg = reason_map.get(eligibility.ineligible_reason, "não está elegível")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{eligibility.name} {msg} para este título."
+            )
+
+        rec = FriendRecommendation(
+            sender_id=current_user_id,
+            recipient_id=recipient_id,
+            media_type=payload.media_type,
+            tmdb_id=payload.tmdb_id,
+            media_title=payload.media_title,
+            media_poster_path=payload.media_poster_path,
+            media_release_date=payload.media_release_date,
+            media_vote_average=payload.media_vote_average,
+            message=clean_message,
+            status="pending"
+        )
+        db.add(rec)
+        created_recs.append((rec, recipient_id))
+
+        notif_msg = f"{sender_display} indicou '{payload.media_title}' para você."
+        if clean_message:
+            snippet = clean_message if len(clean_message) <= 60 else f"{clean_message[:57]}..."
+            notif_msg += f' "{snippet}"'
+
+        notif = Notification(
+            user_id=recipient_id,
+            title="Indicação de Amigo",
+            message=notif_msg,
+            media_id=media.id if media else None
+        )
+        db.add(notif)
+
+    await db.commit()
+
+    response_items = []
+    sender_summary = UserSummary(
+        id=current_user.id,
+        name=current_user.name,
+        username=current_user.username,
+        email=current_user.email
+    )
+    for rec, recipient_id in created_recs:
+        await db.refresh(rec)
+        rec_u = recipients_dict.get(recipient_id)
+        rec_summary = UserSummary(
+            id=rec_u.id,
+            name=rec_u.name,
+            username=rec_u.username,
+            email=rec_u.email
+        ) if rec_u else UserSummary(id=recipient_id, name="Amigo")
+
+        response_items.append(
+            FriendRecommendationResponse(
+                id=rec.id,
+                sender=sender_summary,
+                recipient=rec_summary,
+                media_type=rec.media_type,
+                tmdb_id=rec.tmdb_id,
+                media_title=rec.media_title,
+                media_poster_path=rec.media_poster_path,
+                media_release_date=rec.media_release_date,
+                media_vote_average=rec.media_vote_average,
+                message=rec.message,
+                status=rec.status,
+                created_at=rec.created_at,
+                updated_at=rec.updated_at,
+                in_user_list=False,
+                user_list_status=None
+            )
+        )
+
+    return response_items
+
+
+async def get_received_recommendations(
+    db: AsyncSession,
+    current_user_id: uuid.UUID,
+    status_filter: str = "pending",
+    limit: int = 50,
+    offset: int = 0
+) -> List[FriendRecommendationResponse]:
+    stmt = (
+        select(FriendRecommendation)
+        .where(FriendRecommendation.recipient_id == current_user_id)
+        .order_by(FriendRecommendation.created_at.desc())
+    )
+    if status_filter == "pending":
+        stmt = stmt.where(FriendRecommendation.status == "pending")
+    elif status_filter == "history":
+        stmt = stmt.where(FriendRecommendation.status.in_(["accepted", "dismissed"]))
+
+    stmt = stmt.limit(limit).offset(offset)
+    res = await db.execute(stmt)
+    recs = res.scalars().all()
+
+    if not recs:
+        return []
+
+    sender_ids = list({r.sender_id for r in recs})
+    users_res = await db.execute(select(User).where(User.id.in_(sender_ids + [current_user_id])))
+    users_dict = {u.id: u for u in users_res.scalars().all()}
+
+    tmdb_keys = {(r.tmdb_id, r.media_type) for r in recs}
+    media_filters = [and_(Media.tmdb_id == tid, Media.media_type == mtype) for tid, mtype in tmdb_keys]
+    media_res = await db.execute(select(Media).where(or_(*media_filters)))
+    medias = media_res.scalars().all()
+    media_by_key = {(m.tmdb_id, m.media_type): m for m in medias}
+
+    media_ids = [m.id for m in medias]
+    user_list_map = {}
+    if media_ids:
+        list_res = await db.execute(
+            select(UserListItem).where(
+                UserListItem.user_id == current_user_id,
+                UserListItem.media_id.in_(media_ids)
+            )
+        )
+        for it in list_res.scalars().all():
+            user_list_map[it.media_id] = it.status
+
+    current_user = users_dict.get(current_user_id)
+    recipient_summary = UserSummary(
+        id=current_user.id,
+        name=current_user.name,
+        username=current_user.username,
+        email=current_user.email
+    ) if current_user else UserSummary(id=current_user_id, name="Você")
+
+    results: List[FriendRecommendationResponse] = []
+    for r in recs:
+        snd = users_dict.get(r.sender_id)
+        sender_summary = UserSummary(
+            id=snd.id,
+            name=snd.name,
+            username=snd.username,
+            email=snd.email
+        ) if snd else UserSummary(id=r.sender_id, name="Amigo")
+
+        m = media_by_key.get((r.tmdb_id, r.media_type))
+        user_list_status = user_list_map.get(m.id) if m else None
+
+        results.append(
+            FriendRecommendationResponse(
+                id=r.id,
+                sender=sender_summary,
+                recipient=recipient_summary,
+                media_type=r.media_type,
+                tmdb_id=r.tmdb_id,
+                media_title=r.media_title,
+                media_poster_path=r.media_poster_path,
+                media_release_date=r.media_release_date,
+                media_vote_average=r.media_vote_average,
+                message=r.message,
+                status=r.status,
+                created_at=r.created_at,
+                updated_at=r.updated_at,
+                in_user_list=user_list_status is not None,
+                user_list_status=user_list_status
+            )
+        )
+
+    return results
+
+
+async def update_recommendation_status(
+    db: AsyncSession,
+    current_user_id: uuid.UUID,
+    recommendation_id: uuid.UUID,
+    new_status: str
+) -> FriendRecommendationResponse:
+    if new_status not in ("accepted", "dismissed"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Status inválido.")
+
+    stmt = select(FriendRecommendation).where(
+        FriendRecommendation.id == recommendation_id,
+        FriendRecommendation.recipient_id == current_user_id
+    )
+    res = await db.execute(stmt)
+    rec = res.scalar_one_or_none()
+    if not rec:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicação não encontrada.")
+
+    rec.status = new_status
+    await db.commit()
+    await db.refresh(rec)
+
+    users_res = await db.execute(select(User).where(User.id.in_([rec.sender_id, rec.recipient_id])))
+    users_dict = {u.id: u for u in users_res.scalars().all()}
+
+    snd = users_dict.get(rec.sender_id)
+    rcp = users_dict.get(rec.recipient_id)
+
+    return FriendRecommendationResponse(
+        id=rec.id,
+        sender=UserSummary(id=snd.id, name=snd.name, username=snd.username, email=snd.email) if snd else UserSummary(id=rec.sender_id, name="Amigo"),
+        recipient=UserSummary(id=rcp.id, name=rcp.name, username=rcp.username, email=rcp.email) if rcp else UserSummary(id=rec.recipient_id, name="Você"),
+        media_type=rec.media_type,
+        tmdb_id=rec.tmdb_id,
+        media_title=rec.media_title,
+        media_poster_path=rec.media_poster_path,
+        media_release_date=rec.media_release_date,
+        media_vote_average=rec.media_vote_average,
+        message=rec.message,
+        status=rec.status,
+        created_at=rec.created_at,
+        updated_at=rec.updated_at,
+        in_user_list=False,
+        user_list_status=None
+    )
+
