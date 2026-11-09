@@ -439,22 +439,26 @@ async def compute_and_save_user_recommendations(
                 logger.error(f"[RECS-SERVICE] Erro ao gerar explore_recommendations para {user_id_str}: {e}")
                 explore_data = record.explore_items if record else []
 
+            _explore_keys = {(it.get("media_type", "movie"), it.get("id")) for it in (explore_data or []) if isinstance(it, dict)}
+
             try:
                 from app.recommendation.orchestrator import get_recent_vibe_recommendations
-                recent_vibe_data = await get_recent_vibe_recommendations(session, user_id_str, top_k=20)
+                recent_vibe_data = await get_recent_vibe_recommendations(session, user_id_str, top_k=25, exclude_keys=_explore_keys)
             except Exception as e:
                 logger.error(f"[RECS-SERVICE] Erro ao gerar recent_vibe_recommendations para {user_id_str}: {e}")
                 recent_vibe_data = getattr(record, "recent_vibe_items", []) if record else []
 
+            _vibe_keys = {(it.get("media_type", "movie"), it.get("id")) for it in (recent_vibe_data or []) if isinstance(it, dict)}
+            _cascade_excluded_keys = _explore_keys | _vibe_keys
+
             try:
-                upcoming_data = await get_upcoming_recommendations(session, user_id_str, top_k_per_type=20)
+                upcoming_data = await get_upcoming_recommendations(session, user_id_str, top_k_per_type=25)
             except Exception as e:
                 logger.error(f"[RECS-SERVICE] Erro ao gerar upcoming_recommendations para {user_id_str}: {e}")
                 upcoming_data = record.upcoming_items if record else {}
 
             try:
-                _explore_keys = {(it.get("media_type", "movie"), it.get("id")) for it in (explore_data or []) if isinstance(it, dict)}
-                personas_data = await get_persona_recommendations(session, user_id_str, top_k_per_persona=15, exclude_keys=_explore_keys)
+                personas_data = await get_persona_recommendations(session, user_id_str, top_k_per_persona=25, exclude_keys=_cascade_excluded_keys)
             except Exception as e:
                 logger.error(f"[RECS-SERVICE] Erro ao gerar persona_recommendations para {user_id_str}: {e}")
                 personas_data = record.personas_items if record else []
@@ -470,8 +474,13 @@ async def compute_and_save_user_recommendations(
 
             # Limita tamanho do dicionário de impressões para não inflar o JSONB indefinidamente
             if len(new_impressions) > 250:
-                sorted_imps = sorted(new_impressions.items(), key=lambda x: x[1], reverse=True)
+                sorted_imps = sorted(
+                    ((k, v) for k, v in new_impressions.items() if k != "_algo_version"),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
                 new_impressions = dict(sorted_imps[:200])
+            new_impressions["_algo_version"] = 5
 
             # Verifica elegibilidade real de Vibe Recente (completed/watching <= 30 dias)
             from app.recommendation.profile_manager import user_has_recent_vibe_activity
@@ -616,12 +625,17 @@ async def run_recommendations_daily_sync_loop(interval_hours: int = 24):
                     recs_res = await session.execute(select(UserRecommendation))
                     recs_by_uid = {str(r.user_id): r for r in recs_res.scalars().all()}
 
-                    from app.recommendation.profile_manager import user_has_recent_vibe_activity
+                    from app.recommendation.profile_manager import user_has_recent_vibe_activity, rebuild_user_profile
                     user_ids = []
+                    needs_profile_rebuild = set()
                     for uid in candidate_uids:
                         rec = recs_by_uid.get(uid)
                         if rec is None or rec.is_stale or not rec.explore_items:
                             user_ids.append(uid)
+                            continue
+                        if (rec.impressions or {}).get("_algo_version") != 5:
+                            user_ids.append(uid)
+                            needs_profile_rebuild.add(uid)
                             continue
                         if not getattr(rec, "recent_vibe_items", None):
                             if await user_has_recent_vibe_activity(session, uid, max_age_days=30.0):
@@ -640,6 +654,7 @@ async def run_recommendations_daily_sync_loop(interval_hours: int = 24):
                 else:
                     result = await session.execute(select(User.id))
                     user_ids = [str(uid) for uid in result.scalars().all()]
+                    needs_profile_rebuild = set()
 
             if user_ids:
                 logger.info(
@@ -647,6 +662,9 @@ async def run_recommendations_daily_sync_loop(interval_hours: int = 24):
                 )
                 for uid in user_ids:
                     try:
+                        if uid in needs_profile_rebuild:
+                            async with AsyncSessionLocal() as prof_session:
+                                await rebuild_user_profile(prof_session, _parse_uuid(uid))
                         await compute_and_save_user_recommendations(uid, force=True)
                         await asyncio.sleep(4)
                     except Exception as err:

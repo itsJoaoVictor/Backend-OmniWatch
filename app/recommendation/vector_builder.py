@@ -7,6 +7,7 @@ NOISE_KEYWORDS = {
     "sequel", "aftercreditsstinger", "duringcreditsstinger", "prequel", "remake", "reboot",
     "based on comic", "based on novel or book", "woman director", "3d", "imax", "spin off",
     "post-credits scene", "mid-credits scene", "duringcreditsstinger ", "based on true story",
+    "3d animation", "cgi", "live action",
 }
 
 WEIGHTS = {

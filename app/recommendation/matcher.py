@@ -49,6 +49,8 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
             genre_ratios.append(ratio)
         genre_ratios.sort(reverse=True)
         # Soft Top-r Genre Matching (Ideia 4): 0.50 para 1º, 0.30 para 2º, 0.20 para 3º
+        # Usa piso suave (0.75) no denominador para evitar que obras catalogadas com apenas 1 gênero
+        # ganhem 100% dos 40 pts automaticamente em detrimento de obras multi-gênero.
         pos_weights = [0.50, 0.30, 0.20]
         weighted_genre_ratio = 0.0
         weight_sum = 0.0
@@ -57,7 +59,8 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
             weighted_genre_ratio += r * w
             weight_sum += w
         if weight_sum > 0:
-            genre_ratio = max(0.0, min(1.0, weighted_genre_ratio / weight_sum))
+            effective_weight_sum = max(weight_sum, 0.75)
+            genre_ratio = max(0.0, min(1.0, weighted_genre_ratio / effective_weight_sum))
             total_score += genre_ratio * 40.0
     else:
         total_score += 0.35 * 40.0  # Shrinkage prior (14.0 pts)
@@ -98,22 +101,29 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
             sat = 1.0 - math.exp(-1.2 * matched_sum)
             total_score += sat * 25.0
         else:
-            total_score += 0.35 * 25.0  # Bayesian prior (8.75 pts)
+            total_score += 0.18 * 25.0  # Bayesian prior calibrado para zero matches (4.5 pts)
     else:
-        total_score += 0.35 * 25.0  # Bayesian prior (8.75 pts)
+        total_score += 0.18 * 25.0  # Bayesian prior calibrado (4.5 pts)
 
     # 4. Componente de Palavras-chave e Temas (peso 20.0)
-    media_kw = {k: v for k, v in media_vector.items() if k.startswith("keyword_")}
+    from app.recommendation.vector_builder import NOISE_KEYWORDS
+    media_kw = {
+        k: v for k, v in media_vector.items()
+        if k.startswith("keyword_") and k.replace("keyword_", "").lower().strip() not in NOISE_KEYWORDS
+    }
     if media_kw:
-        user_kw = {k: v for k, v in user_vector.items() if k.startswith("keyword_")}
+        user_kw = {
+            k: v for k, v in user_vector.items()
+            if k.startswith("keyword_") and k.replace("keyword_", "").lower().strip() not in NOISE_KEYWORDS
+        }
         max_u_kw = max(abs(v) for v in user_kw.values()) if user_kw else 1.0
         if max_u_kw == 0:
             max_u_kw = 1.0
 
         matched_kw_ratios = [
-            max(0.0, min(1.0, user_vector[k] / max_u_kw))
+            max(0.0, min(1.0, user_kw[k] / max_u_kw))
             for k in media_kw
-            if k in user_vector and user_vector[k] > 0
+            if k in user_kw and user_kw[k] > 0
         ]
         matched_kw_sum = sum(matched_kw_ratios)
         if matched_kw_sum > 0:
@@ -121,9 +131,9 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
             sat_kw = 1.0 - math.exp(-1.2 * matched_kw_sum)
             total_score += sat_kw * 20.0
         else:
-            total_score += 0.35 * 20.0  # Bayesian prior (7.0 pts)
+            total_score += 0.18 * 20.0  # Bayesian prior calibrado para zero matches (3.6 pts)
     else:
-        total_score += 0.35 * 20.0  # Bayesian prior (7.0 pts)
+        total_score += 0.18 * 20.0  # Bayesian prior calibrado (3.6 pts)
 
     # 5. Componente de Idioma Original (peso 10.0)
     media_langs = {k: v for k, v in media_vector.items() if k.startswith("lang_")}
@@ -153,6 +163,8 @@ def calculate_match_score(user_vector: Dict[str, float], media_vector: Dict[str,
     # Identificar principais contribuintes para explicabilidade
     contributors = []
     for k in set(user_vector) & set(media_vector):
+        if k.startswith("keyword_") and k.replace("keyword_", "").lower().strip() in NOISE_KEYWORDS:
+            continue
         contribution = user_vector[k] * media_vector[k]
         if contribution > 0:
             contributors.append((k, contribution))
@@ -265,8 +277,8 @@ def compute_omnimatch_score(
         lse_inner = sum((item[1] / sum_pi) * math.exp(tau * (item[0] - M)) for item in phi_items)
         lse_score = M + (1.0 / tau) * math.log(max(1e-9, lse_inner))
 
-        # Preserva a força do pico da persona principal
-        phi = max(lse_score, best_p_phi * 0.95)
+        # Preserva 100% da força do pico da persona principal (unificando a escala entre Explore e Personas)
+        phi = max(lse_score, best_p_phi)
         tags = best_tags
     else:
         aff_score, tags = calculate_match_score(user_vector, candidate_vector)
@@ -541,6 +553,15 @@ def build_rich_explanation_tags(
 
     # 1. Conexão com obra que o usuário assistiu e amou (Item-to-Item Similarity)
     if user_items and cand_emb:
+        from app.recommendation.vector_builder import normalize_genre_to_canonical
+        cand_genres_canon = set()
+        if candidate_vector:
+            cand_genres_canon = {k.replace("genre_", "") for k in candidate_vector if k.startswith("genre_")}
+        if not cand_genres_canon:
+            for g in list(candidate.get("genre_ids", [])) + list(candidate.get("genres", [])):
+                for c_g in normalize_genre_to_canonical(g):
+                    cand_genres_canon.add(c_g)
+
         best_sim = -1.0
         best_item_title = None
         best_rating = None
@@ -552,6 +573,7 @@ def build_rich_explanation_tags(
             if isinstance(item, dict):
                 m_title = item.get("title")
                 m_emb = item.get("embedding")
+                m_obj = item.get("media_obj")
                 rating = item.get("rating") or 0.0
                 status = item.get("status") or ""
                 is_fav = item.get("is_favorite", False)
@@ -564,6 +586,7 @@ def build_rich_explanation_tags(
                         continue
                     m_title = media.title
                     m_emb = media.embedding
+                    m_obj = media
                     rating = getattr(item, "rating", None) or 0.0
                     status = getattr(item, "status", "")
                     is_fav = getattr(item, "is_favorite", False)
@@ -581,11 +604,26 @@ def build_rich_explanation_tags(
                 continue
 
             sim = calculate_cosine_similarity(cand_emb, m_emb)
-            fav_mult = 1.25 if is_fav else 1.0
+            if sim < 0.60:
+                continue
+
+            # Verifica coerência temática de gênero entre a âncora e o candidato
+            if m_obj is not None and cand_genres_canon:
+                item_genres_canon = set()
+                for g in getattr(m_obj, "genres", []) or []:
+                    for c_g in normalize_genre_to_canonical(g):
+                        item_genres_canon.add(c_g)
+                if item_genres_canon:
+                    if not (cand_genres_canon & item_genres_canon) and sim < 0.72:
+                        continue
+                    if ("animação" in item_genres_canon) != ("animação" in cand_genres_canon) and sim < 0.72:
+                        continue
+
+            fav_mult = 1.12 if is_fav else 1.0
             rewatch_mult = (
-                (1.25 + min(0.10 * (rewatch_cnt - 1), 0.25))
+                (1.15 + min(0.08 * (rewatch_cnt - 1), 0.15))
                 if rewatch_cnt > 0
-                else (1.12 if ep_rewatches > 0 else 1.0)
+                else (1.08 if ep_rewatches > 0 else 1.0)
             )
             sim_effective = sim * fav_mult * rewatch_mult
             if sim_effective > best_sim:

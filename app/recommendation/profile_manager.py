@@ -349,10 +349,12 @@ def compute_recent_vibe_profile(
     list_items: List[UserListItem],
     half_life_days: float = 14.0,
     max_age_days: float = 30.0,
+    max_items: int = 15,
 ) -> Tuple[Dict[str, float], Optional[List[float]], List[Tuple[str, int]]]:
     """
     Calcula o perfil Rocchio de memória curta restrito ESTRITAMENTE a obras
-    com status 'completed' ou 'watching' nos últimos `max_age_days` (30 dias).
+    com status 'completed' ou 'watching' nos últimos `max_age_days` (30 dias),
+    limitando às `max_items` (15) obras mais recentes para evitar diluição por import em lote.
     Passando de 30 dias, a obra não entra na vibe recente (sem fallback antigo).
     Retorna (vibe_feature_vector, vibe_embedding, recent_seed_keys).
     """
@@ -374,6 +376,8 @@ def compute_recent_vibe_profile(
         age_days = (now - dt).total_seconds() / 86400.0
         if age_days <= max_age_days:
             recent_candidates.append(it)
+            if max_items and len(recent_candidates) >= max_items:
+                break
 
     if not recent_candidates:
         return {}, None, []

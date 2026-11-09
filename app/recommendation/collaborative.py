@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import logging
 import time
@@ -45,6 +46,20 @@ def invalidate_als_cache():
     _LAST_ALS_FIT_TIME = 0.0
 
 
+def get_collaborative_rrf_weight() -> float:
+    """
+    Peso adaptativo do canal colaborativo no RRF conforme a maturidade da base de usuários.
+    Em bases pequenas (< 10 usuários ativos), usa peso moderado (0.50) para não sobrepor o conteúdo;
+    escala suavemente até 1.20 conforme a base atinge 30+ usuários ativos.
+    """
+    n_users = len(_USER_MAP)
+    if n_users < 10:
+        return 0.50
+    if n_users >= 30:
+        return 1.20
+    return round(0.50 + 0.70 * ((n_users - 10) / 20.0), 2)
+
+
 async def _get_or_train_als_model(db: AsyncSession) -> Tuple[
     Optional[implicit.als.AlternatingLeastSquares],
     Optional[sp.csr_matrix],
@@ -88,8 +103,23 @@ async def _get_or_train_als_model(db: AsyncSession) -> Tuple[
         if not rows:
             return None, None, {}, {}
 
-        user_ids = sorted(list(set(r[0] for r in rows if r[0])))
-        item_keys = sorted(list(set((r[1] or "movie", r[2]) for r in rows if r[2])))
+        # Filtra apenas sinais reais de consumo positivo (exclui plan_to_watch/upcoming sem nota e obras rejeitadas < 3.0★)
+        positive_rows = []
+        for r in rows:
+            uid, mtype, tmdb_id, rating, status, is_fav, rewatch_cnt = r
+            if not uid or not tmdb_id:
+                continue
+            if rating is not None and float(rating) < 3.0 and not is_fav:
+                continue
+            if rating is None and status not in ("completed", "watching") and not is_fav and not (rewatch_cnt and rewatch_cnt > 0):
+                continue
+            positive_rows.append(r)
+
+        if not positive_rows:
+            return None, None, {}, {}
+
+        user_ids = sorted(list(set(r[0] for r in positive_rows if r[0])))
+        item_keys = sorted(list(set((r[1] or "movie", r[2]) for r in positive_rows if r[2])))
 
         if not user_ids or not item_keys:
             return None, None, {}, {}
@@ -104,16 +134,14 @@ async def _get_or_train_als_model(db: AsyncSession) -> Tuple[
         data = []
 
         alpha_weight = 40.0
-        for uid, mtype, tmdb_id, rating, status, is_fav, rewatch_cnt in rows:
-            if not uid or not tmdb_id:
-                continue
+        for uid, mtype, tmdb_id, rating, status, is_fav, rewatch_cnt in positive_rows:
             u_i = user_map[uid]
             i_j = item_map[(mtype or "movie", tmdb_id)]
 
             # Cálculo de afinidade r_{ui} e confiança c_{ui} = 1 + alpha * r_{ui}
-            r_ui = 0.5  # Base de interação neutra
+            r_ui = 0.5  # Base de interação positiva
             if rating:
-                r_ui = max(0.1, float(rating) / 2.5)
+                r_ui = max(0.2, float(rating) / 2.5)
             elif status == "completed":
                 r_ui = 1.2
             elif status == "watching":

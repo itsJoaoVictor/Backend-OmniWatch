@@ -67,7 +67,7 @@ class TelemetryBatchRequest(BaseModel):
 class RefreshExploreBatchRequest(BaseModel):
     media_type: str = "movie"
     exclude_ids: List[int] = []
-    limit: int = 24
+    limit: int = 25
 
 _seen_ids_locks: Dict[str, asyncio.Lock] = {}
 _incomplete_heal_timestamps: Dict[str, float] = {}
@@ -180,7 +180,7 @@ async def get_recent_vibe_endpoint(
     request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
-    limit: int = Query(20, ge=1, le=50),
+    limit: int = Query(25, ge=1, le=50),
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
@@ -228,7 +228,7 @@ async def get_user_personas(
     request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
-    top_k: int = Query(15, ge=1, le=30),
+    top_k: int = Query(25, ge=1, le=50),
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
@@ -279,7 +279,7 @@ async def get_upcoming_recommendations_endpoint(
     request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
-    limit: int = Query(20, ge=1, le=50),
+    limit: int = Query(25, ge=1, le=50),
     current_user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
