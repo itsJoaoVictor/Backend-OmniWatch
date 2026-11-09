@@ -106,12 +106,17 @@ async def send_web_push_notification(
         logger.error("Vapid instance não pôde ser inicializada. Web push cancelado.")
         return 0, "Chave VAPID privada inválida ou com formato não suportado."
 
+    u_uuid = uuid.UUID(str(user_id)) if not isinstance(user_id, uuid.UUID) else user_id
+
     res = await db.execute(
-        select(PushSubscription).where(PushSubscription.user_id == user_id)
+        select(PushSubscription).where(PushSubscription.user_id == u_uuid)
     )
     subscriptions = res.scalars().all()
     if not subscriptions:
+        logger.warning(f"[WebPush] Abortado: user_id={u_uuid} não possui nenhum aparelho registrado em push_subscriptions.")
         return 0, "Nenhum aparelho ativo encontrado para este usuário."
+
+    logger.info(f"[WebPush] Disparando para user_id={u_uuid} ({len(subscriptions)} aparelho(s) registrado(s))...")
 
     payload_dict = {
         "title": title,
@@ -194,7 +199,7 @@ def trigger_web_push_background(
     async def _runner():
         async with AsyncSessionLocal() as session:
             try:
-                await send_web_push_notification(
+                success_count, err = await send_web_push_notification(
                     session,
                     user_id=user_id,
                     title=title,
@@ -204,7 +209,8 @@ def trigger_web_push_background(
                     icon=icon,
                     image=image
                 )
+                logger.info(f"[WebPush-Background] Concluído para user_id={user_id}. Entregas: {success_count}. Mensagem/Erro: {err}")
             except Exception as e:
-                logger.error(f"Falha na task de background Web Push: {e}")
+                logger.error(f"[WebPush-Background] Falha na task de background: {e}", exc_info=True)
 
     asyncio.create_task(_runner())
