@@ -921,8 +921,21 @@ def _damped_quality(c: Dict[str, Any]) -> float:
     return (va * vc + 6.5 * 50.0) / (vc + 50.0)
 
 
-def _franchise_key(c: Dict[str, Any]) -> Optional[str]:
+def _extract_base_franchise_title(title: Optional[str]) -> str:
     import re
+    if not title:
+        return ""
+    base = str(title).strip().split(":")[0].split(" - ")[0].split(" – ")[0].strip()
+    base = re.sub(
+        r"\s+(?:[2-9]|ii|iii|iv|v|vi|vii|terceiro|para sempre|o filme|the movie|parte\s+\w+)$",
+        "",
+        base,
+        flags=re.IGNORECASE,
+    ).strip().lower()
+    return base
+
+
+def _franchise_key(c: Dict[str, Any]) -> Optional[str]:
     col = c.get("belongs_to_collection")
     if isinstance(col, dict) and col.get("id"):
         key = f"col:{col['id']}"
@@ -930,7 +943,10 @@ def _franchise_key(c: Dict[str, Any]) -> Optional[str]:
         key = f"col:{c['collection_tmdb_id']}"
     else:
         key = None
-    kws = " ".join(str(k).lower() for k in (c.get("keywords_list") or []))
+    kws = " ".join(
+        (str(k.get("name", "")) if isinstance(k, dict) else str(k)).lower()
+        for k in (c.get("keywords_list") or c.get("keywords") or [])
+    )
     if "marvel cinematic universe" in kws or "mcu" in kws.split():
         return "universe:mcu"
     if key:
@@ -938,14 +954,65 @@ def _franchise_key(c: Dict[str, Any]) -> Optional[str]:
     title = str(c.get("title") or c.get("name") or "").strip()
     if not title:
         return None
-    base = title.split(":")[0].split(" - ")[0].strip()
-    base = re.sub(
-        r"\s+(?:[2-9]|ii|iii|iv|v|vi|vii|terceiro|para sempre|o filme|parte\s+\w+)$",
-        "",
-        base,
-        flags=re.IGNORECASE,
-    ).strip().lower()
+    base = _extract_base_franchise_title(title)
     return f"title:{base}" if base else None
+
+
+def is_tv_recap_compilation(
+    candidate: Dict[str, Any],
+    seen_series_titles: Optional[Set[str]] = None,
+) -> bool:
+    """
+    Camada 1 (Filtro Preventivo de Recaps/Compilações):
+    Identifica filmes que são compilações/recaps de episódios de séries de TV
+    (ex.: 'Demon Slayer: Vínculo de Irmãos', 'Demon Slayer: Arco de Encontro de Hashira',
+    'Attack on Titan: O Último Ataque'), preservando filmes canônicos/originais de franquia
+    (ex.: 'Demon Slayer: Mugen Train', 'Demon Slayer: Castelo Infinito', 'Jujutsu Kaisen 0').
+    """
+    if candidate.get("media_type", "movie") != "movie":
+        return False
+
+    raw_kws = candidate.get("keywords_list") or candidate.get("keywords") or []
+    kw_set: Set[str] = set()
+    for k in raw_kws:
+        if isinstance(k, dict):
+            name = str(k.get("name", "")).strip().lower()
+        else:
+            name = str(k).strip().lower()
+        if name:
+            kw_set.add(name)
+
+    # 1. Tag oficial do TMDB para filmes editados/compilados a partir de episódios de série de TV
+    if "edited from tv series" in kw_set or "tv compilation" in kw_set or "recap" in kw_set:
+        return True
+
+    title = str(candidate.get("title") or candidate.get("name") or "")
+    overview = str(candidate.get("overview") or "").lower()
+    base_title = _extract_base_franchise_title(title)
+
+    # 2. Se possui tag 'compilation' e pertence a anime/mangá ou a uma série já presente na biblioteca do usuário
+    if "compilation" in kw_set:
+        if kw_set & {"anime", "based on manga", "shounen", "shonen", "seinen"}:
+            return True
+        if seen_series_titles and base_title and base_title in seen_series_titles:
+            return True
+
+    # 3. Heurística textual defensiva para recaps sem keywords completas de séries que o usuário já conhece
+    if seen_series_titles and base_title and base_title in seen_series_titles:
+        recap_markers = (
+            "reconta os primeiros episódios",
+            "filme de compilação",
+            "compilação dos episódios",
+            "episódios compilados",
+            "resumo da temporada",
+            "recap",
+            "omnibus",
+        )
+        text_blob = f"{title.lower()} {overview}"
+        if any(marker in text_blob for marker in recap_markers):
+            return True
+
+    return False
 
 
 def _cap_per_franchise(items: List[Dict[str, Any]], limit: int, max_per: int = 2) -> List[Dict[str, Any]]:
@@ -1085,20 +1152,20 @@ async def get_personalized_recommendations(
     from app.recommendation.service import (
         get_active_dismissed_media_keys,
         get_user_dismissed_records,
+        build_enriched_dismissed_snapshots,
         calculate_semantic_dismiss_penalty,
     )
     user_list = await get_user_list(db, user_id)
     seen_media_keys = {(item.media.media_type, item.media.tmdb_id) for item in user_list if item.media}
+    seen_series_titles = {
+        _extract_base_franchise_title(getattr(item.media, "title", None))
+        for item in user_list
+        if item.media and getattr(item.media, "media_type", "") == "tv" and getattr(item.media, "title", None)
+    }
+    seen_series_titles.discard("")
     dismissed_keys = await get_active_dismissed_media_keys(db, user_id)
     dismissed_records = await get_user_dismissed_records(db, user_id)
-    dismissed_snapshots = [
-        {
-            "embedding": getattr(r, "embedding", None),
-            "expires_at": getattr(r, "expires_at", None),
-            "created_at": getattr(r, "created_at", None),
-        }
-        for r in dismissed_records
-    ]
+    dismissed_snapshots = await build_enriched_dismissed_snapshots(db, dismissed_records)
     seen_media_keys = seen_media_keys.union(dismissed_keys)
 
     # Cria snapshots imutáveis em memória para isolar do ciclo de vida da sessão SQLAlchemy
@@ -1269,7 +1336,8 @@ async def get_personalized_recommendations(
             from app.media.models import Media as MediaModel
             media_records = await db.execute(
                 select(MediaModel.media_type, MediaModel.tmdb_id, MediaModel.embedding,
-                       MediaModel.vote_average, MediaModel.vote_count, MediaModel.release_date).where(
+                       MediaModel.vote_average, MediaModel.vote_count, MediaModel.release_date,
+                       MediaModel.keywords).where(
                     MediaModel.tmdb_id.in_(candidate_tmdb_ids)
                 )
             )
@@ -1285,6 +1353,8 @@ async def get_personalized_recommendations(
                         c["vote_count"] = int(_r[4])
                     if not c.get("release_date") and not c.get("first_air_date") and _r[5]:
                         c["release_date"] = str(_r[5])
+                    if not c.get("keywords_list") and _r[6]:
+                        c["keywords_list"] = _r[6]
             for c in total_candidates:
                 m_key = (c.get("media_type", "movie"), c.get("id"))
                 if m_key in emb_map and not c.get("embedding"):
@@ -1293,6 +1363,7 @@ async def get_personalized_recommendations(
             pass
 
     # Filtra obras ainda não lançadas (que pertencem apenas à vitrine de Lançamentos Futuros)
+    # e aplica Camada 1: Filtro Preventivo de Filmes de Recap/Compilação de Séries de TV
     from datetime import datetime, timezone
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     released_candidates = []
@@ -1302,6 +1373,8 @@ async def get_personalized_recommendations(
         if r_date and len(r_date) >= 10 and r_date[:10] > today_str:
             continue
         if vc <= 0 and (not r_date or r_date[:4] >= today_str[:4]):
+            continue
+        if is_tv_recap_compilation(c, seen_series_titles):
             continue
         released_candidates.append(c)
     total_candidates = released_candidates
@@ -1358,9 +1431,14 @@ async def get_personalized_recommendations(
         elif c.get("semantic") and c.get("semantic_score", 0) >= 70.0 and "✨ Afinidade Semântica" not in top_tags:
             top_tags.append("✨ Afinidade Semântica")
 
-        # Aplica penalidade contextual suave se o candidato for semanticamente muito próximo (>=0.75) de uma obra dispensada
-        if dismissed_snapshots and cand_emb:
-            penalty = calculate_semantic_dismiss_penalty(cand_emb, dismissed_snapshots)
+        # Aplica penalidade contextual inteligente (Camada 2: Escudo de Recap + Escudo de Âncora Positiva + Franquia vs Gênero)
+        if dismissed_snapshots and (cand_emb or c):
+            penalty = calculate_semantic_dismiss_penalty(
+                cand_emb,
+                dismissed_snapshots,
+                candidate=c,
+                user_items=user_item_snapshots,
+            )
             if penalty > 0:
                 final_score = max(0.0, round(final_score - penalty, 1))
 
@@ -2137,10 +2215,15 @@ async def get_recent_vibe_recommendations(
 
     # 3. Conjunto de obras já assistidas / dispensadas para filtragem
     seen_keys: Set[Tuple[str, int]] = set()
+    seen_series_titles_vibe: Set[str] = set()
     for it in list_items:
         if it.media and getattr(it.media, "tmdb_id", None):
             m_type = getattr(it.media, "media_type", "movie") or "movie"
             seen_keys.add((m_type, it.media.tmdb_id))
+            if m_type == "tv" and getattr(it.media, "title", None):
+                bt = _extract_base_franchise_title(it.media.title)
+                if bt:
+                    seen_series_titles_vibe.add(bt)
 
     from app.recommendation.service import get_active_dismissed_media_keys
     from app.recommendation.models import UserRecommendation
@@ -2258,6 +2341,8 @@ async def get_recent_vibe_recommendations(
     for c in enriched:
         ckey = (c.get("media_type", "movie"), c.get("id"))
         if not ckey[1] or ckey in excluded_keys or ckey in seen_after_enrich_vibe:
+            continue
+        if is_tv_recap_compilation(c, seen_series_titles_vibe):
             continue
         seen_after_enrich_vibe.add(ckey)
 

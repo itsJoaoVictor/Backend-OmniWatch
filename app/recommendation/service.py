@@ -480,7 +480,7 @@ async def compute_and_save_user_recommendations(
                     reverse=True,
                 )
                 new_impressions = dict(sorted_imps[:200])
-            new_impressions["_algo_version"] = 5
+            new_impressions["_algo_version"] = 6
 
             # Verifica elegibilidade real de Vibe Recente (completed/watching <= 30 dias)
             from app.recommendation.profile_manager import user_has_recent_vibe_activity
@@ -633,7 +633,7 @@ async def run_recommendations_daily_sync_loop(interval_hours: int = 24):
                         if rec is None or rec.is_stale or not rec.explore_items:
                             user_ids.append(uid)
                             continue
-                        if (rec.impressions or {}).get("_algo_version") != 5:
+                        if (rec.impressions or {}).get("_algo_version") != 6:
                             user_ids.append(uid)
                             needs_profile_rebuild.add(uid)
                             continue
@@ -840,19 +840,106 @@ async def get_user_dismissed_records(
     res = await db.execute(stmt)
     return list(res.scalars().all())
 
+async def build_enriched_dismissed_snapshots(
+    db: AsyncSession,
+    dismissed_records: List[UserDismissedRecommendation],
+) -> List[Dict[str, Any]]:
+    """
+    Constrói snapshots em memória dos itens dispensados enriquecidos com keywords e título
+    da tabela Media, permitindo que a Camada 2 diferencie recaps/compilações e franquias.
+    """
+    if not dismissed_records:
+        return []
+    media_meta_map: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    try:
+        from app.media.models import Media as MediaModel
+        tids = [r.tmdb_id for r in dismissed_records if getattr(r, "tmdb_id", None)]
+        if tids:
+            res = await db.execute(
+                select(
+                    MediaModel.media_type,
+                    MediaModel.tmdb_id,
+                    MediaModel.title,
+                    MediaModel.keywords,
+                ).where(MediaModel.tmdb_id.in_(tids))
+            )
+            for mtype, tid, mtitle, mkws in res.all():
+                media_meta_map[(mtype or "movie", tid)] = {
+                    "title": mtitle,
+                    "keywords_list": mkws or [],
+                }
+    except Exception:
+        pass
+
+    snapshots: List[Dict[str, Any]] = []
+    for r in dismissed_records:
+        mtype = getattr(r, "media_type", "movie") or "movie"
+        tid = getattr(r, "tmdb_id", None)
+        meta = media_meta_map.get((mtype, tid), {})
+        snapshots.append({
+            "tmdb_id": tid,
+            "media_type": mtype,
+            "title": getattr(r, "title", None) or meta.get("title") or "",
+            "keywords_list": meta.get("keywords_list", []),
+            "embedding": getattr(r, "embedding", None),
+            "expires_at": getattr(r, "expires_at", None),
+            "created_at": getattr(r, "created_at", None),
+        })
+    return snapshots
+
+
 def calculate_semantic_dismiss_penalty(
     candidate_embedding: Optional[List[float]],
-    dismissed_records: List[UserDismissedRecommendation],
+    dismissed_records: List[Any],
+    candidate: Optional[Dict[str, Any]] = None,
+    user_items: Optional[List[Dict[str, Any]]] = None,
 ) -> float:
     """
-    Calcula uma penalidade semântica suave (-15% a -25%) para candidatos que tenham
-    altíssima similaridade cosseno (>= 0.75) com obras dispensadas pelo usuário.
-    Aplica decaimento temporal conforme a data de expiração se aproxima.
+    Camada 2 (Penalidade Inteligente em 2 Escopos com Escudo de Recap e Escudo de Favoritos):
+    1. Escudo de Recap/Compilação: Se a obra dispensada for um filme de recap/compilação
+       ('edited from tv series', 'compilation', 'recap'), aplica 0.0 de penalidade para não
+       punir filmes canônicos nem outros animes.
+    2. Escudo de Âncora Positiva & Separação Franquia vs. Gênero:
+       - Se o usuário já possui âncora positiva na biblioteca (favorito ou nota >= 4.0) da mesma
+         franquia ou com alta similaridade semântica (>= 0.70) com o item dispensado:
+         * Candidatos de OUTRAS franquias recebem 0.0 de penalidade (protege o gênero).
+         * Candidatos da MESMA franquia recebem penalidade controlada de franquia (-12 pts para
+           sequências de filmes, ou -6 pts se o usuário favoritou a série de TV principal),
+           usando max() (nunca soma) para que múltiplos filmes dispensados não acumulem.
+       - Se o usuário NÃO possui âncora positiva próxima ao item dispensado, aplica a penalidade
+         semântica padrão (-15 a -25 pts para sim >= 0.75) com decaimento temporal.
     """
-    if not candidate_embedding or not dismissed_records:
+    if not dismissed_records or (not candidate_embedding and not candidate):
         return 0.0
 
     from app.recommendation.embeddings import calculate_cosine_similarity
+    from app.recommendation.orchestrator import _extract_base_franchise_title, is_tv_recap_compilation
+
+    cand_title = str((candidate or {}).get("title") or (candidate or {}).get("name") or "")
+    cand_base_title = _extract_base_franchise_title(cand_title)
+    cand_mtype = (candidate or {}).get("media_type", "movie")
+
+    # Pré-processa âncoras positivas do usuário (favoritos, nota >= 4.0 ou rewatch >= 1)
+    positive_anchors: List[Dict[str, Any]] = []
+    seen_series_titles: Set[str] = set()
+    for u_it in (user_items or []):
+        u_title = str(u_it.get("title") or "")
+        u_base = _extract_base_franchise_title(u_title)
+        u_mtype = u_it.get("media_type", "movie")
+        if u_mtype == "tv" and u_base:
+            seen_series_titles.add(u_base)
+        is_pos = (
+            bool(u_it.get("is_favorite"))
+            or float(u_it.get("rating") or 0.0) >= 4.0
+            or int(u_it.get("rewatch_count") or 0) >= 1
+            or int(u_it.get("ep_rewatches") or 0) >= 1
+        )
+        if is_pos:
+            positive_anchors.append({
+                "base_title": u_base,
+                "media_type": u_mtype,
+                "embedding": u_it.get("embedding"),
+            })
 
     max_penalty = 0.0
     now = datetime.now(timezone.utc)
@@ -862,28 +949,79 @@ def calculate_semantic_dismiss_penalty(
             item_emb = item.get("embedding")
             expires_at = item.get("expires_at")
             created_at = item.get("created_at")
+            item_title = str(item.get("title") or "")
+            item_mtype = item.get("media_type", "movie") or "movie"
+            item_kws = item.get("keywords_list") or item.get("keywords") or []
         else:
             try:
                 item_emb = getattr(item, "embedding", None)
                 expires_at = getattr(item, "expires_at", None)
                 created_at = getattr(item, "created_at", None)
+                item_title = str(getattr(item, "title", "") or "")
+                item_mtype = getattr(item, "media_type", "movie") or "movie"
+                item_kws = getattr(item, "keywords_list", None) or []
             except Exception:
                 continue
 
-        if not item_emb:
+        # 1. Escudo de Recap/Compilação: dispensar filme de recap nunca penaliza nenhuma obra
+        item_dict = {
+            "media_type": item_mtype,
+            "title": item_title,
+            "keywords_list": item_kws,
+        }
+        if is_tv_recap_compilation(item_dict, seen_series_titles):
+            continue
+
+        if expires_at and created_at:
+            total_duration = (expires_at - created_at).total_seconds() or 1.0
+            remaining = (expires_at - now).total_seconds()
+            time_factor = max(0.2, min(1.0, remaining / total_duration))
+        else:
+            time_factor = 1.0
+
+        dismissed_base_title = _extract_base_franchise_title(item_title)
+        same_franchise = bool(
+            cand_base_title
+            and dismissed_base_title
+            and cand_base_title == dismissed_base_title
+        )
+
+        # Verifica se o item dispensado é blindado por alguma âncora positiva do usuário
+        has_positive_anchor = False
+        has_loved_same_franchise_tv = False
+        for anc in positive_anchors:
+            if dismissed_base_title and anc["base_title"] == dismissed_base_title:
+                has_positive_anchor = True
+                if anc["media_type"] == "tv":
+                    has_loved_same_franchise_tv = True
+                break
+            if item_emb and anc.get("embedding"):
+                if calculate_cosine_similarity(item_emb, anc["embedding"]) >= 0.70:
+                    has_positive_anchor = True
+
+        # 2A. Escopo de Franquia (mesma franquia/coleção do item dispensado)
+        if same_franchise:
+            if has_loved_same_franchise_tv:
+                # Usuário ama a série de TV principal e dispensou um filme derivado/filler:
+                # aplica penalidade leve apenas sobre outros filmes derivados (e nunca soma 3x)
+                penalty = (6.0 * time_factor) if cand_mtype == "movie" else 0.0
+            else:
+                # Usuário dispensou uma sequência de franquia (ex: Shrek Terceiro -> Shrek Para Sempre)
+                penalty = 12.0 * time_factor
+            if penalty > max_penalty:
+                max_penalty = penalty
+            continue
+
+        # 2B. Escopo de Gênero/Subgênero (franquias diferentes)
+        if has_positive_anchor:
+            # Escudo de Gênero ativo: o usuário gosta do subgênero/vibe, apenas dispensou uma obra específica
+            continue
+
+        if not item_emb or not candidate_embedding:
             continue
 
         sim = calculate_cosine_similarity(candidate_embedding, item_emb)
         if sim >= 0.75:
-            # Fator de decaimento temporal: quanto mais recente, mais próximo de 1.0; perto de expirar, chega a 0.2
-            if expires_at and created_at:
-                total_duration = (expires_at - created_at).total_seconds() or 1.0
-                remaining = (expires_at - now).total_seconds()
-                time_factor = max(0.2, min(1.0, remaining / total_duration))
-            else:
-                time_factor = 1.0
-
-            # Penalidade proporcional entre 0.75 e 1.0 (escala de 15 a 25 pontos percentuais)
             norm_sim = (sim - 0.75) / 0.25  # 0.0 a 1.0
             penalty = (15.0 + norm_sim * 10.0) * time_factor
             if penalty > max_penalty:
@@ -917,6 +1055,8 @@ async def refresh_explore_media_batch(
         build_candidate_vector,
         apply_mmr_reranking,
         reciprocal_rank_fusion,
+        _extract_base_franchise_title,
+        is_tv_recap_compilation,
     )
     from app.recommendation.matcher import compute_omnimatch_score
     from app.recommendation.ranker import LightGBMRanker
@@ -937,16 +1077,15 @@ async def refresh_explore_media_batch(
     seen_media_keys: Set[Tuple[str, int]] = {
         (it.media.media_type, it.media.tmdb_id) for it in user_list if getattr(it, "media", None)
     }
+    seen_series_titles: Set[str] = {
+        _extract_base_franchise_title(getattr(it.media, "title", None))
+        for it in user_list
+        if getattr(it, "media", None) and getattr(it.media, "media_type", "") == "tv" and getattr(it.media, "title", None)
+    }
+    seen_series_titles.discard("")
     dismissed_keys = await get_active_dismissed_media_keys(db, user_id)
     dismissed_records = await get_user_dismissed_records(db, user_id)
-    dismissed_snapshots = [
-        {
-            "embedding": getattr(r, "embedding", None),
-            "expires_at": getattr(r, "expires_at", None),
-            "created_at": getattr(r, "created_at", None),
-        }
-        for r in dismissed_records
-    ]
+    dismissed_snapshots = await build_enriched_dismissed_snapshots(db, dismissed_records)
 
     exclude_set: Set[int] = {int(x) for x in (exclude_ids or []) if x}
     cycle_excluded_keys: Set[Tuple[str, int]] = {(media_type, tid) for tid in exclude_set}
@@ -1014,6 +1153,8 @@ async def refresh_explore_media_batch(
 
     scored: List[Dict[str, Any]] = []
     for c in candidates:
+        if is_tv_recap_compilation(c, seen_series_titles):
+            continue
         c_vec = build_candidate_vector(c)
         c["_candidate_vector"] = c_vec
         cand_emb = c.get("embedding")
@@ -1046,8 +1187,13 @@ async def refresh_explore_media_batch(
             except Exception:
                 pass
 
-        if dismissed_snapshots and cand_emb:
-            pen = calculate_semantic_dismiss_penalty(cand_emb, dismissed_snapshots)
+        if dismissed_snapshots and (cand_emb or c):
+            pen = calculate_semantic_dismiss_penalty(
+                cand_emb,
+                dismissed_snapshots,
+                candidate=c,
+                user_items=user_item_snapshots,
+            )
             if pen > 0:
                 score = max(0.0, round(score - pen, 1))
 

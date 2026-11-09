@@ -49,10 +49,20 @@ async def lifespan(app: FastAPI):
         await asyncio.sleep(12)
         await migrate_existing_future_media()
 
+    async def _delayed_universe_recap_purge():
+        await asyncio.sleep(8)
+        try:
+            async with AsyncSessionLocal() as db:
+                from app.universes.services import purge_recap_items_from_all_universes
+                await purge_recap_items_from_all_universes(db)
+        except Exception as e:
+            logger.warning(f"⚠️ [Startup] Erro ao expurgar recaps de universos no boot: {e}")
+
     # Rotinas escalonadas em background para evitar rajadas concorrentes (429/timeout) no TMDB durante o boot:
-    # t=6s: heal/sync de recomendações | t=12s: migração future_media | t=25s: calendário
+    # t=6s: heal/sync de recomendações | t=8s: expurgo recaps de universos | t=12s: migração future_media | t=25s: calendário
     # t=45s: sugestões de coleções | t=75s: sugestões de universos | t=110s: sync coleções | t=135s: sync universos | t=180s: ranker
     fut_mig_task = asyncio.create_task(_delayed_future_media_migration())
+    univ_purge_task = asyncio.create_task(_delayed_universe_recap_purge())
     recs_sync_task = asyncio.create_task(run_recommendations_daily_sync_loop(interval_hours=24))
     cal_sync_task = asyncio.create_task(run_calendar_sync_loop(interval_hours=24, initial_delay_seconds=25))
     col_sugg_task = asyncio.create_task(run_collection_suggestions_loop(interval_hours=24, initial_delay_seconds=45))
@@ -62,6 +72,7 @@ async def lifespan(app: FastAPI):
     ranker_task = asyncio.create_task(run_ranker_training_loop(interval_hours=24))
     yield
     fut_mig_task.cancel()
+    univ_purge_task.cancel()
     sync_task.cancel()
     col_sugg_task.cancel()
     univ_sync_task.cancel()

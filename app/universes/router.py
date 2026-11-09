@@ -30,6 +30,7 @@ from app.universes.services import (
     schedule_universe_suggestions_scan,
     toggle_universe_item_ignored,
     update_universe_settings,
+    purge_recap_items_from_all_universes,
 )
 
 router = APIRouter(prefix="/universes", tags=["universes"])
@@ -252,4 +253,20 @@ async def trigger_universe_sync(
         "success": True,
         "message": f"Universo '{universe.name}' sincronizado com sucesso!",
         "items_count": universe.items_count,
+    }
+
+
+@router.post("/purge-recaps")
+async def trigger_purge_recaps(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Expurga preventivamente filmes de recap/compilação de séries de TV de todos os
+    universos cadastrados no banco de dados.
+    """
+    result = await purge_recap_items_from_all_universes(db)
+    return {
+        "success": True,
+        "result": result,
     }

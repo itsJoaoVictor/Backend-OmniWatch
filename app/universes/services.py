@@ -227,6 +227,8 @@ RECAP_KEYWORDS = {
     "arco da",
     "arco de",
     "arco do",
+    "arco dos",
+    "arco ",
     "arcos",
     "arc compilation",
     "special edition",
@@ -244,16 +246,62 @@ RECAP_KEYWORDS = {
     "special edition swordsmith village",
     "special edition hashira training",
     "arc part",
+    "the movie: recap",
+    "recapeamento",
+    "omnibus",
 }
 
+RECAP_OVERVIEW_MARKERS = (
+    "reconta os primeiros episódios",
+    "filme de compilação",
+    "compilação dos episódios",
+    "episódios compilados",
+    "resumo da temporada",
+    "compilation of episodes",
+    "recap of",
+    "recaps the",
+)
 
-def _check_is_recap(title: str, overview: Optional[str] = None) -> bool:
-    """Detecta se uma obra é um filme recap ou compilação de episódios da TV."""
+
+def _check_is_recap(
+    title: str,
+    overview: Optional[str] = None,
+    keywords: Optional[List[Any]] = None,
+    media_type: str = "movie",
+) -> bool:
+    """
+    Camada de Filtro Preventivo de Recaps/Compilações em Universos:
+    Detecta se uma obra é um filme recap ou compilação de episódios da TV para
+    evitar que ela entre e polua a linha do tempo ou distorça o progresso do universo.
+    """
+    if media_type != "movie":
+        return False
+
     t_lower = (title or "").lower()
     o_lower = (overview or "").lower()
+
+    # 1. Verifica keywords oficiais do TMDB
+    if keywords:
+        for k in keywords:
+            name = (k.get("name") if isinstance(k, dict) else str(k)).strip().lower()
+            if name in ("edited from tv series", "tv compilation", "recap"):
+                return True
+            if name == "compilation" and any(
+                tag in (t_lower + " " + o_lower)
+                for tag in ("anime", "demon", "kimetsu", "episódio", "episodio", "episode", "season", "temporada", "arco")
+            ):
+                return True
+
+    # 2. Verifica palavras-chave e nomes de arcos no título
     for kw in RECAP_KEYWORDS:
-        if kw in t_lower or kw in o_lower:
+        if kw in t_lower:
             return True
+
+    # 3. Verifica marcadores de compilação na sinopse/overview
+    for marker in RECAP_OVERVIEW_MARKERS:
+        if marker in o_lower:
+            return True
+
     return False
 
 
@@ -427,6 +475,9 @@ async def _enrich_universe_members(
         for m in res.scalars().all():
             key = (m.tmdb_id, m.media_type)
             if key in members_map:
+                if _check_is_recap(m.title, None, m.keywords, m.media_type):
+                    members_map.pop(key, None)
+                    continue
                 entry = members_map[key]
                 if m.title and not _is_non_latin(m.title):
                     entry["title"] = entry.get("title") or m.title
@@ -434,6 +485,7 @@ async def _enrich_universe_members(
                 entry["poster_path"] = entry.get("poster_path") or m.poster_path
                 entry["backdrop_path"] = entry.get("backdrop_path") or m.backdrop_path
                 entry["collection_name"] = entry.get("collection_name") or m.collection_name
+                entry["keywords_list"] = m.keywords or []
                 if m.media_type == "movie" and m.collection_tmdb_id and m.collection_tmdb_id > 0:
                     child_col_ids.add(m.collection_tmdb_id)
 
@@ -463,7 +515,16 @@ async def _enrich_universe_members(
         if isinstance(col_info, dict) and col_info.get("id"):
             child_col_ids.add(col_info["id"])
         final_title = data.get("title") or data.get("name") or data.get("original_title") or data.get("original_name") or f"Item #{tid}"
-        is_recap = _check_is_recap(final_title, data.get("overview"))
+        kw_data = data.get("keywords") or data.get("keywords_list")
+        if isinstance(kw_data, dict):
+            kw_list = kw_data.get("keywords") or kw_data.get("results") or []
+        elif isinstance(kw_data, list):
+            kw_list = kw_data
+        else:
+            kw_list = []
+        is_recap = _check_is_recap(final_title, data.get("overview"), kw_list, mtype)
+        if is_recap:
+            return key, None
         return key, {
             "tmdb_id": tid,
             "media_type": mtype,
@@ -472,7 +533,7 @@ async def _enrich_universe_members(
             "poster_path": data.get("poster_path"),
             "backdrop_path": data.get("backdrop_path"),
             "collection_name": col_name,
-            "is_recap": is_recap,
+            "is_recap": False,
         }
 
     if missing_keys:
@@ -498,8 +559,10 @@ async def _enrich_universe_members(
                 pid = part.get("id")
                 if not pid:
                     continue
-                key = (pid, "movie")
                 part_title = part.get("title") or part.get("original_title") or f"Filme #{pid}"
+                if _check_is_recap(part_title, part.get("overview"), None, "movie"):
+                    continue
+                key = (pid, "movie")
                 if key not in members_map:
                     members_map[key] = {
                         "tmdb_id": pid,
@@ -509,7 +572,7 @@ async def _enrich_universe_members(
                         "poster_path": part.get("poster_path"),
                         "backdrop_path": part.get("backdrop_path"),
                         "collection_name": col_name,
-                        "is_recap": _check_is_recap(part_title),
+                        "is_recap": False,
                     }
                 elif not members_map[key].get("collection_name") and col_name:
                     members_map[key]["collection_name"] = col_name
@@ -524,13 +587,23 @@ async def _enrich_universe_members(
         for key, info in post_fetched:
             if info:
                 members_map[key] = info
+            else:
+                members_map.pop(key, None)
 
     cand["child_collection_ids"] = child_col_ids
 
-    # Ordena cronologicamente por data de lançamento
-    enriched_list = list(members_map.values())
-    enriched_list.sort(key=lambda x: x.get("release_date") or "9999-12-31")
-    return enriched_list
+    # 5. Filtro preventivo estrito: Remove qualquer recap/compilação remanescente e ordena por data
+    cleaned_members = [
+        v for v in members_map.values()
+        if not _check_is_recap(
+            v.get("title", ""),
+            v.get("overview"),
+            v.get("keywords_list") or v.get("keywords"),
+            v.get("media_type", "movie"),
+        )
+    ]
+    cleaned_members.sort(key=lambda x: x.get("release_date") or "9999-12-31")
+    return cleaned_members
 
 
 async def generate_user_universe_suggestions(
@@ -1172,6 +1245,8 @@ async def get_or_create_universe(
         mtype = m.get("media_type", "movie")
         if not tid or (tid, mtype) in seen_pairs:
             continue
+        if _check_is_recap(m.get("title", ""), m.get("overview"), m.get("keywords_list") or m.get("keywords"), mtype):
+            continue
         seen_pairs.add((tid, mtype))
         local_m = local_media_map.get((tid, mtype))
 
@@ -1726,11 +1801,12 @@ async def _build_universe_detail_response(
 
         asyncio.create_task(_bg_resolve_non_latin(universe.id, non_latin_items))
 
-    sorted_items = sorted(universe.items, key=lambda x: x.release_date or "9999-12-31")
+    canonical_items = [it for it in universe.items if not _check_is_recap(it.title, None, None, it.media_type)]
+    sorted_items = sorted(canonical_items, key=lambda x: x.release_date or "9999-12-31")
     for item in sorted_items:
         pair = (item.tmdb_id, item.media_type)
         is_ignored = pair in ignored_pairs
-        is_recap = _check_is_recap(item.title)
+        is_recap = False
 
         uli_tuple = user_items_by_pair.get(pair)
         status = uli_tuple[0].status if uli_tuple else None
@@ -2104,10 +2180,91 @@ async def run_universe_suggestions_loop(interval_hours: int = 6, initial_delay_s
         await asyncio.sleep(interval_hours * 3600)
 
 
+async def purge_recap_items_from_all_universes(db: AsyncSession) -> Dict[str, Any]:
+    """
+    Expurga preventivamente filmes de recap/compilação de séries de TV de todos os
+    universos cadastrados no banco de dados, atualizando as contagens de itens e
+    as sugestões cacheadas.
+    """
+    logger.info("🧹 [Universes] Iniciando varredura e expurgo de recaps de TV em universos...")
+    res = await db.execute(select(Universe).options(selectinload(Universe.items)))
+    universes = res.scalars().all()
+
+    total_purged = 0
+    purged_by_universe: Dict[str, List[str]] = {}
+
+    for u in universes:
+        recap_items: List[UniverseItem] = []
+        for it in u.items:
+            if _check_is_recap(it.title, None, None, it.media_type):
+                recap_items.append(it)
+
+        if not recap_items:
+            continue
+
+        purged_titles = [it.title for it in recap_items]
+        purged_by_universe[u.name] = purged_titles
+        total_purged += len(recap_items)
+
+        for it in recap_items:
+            # Remove referências de ignorados para não deixar registros órfãos
+            await db.execute(
+                delete(UserUniverseIgnoredItem).where(
+                    UserUniverseIgnoredItem.universe_id == u.id,
+                    UserUniverseIgnoredItem.tmdb_id == it.tmdb_id,
+                    UserUniverseIgnoredItem.media_type == it.media_type,
+                )
+            )
+            await db.delete(it)
+            if it in u.items:
+                u.items.remove(it)
+
+        # Atualiza métricas do universo
+        u.items_count = len(u.items)
+        u.movies_count = sum(1 for it in u.items if it.media_type == "movie")
+        u.tv_count = sum(1 for it in u.items if it.media_type == "tv")
+
+        # Atualiza sugestões em cache
+        sugg_res = await db.execute(
+            select(UserUniverseSuggestion).where(UserUniverseSuggestion.universe_key == u.universe_key)
+        )
+        for sugg in sugg_res.scalars().all():
+            if sugg.discovered_members:
+                sugg.discovered_members = [
+                    m for m in sugg.discovered_members
+                    if not _check_is_recap(
+                        m.get("title", ""),
+                        m.get("overview"),
+                        m.get("keywords_list") or m.get("keywords"),
+                        m.get("media_type", "movie"),
+                    )
+                ]
+            sugg.total_items = u.items_count
+            sugg.movies_count = u.movies_count
+            sugg.tv_count = u.tv_count
+
+        logger.info(f"🧹 [Universes] Universo '{u.name}': expurgados {len(recap_items)} recaps de TV. Novo total: {u.items_count} obras.")
+
+    await db.commit()
+    logger.info(f"🧹 [Universes] Expurgo concluído com sucesso. Total de obras removidas: {total_purged}.")
+    return {
+        "total_purged": total_purged,
+        "purged_by_universe": purged_by_universe,
+    }
+
+
 async def run_universe_sync_loop(interval_hours: int = 12, initial_delay_seconds: int = 135):
     """Loop periódico para sincronizar universos seguidos com novas estreias/anúncios."""
     if initial_delay_seconds > 0:
         await asyncio.sleep(initial_delay_seconds)
+
+    # Executa expurgo preventivo no boot para auto-healing imediato do catálogo em produção
+    try:
+        async with AsyncSessionLocal() as db:
+            await purge_recap_items_from_all_universes(db)
+    except Exception as e:
+        logger.warning(f"[Universes] Erro no expurgo inicial de recaps no boot: {e}")
+
     while True:
         try:
             async with AsyncSessionLocal() as db:
