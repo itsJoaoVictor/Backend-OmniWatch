@@ -120,8 +120,10 @@ async def revert_completed_shows(db: AsyncSession):
         )
     )
 
+    from sqlalchemy.orm import joinedload
     stmt_revert = (
         select(UserListItem)
+        .options(joinedload(UserListItem.media))
         .join(Media, UserListItem.media_id == Media.id)
         .join(MediaRelease, UserListItem.media_id == MediaRelease.media_id)
         .where(
@@ -135,11 +137,14 @@ async def revert_completed_shows(db: AsyncSession):
         .distinct()
     )
     result_revert = await db.execute(stmt_revert)
-    items_to_revert = result_revert.scalars().all()
+    items_to_revert = result_revert.scalars().unique().all()
     
     if items_to_revert:
+        from app.core.cache import tv_status_cache
         for item in items_to_revert:
             item.status = "watching"
+            if item.media and item.media.tmdb_id:
+                tv_status_cache.delete_prefix(f"tv_status:{item.media.tmdb_id}")
         await db.commit()
 
 async def fetch_changed_tmdb_ids(media_type: str, start_date: str, end_date: str) -> List[int]:
@@ -259,6 +264,13 @@ async def notify_today_releases(db: AsyncSession):
     releases_by_media = defaultdict(list)
     for r in today_releases:
         releases_by_media[r.media_id].append(r)
+
+    # Invalida cache de status das séries com estreias hoje para que a Minha Lista/Dashboard reflitam o novo episódio no ar
+    from app.core.cache import tv_status_cache, details_cache
+    for r in today_releases:
+        if r.media and r.media.tmdb_id:
+            tv_status_cache.delete_prefix(f"tv_status:{r.media.tmdb_id}")
+            details_cache.delete_prefix(f"details:tv:{r.media.tmdb_id}")
 
     tracked_media_ids = list(releases_by_media.keys())
     if not tracked_media_ids:
@@ -488,6 +500,13 @@ async def run_calendar_sync_loop(interval_hours: int = 24, initial_delay_seconds
                     for m_id in media_ids_to_update:
                         await sync_single_media_release(db, m_id)
                 
+                # Limpa cache em memória das séries que tiveram alterações no TMDB
+                if all_changed_tmdb_ids:
+                    from app.core.cache import tv_status_cache, details_cache
+                    for tmdb_id_changed in all_changed_tmdb_ids:
+                        tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_changed}")
+                        details_cache.delete_prefix(f"details:tv:{tmdb_id_changed}")
+
                 # 4. Revert completed shows if new episodes aired
                 if all_changed_tmdb_ids:
                     await revert_completed_shows(db)

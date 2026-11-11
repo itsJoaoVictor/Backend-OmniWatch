@@ -99,17 +99,26 @@ async def determine_tv_next_episode_status(
                 max_ep = e
 
     cache_key = f"tv_status:{tmdb_id}:{max_season}:{max_ep}"
-    cached_data, _ = tv_status_cache.get_with_status(cache_key)
-    if cached_data is not None:
-        return cached_data.get("is_up_to_date"), cached_data.get("next_episode")
+    cached_data, is_stale = tv_status_cache.get_with_status(cache_key)
+    if cached_data is not None and not is_stale:
+        from app.core.utils import is_date_released
+        next_ep = cached_data.get("next_episode")
+        if next_ep and isinstance(next_ep, dict) and next_ep.get("air_date"):
+            # Recalcula dinamicamente se o episódio já estreou em relação à data civil de hoje do servidor
+            is_rel = is_date_released(next_ep["air_date"])
+            next_ep_copy = dict(next_ep)
+            next_ep_copy["is_released"] = is_rel
+            is_up = not is_rel
+            return is_up, next_ep_copy
+        return cached_data.get("is_up_to_date"), next_ep
 
     next_season = max_season if max_season > 0 else 1
     next_ep_num = (max_ep + 1) if max_season > 0 else 1
 
     # 1. Fast-path em memória (< 1ms) quando a temporada já está em details_cache
     season_cache_key = f"details:tv:{tmdb_id}:season:{next_season}"
-    season_cached_data, _ = details_cache.get_with_status(season_cache_key)
-    if season_cached_data and isinstance(season_cached_data.get("episodes"), list):
+    season_cached_data, season_is_stale = details_cache.get_with_status(season_cache_key)
+    if season_cached_data and not season_is_stale and isinstance(season_cached_data.get("episodes"), list):
         try:
             from app.core.utils import is_date_released
             episodes = season_cached_data.get("episodes", [])
@@ -120,8 +129,8 @@ async def determine_tv_next_episode_status(
                 next_season = next_season + 1
                 next_ep_num = 1
                 next_season_key = f"details:tv:{tmdb_id}:season:{next_season}"
-                next_season_cached, _ = details_cache.get_with_status(next_season_key)
-                if next_season_cached is not None and isinstance(next_season_cached.get("episodes"), list):
+                next_season_cached, next_season_is_stale = details_cache.get_with_status(next_season_key)
+                if next_season_cached is not None and not next_season_is_stale and isinstance(next_season_cached.get("episodes"), list):
                     episodes = next_season_cached.get("episodes", [])
                 else:
                     # A próxima temporada não está em memória ainda: já avança next_season e consulta direto a nova temporada!
