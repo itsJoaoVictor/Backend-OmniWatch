@@ -216,6 +216,27 @@ def _select_and_sort_videos(videos_data: list) -> List[VideoItem]:
     return result
 
 
+async def _resolve_videos_with_original_fallback(base_url: str, data: dict) -> List[VideoItem]:
+    """Seleciona vídeos de pt-BR/pt/en/null e, se vazio em obra estrangeira, consulta o idioma original."""
+    videos = _select_and_sort_videos(data.get("videos", {}).get("results", []))
+    if videos:
+        return videos
+    orig_lang = (data.get("original_language") or "").strip().lower()
+    if not orig_lang or orig_lang in ("pt", "en", "xx", "und"):
+        return []
+    try:
+        resp = await tmdb_request(
+            f"{base_url}/videos",
+            params={"language": orig_lang},
+            timeout=8.0,
+        )
+        if resp.status_code == 200:
+            return _select_and_sort_videos(resp.json().get("results", []))
+    except Exception:
+        pass
+    return []
+
+
 async def fetch_movie_details(movie_id: int) -> MovieDetailsResponse:
     if not settings.TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="TMDB API key not configured")
@@ -282,7 +303,7 @@ async def fetch_movie_details(movie_id: int) -> MovieDetailsResponse:
     ]
 
     # Normalize videos (Trailers com fallback para Teaser, ordenados por idioma e oficialidade)
-    videos = _select_and_sort_videos(data.get("videos", {}).get("results", []))
+    videos = await _resolve_videos_with_original_fallback(url, data)
 
     br_providers = data.get("watch/providers", {}).get("results", {}).get("BR", {})
     watch_providers_data = br_providers.get("flatrate", []) or br_providers.get("free", []) or br_providers.get("ads", [])
@@ -438,7 +459,7 @@ async def fetch_tv_details(series_id: int) -> TvSeriesDetailsResponse:
             if not any(x.get("person_id") == c.get("id") for x in crew_ids):
                 crew_ids.append(entry)
 
-    videos = _select_and_sort_videos(data.get("videos", {}).get("results", []))
+    videos = await _resolve_videos_with_original_fallback(url, data)
     
     br_providers = data.get("watch/providers", {}).get("results", {}).get("BR", {})
     watch_providers_data = br_providers.get("flatrate", []) or br_providers.get("free", []) or br_providers.get("ads", [])
