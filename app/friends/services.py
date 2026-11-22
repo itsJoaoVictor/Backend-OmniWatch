@@ -962,6 +962,35 @@ async def get_received_recommendations(
     limit: int = 50,
     offset: int = 0
 ) -> List[FriendRecommendationResponse]:
+    # Reconcilia automaticamente indicações pendentes de títulos já presentes na lista do usuário
+    pending_in_list_stmt = (
+        select(FriendRecommendation)
+        .join(
+            Media,
+            and_(
+                Media.tmdb_id == FriendRecommendation.tmdb_id,
+                Media.media_type == FriendRecommendation.media_type,
+            ),
+        )
+        .join(
+            UserListItem,
+            and_(
+                UserListItem.media_id == Media.id,
+                UserListItem.user_id == current_user_id,
+            ),
+        )
+        .where(
+            FriendRecommendation.recipient_id == current_user_id,
+            FriendRecommendation.status == "pending",
+        )
+    )
+    pending_in_list_res = await db.execute(pending_in_list_stmt)
+    reconciled_recs = pending_in_list_res.scalars().all()
+    if reconciled_recs:
+        for rec_to_accept in reconciled_recs:
+            rec_to_accept.status = "accepted"
+        await db.commit()
+
     stmt = (
         select(FriendRecommendation)
         .where(FriendRecommendation.recipient_id == current_user_id)

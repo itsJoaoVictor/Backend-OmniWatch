@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload, load_only, joinedload
-from sqlalchemy import text
+from sqlalchemy import text, update
 from fastapi import BackgroundTasks
 import logging
 import uuid
@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 from app.tracking.models import UserListItem, UserEpisodeProgress
 from app.tracking.schemas import UserListItemCreate, UserListItemUpdate, UserEpisodeProgressCreate
+from app.friends.models import FriendRecommendation
 from app.media.services import get_media_by_tmdb_id, create_media
 from app.media.schemas import MediaCreate
 from app.media.models import Media
@@ -280,6 +281,26 @@ async def get_user_list(db: AsyncSession, user_id: str, status_filter: Optional[
 
     return items
 
+async def _accept_pending_friend_recommendations(
+    db: AsyncSession,
+    user_uuid: uuid.UUID,
+    tmdb_id: int,
+    media_type: str,
+) -> int:
+    """Marca indicações pendentes recebidas para esta mídia como aceitas ao adicioná-la à lista."""
+    res = await db.execute(
+        update(FriendRecommendation)
+        .where(
+            FriendRecommendation.recipient_id == user_uuid,
+            FriendRecommendation.tmdb_id == tmdb_id,
+            FriendRecommendation.media_type == media_type,
+            FriendRecommendation.status == "pending",
+        )
+        .values(status="accepted")
+    )
+    return res.rowcount or 0
+
+
 async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate, background_tasks: Optional[BackgroundTasks] = None):
     media = await get_media_by_tmdb_id(db, item.tmdb_id)
     if not media:
@@ -481,8 +502,12 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate, 
                 existing_item.is_favorite = new_fav
                 changed = True
         
-        if changed:
+        accepted_count = await _accept_pending_friend_recommendations(
+            db, user_uuid, media.tmdb_id, media.media_type
+        )
+        if changed or accepted_count > 0:
             await db.commit()
+        if changed:
             await db.refresh(existing_item)
             if background_tasks:
                 background_tasks.add_task(_async_post_process_list_item_update, user_id=user_id, item_id=str(existing_item.id))
@@ -514,6 +539,7 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate, 
         is_favorite=initial_fav
     )
     db.add(new_item)
+    await _accept_pending_friend_recommendations(db, user_uuid, media.tmdb_id, media.media_type)
     await db.commit()
     await db.refresh(new_item)
     
