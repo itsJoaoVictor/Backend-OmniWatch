@@ -33,6 +33,7 @@ from app.tracking.schemas import UserListItemCreate
 from app.tracking.services import add_to_list, invalidate_user_stats_cache
 from app.core.utils import is_date_released
 from app.core.tmdb_client import get_tmdb_client, tmdb_get_json
+from app.core.translator import translate_batch_to_pt_br, translate_to_pt_br
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ async def _wikidata_step1_find_candidates(
     entidades de universo/franquia no Wikidata em lotes rápidos (~0.6s por lote).
     """
     candidates: Dict[str, Dict[str, Any]] = {}
+    desc_lang_by_qid: Dict[str, str] = {}
     batch_size = 45
 
     async def run_seed_batch(ids: List[int], prop: str, media_type: str):
@@ -131,7 +133,9 @@ async def _wikidata_step1_find_candidates(
                 continue
             qid = u_uri.rsplit("/", 1)[-1]
             label = r.get("universeLabel", {}).get("value", qid)
-            desc = r.get("universeDesc", {}).get("value", "")
+            desc_obj = r.get("universeDesc") or {}
+            desc = (desc_obj.get("value") or "").strip()
+            desc_lang = (desc_obj.get("xml:lang") or "").strip().lower()
             u_type = r.get("uType", {}).get("value", "").rsplit("/", 1)[-1]
             seed_id = int(r["seedTmdb"]["value"])
 
@@ -145,6 +149,12 @@ async def _wikidata_step1_find_candidates(
                     "members": {},
                     "child_collection_ids": set(),
                 }
+                if desc_lang:
+                    desc_lang_by_qid[qid] = desc_lang
+            elif not candidates[qid].get("overview") and desc:
+                candidates[qid]["overview"] = desc
+                if desc_lang:
+                    desc_lang_by_qid[qid] = desc_lang
             candidates[qid]["u_types"].add(u_type)
             candidates[qid]["seed_matches"].add((seed_id, media_type))
 
@@ -157,6 +167,20 @@ async def _wikidata_step1_find_candidates(
     # Executa em grupos de até 3 queries concorrentes para respeitar limites do Wikidata
     for i in range(0, len(tasks), 3):
         await asyncio.gather(*tasks[i : i + 3])
+
+    descs_to_translate = [
+        (qid, cand["overview"], desc_lang_by_qid[qid])
+        for qid, cand in candidates.items()
+        if cand.get("overview")
+        and desc_lang_by_qid.get(qid)
+        and not desc_lang_by_qid[qid].startswith("pt")
+    ]
+    if descs_to_translate:
+        translated_descs = await translate_batch_to_pt_br(
+            [(txt, lang) for _, txt, lang in descs_to_translate]
+        )
+        for (qid, _, _), tr_desc in zip(descs_to_translate, translated_descs):
+            candidates[qid]["overview"] = tr_desc
 
     return candidates
 
@@ -1152,7 +1176,12 @@ async def _discover_single_universe_by_key(
 
     if label_rows:
         cand["name"] = label_rows[0].get("universeLabel", {}).get("value", universe_key)
-        cand["overview"] = label_rows[0].get("universeDesc", {}).get("value")
+        desc_obj = label_rows[0].get("universeDesc") or {}
+        desc_val = (desc_obj.get("value") or "").strip()
+        desc_lang = (desc_obj.get("xml:lang") or "").strip().lower()
+        if desc_val and desc_lang and not desc_lang.startswith("pt"):
+            desc_val = await translate_to_pt_br(desc_val, source_lang=desc_lang)
+        cand["overview"] = desc_val or None
 
     enriched = await _enrich_universe_members(db, cand)
     cand["enriched_members"] = enriched
@@ -1308,7 +1337,11 @@ async def _background_enrich_universe_follow(user_id_str: str, media_ids: List[U
                                 if not media.genres and tmdb_data.genres:
                                     media.genres = [{"id": g.id, "name": g.name} for g in tmdb_data.genres]
                                 if not media.directors and tmdb_data.credits and tmdb_data.credits.crew:
-                                    media.directors = [c.name for c in tmdb_data.credits.crew]
+                                    media.directors = [
+                                        c.name
+                                        for c in tmdb_data.credits.crew
+                                        if getattr(c, "job", "") in ("Director", "Creator", "Series Director")
+                                    ]
                                 if not media.main_cast and tmdb_data.credits and tmdb_data.credits.cast:
                                     media.main_cast = [c.name for c in tmdb_data.credits.cast]
                                 if hasattr(tmdb_data, "keywords") and tmdb_data.keywords:
@@ -1329,7 +1362,11 @@ async def _background_enrich_universe_follow(user_id_str: str, media_ids: List[U
                                 if not media.genres and tmdb_data.genres:
                                     media.genres = [{"id": g.id, "name": g.name} for g in tmdb_data.genres]
                                 if not media.directors and tmdb_data.credits and tmdb_data.credits.crew:
-                                    media.directors = [c.name for c in tmdb_data.credits.crew]
+                                    media.directors = [
+                                        c.name
+                                        for c in tmdb_data.credits.crew
+                                        if getattr(c, "job", "") in ("Director", "Creator", "Series Director")
+                                    ]
                                 if not media.main_cast and tmdb_data.credits and tmdb_data.credits.cast:
                                     media.main_cast = [c.name for c in tmdb_data.credits.cast]
                                 if hasattr(tmdb_data, "keywords") and tmdb_data.keywords:

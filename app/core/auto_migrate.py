@@ -597,6 +597,21 @@ async def run_auto_migrations():
             """))
             await session.commit()
             logger.info("✅ [AutoMigrate] Coluna 'revoked_at' em refresh_tokens validada.")
+
+            # Cache persistente de traduções de sinopses (pt-BR)
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS translation_cache (
+                    text_hash VARCHAR(64) PRIMARY KEY,
+                    source_lang VARCHAR(16) NOT NULL DEFAULT 'auto',
+                    target_lang VARCHAR(16) NOT NULL DEFAULT 'pt-BR',
+                    source_text TEXT NOT NULL,
+                    translated_text TEXT NOT NULL,
+                    provider VARCHAR(32) NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """))
+            await session.commit()
+            logger.info("✅ [AutoMigrate] Tabela 'translation_cache' validada.")
             
     except Exception as e:
         logger.error(f"❌ [AutoMigrate] Falha ao verificar DDL idempotente: {e}")

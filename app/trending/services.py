@@ -3,6 +3,7 @@ from fastapi import HTTPException, status
 from app.core.config import settings
 from app.core.cache import trending_cache
 from app.core.tmdb_client import tmdb_request
+from app.core.translator import localize_tmdb_list_items_pt_br
 
 async def get_trending_week(language: str = "pt-BR", page: int = 1) -> dict:
     cache_key = f"trending:week:{language}:{page}"
@@ -29,7 +30,16 @@ async def get_trending_week(language: str = "pt-BR", page: int = 1) -> dict:
         response = await tmdb_request(url, params=params, timeout=12.0)
         response.raise_for_status()
         data = response.json()
-        
+
+        if language.lower().startswith("pt"):
+            async def _fetch_en_trending_results():
+                en_resp = await tmdb_request(url, params={"language": "en-US", "page": page}, timeout=8.0)
+                if en_resp.status_code == 200:
+                    return en_resp.json().get("results", [])
+                return []
+
+            await localize_tmdb_list_items_pt_br(data.get("results", []), _fetch_en_trending_results)
+
         # Atualiza o cache com o novo dado fresquinho
         trending_cache.set(cache_key, data)
         return data

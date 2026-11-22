@@ -11,6 +11,12 @@ from app.tracking.models import UserListItem, UserEpisodeProgress
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.tmdb_client import tmdb_get_json
+from app.core.translator import (
+    is_non_latin,
+    resolve_overview_pt_br,
+    translate_batch_to_pt_br,
+    translate_to_pt_br,
+)
 
 async def sync_single_media_release(db: AsyncSession, media_id: str):
     """Fetches and updates release/episode data for a single media item."""
@@ -60,37 +66,94 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
                     if s_data:
                         from app.core.utils import get_server_today
                         today_str = get_server_today().strftime("%Y-%m-%d")
-                        for ep in s_data.get("episodes", []):
-                            ep_air_date = ep.get("air_date")
-                            if ep_air_date and ep_air_date >= today_str:
-                                try:
-                                    r_date = datetime.strptime(ep_air_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                                    e_num = ep.get("episode_number")
-                                    ep_title = ep.get("name") or f"Episódio {e_num}"
-                                    ep_desc = ep.get("overview", "")
-                                    
-                                    new_release = MediaRelease(
-                                        media_id=media.id,
-                                        title=f"T{s_num}E{e_num} - {ep_title}",
-                                        description=ep_desc,
-                                        release_date=r_date,
-                                        season_number=s_num,
-                                        episode_number=e_num
+                        upcoming_eps = [
+                            ep for ep in s_data.get("episodes", [])
+                            if ep.get("air_date") and ep.get("air_date") >= today_str
+                        ]
+                        missing_ep_nums = [
+                            ep.get("episode_number")
+                            for ep in upcoming_eps
+                            if not (ep.get("overview") or "").strip() or is_non_latin(ep.get("overview", ""))
+                        ]
+                        en_eps_by_num = {}
+                        if missing_ep_nums:
+                            en_s_data = await tmdb_get_json(
+                                f"/tv/{media.tmdb_id}/season/{s_num}",
+                                params={"language": "en-US"},
+                                timeout=12.0,
+                            )
+                            if en_s_data:
+                                raw_en_by_num = {
+                                    e.get("episode_number"): (e.get("overview") or "").strip()
+                                    for e in en_s_data.get("episodes", [])
+                                    if e.get("episode_number") is not None and (e.get("overview") or "").strip()
+                                }
+                                to_translate = [
+                                    (num, raw_en_by_num[num])
+                                    for num in missing_ep_nums
+                                    if num in raw_en_by_num
+                                ]
+                                if to_translate:
+                                    translated_ovs = await translate_batch_to_pt_br(
+                                        [(txt, "en") for _, txt in to_translate]
                                     )
-                                    db.add(new_release)
-                                    synced_season_episodes = True
-                                except ValueError:
-                                    pass
+                                    for (num, _), tr_ov in zip(to_translate, translated_ovs):
+                                        en_eps_by_num[num] = tr_ov
+
+                        for ep in upcoming_eps:
+                            ep_air_date = ep.get("air_date")
+                            try:
+                                r_date = datetime.strptime(ep_air_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                                e_num = ep.get("episode_number")
+                                ep_title = ep.get("name") or f"Episódio {e_num}"
+                                ep_desc = (ep.get("overview") or "").strip()
+                                if (not ep_desc or is_non_latin(ep_desc)) and e_num in en_eps_by_num:
+                                    ep_desc = en_eps_by_num[e_num]
+
+                                new_release = MediaRelease(
+                                    media_id=media.id,
+                                    title=f"T{s_num}E{e_num} - {ep_title}",
+                                    description=ep_desc,
+                                    release_date=r_date,
+                                    season_number=s_num,
+                                    episode_number=e_num
+                                )
+                                db.add(new_release)
+                                synced_season_episodes = True
+                            except ValueError:
+                                pass
 
                 # Fallback de segurança se a busca da temporada não trouxer episódios futuros
                 if not synced_season_episodes and next_episode and next_episode.get("air_date"):
                     try:
                         r_date = datetime.strptime(next_episode.get("air_date"), "%Y-%m-%d").replace(tzinfo=timezone.utc)
                         ep_title = next_episode.get("name", "Novo Episodio")
-                        ep_desc = next_episode.get("overview", "")
+                        ep_desc = (next_episode.get("overview") or "").strip()
                         s_num = next_episode.get("season_number")
                         e_num = next_episode.get("episode_number")
-                        
+
+                        if (not ep_desc or is_non_latin(ep_desc)) and s_num is not None and e_num is not None:
+                            ep_detail = await tmdb_get_json(
+                                f"/tv/{media.tmdb_id}/season/{s_num}/episode/{e_num}",
+                                params={"language": "pt-BR", "append_to_response": "translations"},
+                                timeout=10.0,
+                            )
+                            ep_desc = await resolve_overview_pt_br(
+                                (ep_detail or {}).get("overview") or ep_desc,
+                                translations_payload=(ep_detail or {}).get("translations"),
+                                original_language=data.get("original_language"),
+                            )
+                            if not ep_desc:
+                                en_ep_detail = await tmdb_get_json(
+                                    f"/tv/{media.tmdb_id}/season/{s_num}/episode/{e_num}",
+                                    params={"language": "en-US"},
+                                    timeout=10.0,
+                                )
+                                if en_ep_detail and (en_ep_detail.get("overview") or "").strip():
+                                    ep_desc = await translate_to_pt_br(
+                                        en_ep_detail["overview"], source_lang="en"
+                                    )
+
                         new_release = MediaRelease(
                             media_id=media.id,
                             title=f"T{s_num}E{e_num} - {ep_title}",

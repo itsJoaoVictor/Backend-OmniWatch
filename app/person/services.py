@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from app.core.config import settings
 from app.core.cache import details_cache
 from app.core.tmdb_client import tmdb_request
+from app.core.translator import resolve_text_field_pt_br, translate_to_pt_br
 from app.person.schemas import PersonDetailsResponse, PersonCastItem, PersonDiscoverResponse
 from app.recommendation.orchestrator import GENRE_MAP
 from app.recommendation.matcher import calculate_match_score
@@ -38,12 +39,7 @@ async def fetch_person_details(person_id: int) -> PersonDetailsResponse:
     url = f"{settings.TMDB_BASE_URL}/person/{person_id}"
     params = {
         "language": "pt-BR",
-        "append_to_response": "combined_credits"
-    }
-
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {settings.TMDB_API_KEY}"
+        "append_to_response": "combined_credits,translations"
     }
 
     try:
@@ -63,6 +59,21 @@ async def fetch_person_details(person_id: int) -> PersonDetailsResponse:
             return PersonDetailsResponse(**cached_data)
         raise HTTPException(status_code=502, detail="Falha de conexão ao buscar detalhes.")
 
+    resolved_bio = await resolve_text_field_pt_br(
+        data.get("biography"),
+        field="biography",
+        translations_payload=data.get("translations"),
+    )
+    if not resolved_bio:
+        try:
+            en_resp = await tmdb_request(url, params={"language": "en-US"}, timeout=8.0)
+            if en_resp.status_code == 200:
+                en_bio = (en_resp.json().get("biography") or "").strip()
+                if en_bio:
+                    resolved_bio = await translate_to_pt_br(en_bio, source_lang="en")
+        except Exception:
+            pass
+
     cast_data = data.get("combined_credits", {}).get("cast", [])
     crew_data = data.get("combined_credits", {}).get("crew", [])
 
@@ -73,7 +84,11 @@ async def fetch_person_details(person_id: int) -> PersonDetailsResponse:
         media_type = c.get("media_type")
         if media_type not in ["movie", "tv"]:
             continue
-        title = c.get("title") if media_type == "movie" else c.get("name")
+        title = (
+            (c.get("title") or c.get("original_title"))
+            if media_type == "movie"
+            else (c.get("name") or c.get("original_name"))
+        )
         release = c.get("release_date") if media_type == "movie" else c.get("first_air_date")
 
         cast_list.append({
@@ -97,7 +112,11 @@ async def fetch_person_details(person_id: int) -> PersonDetailsResponse:
         media_type = c.get("media_type")
         if media_type not in ["movie", "tv"]:
             continue
-        title = c.get("title") if media_type == "movie" else c.get("name")
+        title = (
+            (c.get("title") or c.get("original_title"))
+            if media_type == "movie"
+            else (c.get("name") or c.get("original_name"))
+        )
         release = c.get("release_date") if media_type == "movie" else c.get("first_air_date")
 
         cast_list.append({
@@ -120,7 +139,7 @@ async def fetch_person_details(person_id: int) -> PersonDetailsResponse:
     response_data = {
         "id": data.get("id"),
         "name": data.get("name", ""),
-        "biography": data.get("biography", ""),
+        "biography": resolved_bio,
         "birthday": data.get("birthday"),
         "place_of_birth": data.get("place_of_birth"),
         "profile_path": data.get("profile_path"),

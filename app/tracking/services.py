@@ -321,7 +321,11 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate, 
                     if not genres and tmdb_data.genres:
                         genres = [{"id": g.id, "name": g.name} for g in tmdb_data.genres]
                     if not directors and tmdb_data.credits and tmdb_data.credits.crew:
-                        directors = [c.name for c in tmdb_data.credits.crew]
+                        directors = [
+                            c.name
+                            for c in tmdb_data.credits.crew
+                            if getattr(c, "job", "") in ("Director", "Creator", "Series Director")
+                        ]
                     if not main_cast and tmdb_data.credits and tmdb_data.credits.cast:
                         main_cast = [c.name for c in tmdb_data.credits.cast]
                     if hasattr(tmdb_data, 'keywords') and tmdb_data.keywords:
@@ -345,7 +349,11 @@ async def add_to_list(db: AsyncSession, user_id: str, item: UserListItemCreate, 
                     if not genres and tmdb_data.genres:
                         genres = [{"id": g.id, "name": g.name} for g in tmdb_data.genres]
                     if not directors and tmdb_data.credits and tmdb_data.credits.crew:
-                        directors = [c.name for c in tmdb_data.credits.crew]
+                        directors = [
+                            c.name
+                            for c in tmdb_data.credits.crew
+                            if getattr(c, "job", "") in ("Director", "Creator", "Series Director")
+                        ]
                     if not main_cast and tmdb_data.credits and tmdb_data.credits.cast:
                         main_cast = [c.name for c in tmdb_data.credits.cast]
                     if hasattr(tmdb_data, 'keywords') and tmdb_data.keywords:

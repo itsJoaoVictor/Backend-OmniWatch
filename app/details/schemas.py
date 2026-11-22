@@ -83,6 +83,8 @@ class MovieDetailsResponse(BaseModel):
     release_date: str
     status: str
     runtime: int
+    budget: int = 0
+    revenue: int = 0
     vote_average: float
     vote_count: int = 0
     genres: List[GenreItem]

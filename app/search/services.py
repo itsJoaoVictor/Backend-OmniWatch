@@ -3,6 +3,7 @@ from fastapi import HTTPException
 from app.core.config import settings
 from app.core.cache import search_cache
 from app.core.tmdb_client import tmdb_request
+from app.core.translator import localize_tmdb_list_items_pt_br
 from app.search.schemas import SearchMultiResponse, SearchItem
 import urllib.parse
 
@@ -39,8 +40,18 @@ async def fetch_search_multi(query: str, page: int = 1) -> SearchMultiResponse:
             return SearchMultiResponse(**cached_data)
         raise HTTPException(status_code=502, detail="Failed to fetch search data from upstream provider.")
 
+    raw_results = data.get("results", [])
+
+    async def _fetch_en_search_results():
+        en_resp = await tmdb_request(url, params={**params, "language": "en-US"}, timeout=8.0)
+        if en_resp.status_code == 200:
+            return en_resp.json().get("results", [])
+        return []
+
+    await localize_tmdb_list_items_pt_br(raw_results, _fetch_en_search_results)
+
     normalized_results = []
-    for item in data.get("results", []):
+    for item in raw_results:
         media_type = item.get("media_type")
         
         if media_type == "movie":
