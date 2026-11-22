@@ -49,3 +49,5 @@ details_cache = SimpleTTLCache(ttl_seconds=86400) # 24 hours (aumentado para evi
 tv_status_cache = SimpleTTLCache(ttl_seconds=86400) # 24 hours para status de episódios da Minha Lista
 stats_cache = SimpleTTLCache(ttl_seconds=300) # 5 minutos para estatísticas do usuário
 recommendations_seen_cache = SimpleTTLCache(ttl_seconds=30) # 30 segundos para seen_ids do usuário
+match_breakdown_cache = SimpleTTLCache(ttl_seconds=900) # 15 minutos para snapshot do Raio-X por usuário/obra
+match_insight_cache = SimpleTTLCache(ttl_seconds=86400) # 24 horas para texto editorial gerado por IA no Raio-X

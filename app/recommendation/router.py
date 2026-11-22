@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, BackgroundTa
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Any, Dict, Optional
 from app.core.database import get_db
-from app.core.cache import SimpleTTLCache, recommendations_seen_cache
+from app.core.cache import SimpleTTLCache, recommendations_seen_cache, match_breakdown_cache
 from app.auth.dependencies import get_current_user_id
 from app.users.models import User
 from app.recommendation.orchestrator import (
@@ -15,6 +15,7 @@ from app.recommendation.orchestrator import (
     build_candidate_vector,
 )
 from app.recommendation.matcher import calculate_match_score, compute_omnimatch_score
+from app.recommendation.insight_service import generate_match_editorial_insight
 from app.recommendation.vector_builder import WEIGHTS, normalize_genre_to_canonical
 from app.details.services import fetch_movie_details, fetch_tv_details
 
@@ -489,30 +490,25 @@ async def refresh_explore_batch_endpoint(
         raise HTTPException(status_code=500, detail="Erro ao gerar novas sugestões.")
 
 
-@router.get("/score/{media_type}/{tmdb_id}")
-async def get_item_score(
-    media_type: str = Path(...),
-    tmdb_id: int = Path(...),
-    current_user_id: str = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db)
+async def _compute_item_score_bundle(
+    media_type: str,
+    tmdb_id: int,
+    current_user_id: str,
+    db: AsyncSession,
 ):
-    """
-    Calculates the match score for a specific item on the details page.
-    Includes genres, cast, crew, keywords (Fase 1) and original_language (Fase 2).
-    """
     from sqlalchemy.future import select
     user_result = await db.execute(select(User).where(User.id == current_user_id))
     user = user_result.scalars().first()
-    
+
     if not user or not user.feature_vector:
-        return {"match_score": 0, "match_tags": [], "breakdown": None}
-        
+        return {"match_score": 0, "match_tags": [], "breakdown": None}, None
+
     try:
         if media_type == "movie":
             tmdb_data = await fetch_movie_details(tmdb_id)
         else:
             tmdb_data = await fetch_tv_details(tmdb_id)
-            
+
         candidate_obj = {
             "id": tmdb_id,
             "title": getattr(tmdb_data, "title", None) or getattr(tmdb_data, "name", "Mídia"),
@@ -527,7 +523,7 @@ async def get_item_score(
             "original_language": getattr(tmdb_data, "original_language", "") or "",
         }
         candidate_vector = build_candidate_vector(candidate_obj)
-                    
+
         # Check if we have local embedding
         from app.media.models import Media as MediaModel
         local_media = await db.execute(select(MediaModel).where(MediaModel.tmdb_id == tmdb_id, MediaModel.media_type == media_type))
@@ -594,15 +590,87 @@ async def get_item_score(
                     breakdown.setdefault("restraints", []).insert(0, cal_item)
                     breakdown["restraints"] = breakdown["restraints"][:4]
 
-        return {
+        payload = {
             "match_score": final_score,
             "match_tags": omni["match_tags"],
             "is_preliminary": omni.get("is_preliminary", False),
             "breakdown": breakdown,
         }
-    except Exception as e:
+        snapshot = (
+            {
+                "title": candidate_obj["title"],
+                "overview": getattr(tmdb_data, "overview", "") or "",
+                "media_type": media_type,
+                "genres": candidate_obj["genres"],
+                "breakdown": breakdown,
+            }
+            if breakdown is not None
+            else None
+        )
+        return payload, snapshot
+    except Exception:
         # Ignore errors if TMDB fetch fails
-        return {"match_score": 0, "match_tags": [], "breakdown": None}
+        return {"match_score": 0, "match_tags": [], "breakdown": None}, None
+
+
+@router.get("/score/{media_type}/{tmdb_id}")
+async def get_item_score(
+    media_type: str = Path(...),
+    tmdb_id: int = Path(...),
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Calculates the match score for a specific item on the details page.
+    Includes genres, cast, crew, keywords (Fase 1) and original_language (Fase 2).
+    """
+    payload, snapshot = await _compute_item_score_bundle(
+        media_type=media_type,
+        tmdb_id=tmdb_id,
+        current_user_id=current_user_id,
+        db=db,
+    )
+    if snapshot and snapshot.get("breakdown"):
+        cache_key = f"{current_user_id}:{media_type}:{tmdb_id}"
+        match_breakdown_cache.set(cache_key, snapshot)
+    return payload
+
+
+@router.get("/score/{media_type}/{tmdb_id}/insight")
+async def get_item_score_insight(
+    media_type: str = Path(...),
+    tmdb_id: int = Path(...),
+    current_user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Gera sob demanda (apenas ao abrir o Raio-X) e com cache TTL de 24h
+    um parágrafo editorial curto explicando a compatibilidade com a obra.
+    """
+    cache_key = f"{current_user_id}:{media_type}:{tmdb_id}"
+    snapshot, is_stale = match_breakdown_cache.get_with_status(cache_key)
+    if snapshot is None or is_stale or not snapshot.get("breakdown"):
+        _, snapshot = await _compute_item_score_bundle(
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            current_user_id=current_user_id,
+            db=db,
+        )
+        if snapshot and snapshot.get("breakdown"):
+            match_breakdown_cache.set(cache_key, snapshot)
+
+    if not snapshot or not snapshot.get("breakdown"):
+        return {"insight": None, "source": "unavailable", "cached": False}
+
+    return await generate_match_editorial_insight(
+        user_id=current_user_id,
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+        title=snapshot["title"],
+        overview=snapshot["overview"],
+        genres=snapshot["genres"],
+        breakdown=snapshot["breakdown"],
+    )
 
 @router.post("/visit/{media_type}/{tmdb_id}")
 async def record_visit(
