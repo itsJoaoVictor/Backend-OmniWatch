@@ -505,7 +505,7 @@ async def get_item_score(
     user = user_result.scalars().first()
     
     if not user or not user.feature_vector:
-        return {"match_score": 0, "match_tags": []}
+        return {"match_score": 0, "match_tags": [], "breakdown": None}
         
     try:
         if media_type == "movie":
@@ -554,9 +554,11 @@ async def get_item_score(
             user_item_count=len(user_list),
             candidate=candidate_obj,
             user_items=user_list,
+            include_breakdown=True,
         )
 
         final_score = omni["match_score"]
+        breakdown = omni.get("breakdown")
         try:
             from app.recommendation.ranker import LightGBMRanker
             lgbm_ranker = LightGBMRanker()
@@ -572,14 +574,31 @@ async def get_item_score(
         except Exception:
             pass
 
+        if breakdown is not None and final_score != omni["match_score"]:
+            diff = round(float(final_score) - float(omni["match_score"]), 1)
+            breakdown["score"] = final_score
+            if abs(diff) >= 0.5:
+                cal_item = {
+                    "key": "behavioral_calibration",
+                    "label": "Calibração comportamental",
+                    "detail": "Ajuste fino baseado nos padrões de interação do seu perfil.",
+                    "delta": diff,
+                }
+                if diff > 0:
+                    breakdown.setdefault("boosts", []).append(cal_item)
+                else:
+                    breakdown.setdefault("restraints", []).insert(0, cal_item)
+                    breakdown["restraints"] = breakdown["restraints"][:4]
+
         return {
             "match_score": final_score,
             "match_tags": omni["match_tags"],
             "is_preliminary": omni.get("is_preliminary", False),
+            "breakdown": breakdown,
         }
     except Exception as e:
         # Ignore errors if TMDB fetch fails
-        return {"match_score": 0, "match_tags": []}
+        return {"match_score": 0, "match_tags": [], "breakdown": None}
 
 @router.post("/visit/{media_type}/{tmdb_id}")
 async def record_visit(
