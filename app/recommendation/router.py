@@ -577,6 +577,10 @@ async def get_item_score(
         if breakdown is not None and final_score != omni["match_score"]:
             diff = round(float(final_score) - float(omni["match_score"]), 1)
             breakdown["score"] = final_score
+            breakdown["net_adjustment"] = round(
+                float(final_score) - float(breakdown.get("base_score", omni["match_score"])),
+                1,
+            )
             if abs(diff) >= 0.5:
                 cal_item = {
                     "key": "behavioral_calibration",

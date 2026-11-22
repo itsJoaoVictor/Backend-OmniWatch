@@ -177,6 +177,8 @@ def _calculate_match_score_detailed(
             if clean_kw in CURATED_KEYWORDS_MAP:
                 curated = CURATED_KEYWORDS_MAP[clean_kw]
                 theme_label = curated.split(" ", 1)[1].strip() if " " in curated else curated
+            elif clean_kw in BREAKDOWN_KEYWORD_PT_MAP:
+                theme_label = BREAKDOWN_KEYWORD_PT_MAP[clean_kw]
             else:
                 theme_label = clean_kw.title()
             if theme_label and theme_label not in seen_themes:
@@ -462,6 +464,14 @@ def compute_omnimatch_score(
         else:
             phi = aff_score
 
+    base_score = round(max(0.0, min(100.0, phi)), 1)
+    base_source_label = "Base do perfil geral"
+    if matched_persona:
+        from app.recommendation.cluster_manager import is_valid_persona_name
+        p_name = (matched_persona.get("name") or "").strip()
+        if p_name and is_valid_persona_name(p_name):
+            base_source_label = f"Base da faceta {p_name}"
+
     boosts: List[Dict[str, Any]] = []
     restraints: List[Dict[str, Any]] = []
 
@@ -639,6 +649,7 @@ def compute_omnimatch_score(
                 })
 
     final_score = round(max(0.0, min(100.0, phi)), 1)
+    net_adjustment = round(final_score - base_score, 1)
 
     result: Dict[str, Any] = {
         "match_score": final_score,
@@ -679,6 +690,14 @@ def compute_omnimatch_score(
                     "detail": "Nenhum ator ou diretor principal desta obra aparece com destaque no seu histórico.",
                     "delta": None,
                 })
+            elif talent_detail["percent"] < 45:
+                restraints.append({
+                    "key": "low_talent",
+                    "label": "Elenco com baixa recorrência",
+                    "detail": f"Apenas conexões pontuais de elenco e direção no seu histórico ({talent_detail['percent']}%).",
+                    "delta": None,
+                })
+
             if themes_detail["is_prior"]:
                 restraints.append({
                     "key": "new_themes",
@@ -686,6 +705,14 @@ def compute_omnimatch_score(
                     "detail": "As palavras-chave temáticas desta obra ainda não têm histórico forte na sua lista.",
                     "delta": None,
                 })
+            elif themes_detail["percent"] < 45:
+                restraints.append({
+                    "key": "low_themes",
+                    "label": "Temas com baixa recorrência",
+                    "detail": f"Pouca sobreposição temática com seus títulos mais frequentes ({themes_detail['percent']}%).",
+                    "delta": None,
+                })
+
             if genres_detail["unmatched_items"] and genres_detail["percent"] < 75:
                 unmatched_str = ", ".join(genres_detail["unmatched_items"][:2])
                 restraints.append({
@@ -694,11 +721,27 @@ def compute_omnimatch_score(
                     "detail": f"Gêneros como {unmatched_str} têm pouco peso no seu perfil atual.",
                     "delta": None,
                 })
+            elif not genres_detail["is_prior"] and genres_detail["percent"] < 55:
+                restraints.append({
+                    "key": "moderate_genres",
+                    "label": "Gêneros secundários no perfil",
+                    "detail": f"Esses gêneros ocupam uma parcela menor do seu histórico ({genres_detail['percent']}%).",
+                    "delta": None,
+                })
+
             if used_sem_score is not None and used_sem_score < 65.0:
                 restraints.append({
                     "key": "semantic_gap",
                     "label": "Atmosfera parcialmente diferente",
                     "detail": "O tom narrativo se distancia um pouco das obras centrais do seu gosto.",
+                    "delta": None,
+                })
+
+            if not restraints and final_score < 88.0 and used_sem_score is not None and used_sem_score < 82.0:
+                restraints.append({
+                    "key": "semantic_moderate",
+                    "label": "Atmosfera abaixo do pico central",
+                    "detail": f"Boa sintonia narrativa ({round(used_sem_score)}%), mas um pouco distante das suas obras mais centrais.",
                     "delta": None,
                 })
 
@@ -713,6 +756,9 @@ def compute_omnimatch_score(
 
         result["breakdown"] = {
             "score": final_score,
+            "base_score": base_score,
+            "base_source_label": base_source_label,
+            "net_adjustment": net_adjustment,
             "tier_label": tier_label,
             "summary": summary,
             "is_preliminary": is_preliminary,
@@ -765,6 +811,101 @@ CURATED_KEYWORDS_MAP: Dict[str, str] = {
     "based on true story": "📰 Baseado em Fatos Reais",
     "biography": "📜 História Real",
     "sports": "🏆 Superação no Esporte",
+}
+
+BREAKDOWN_KEYWORD_PT_MAP: Dict[str, str] = {
+    "anime": "Anime",
+    "based on manga": "Baseado em Mangá",
+    "manga": "Mangá",
+    "slice of life": "Cotidiano",
+    "seinen": "Seinen",
+    "shonen": "Shonen",
+    "shounen": "Shonen",
+    "shoujo": "Shoujo",
+    "josei": "Josei",
+    "isekai": "Isekai",
+    "mecha": "Mecha",
+    "rivalry": "Rivalidade",
+    "cooking": "Gastronomia",
+    "food": "Gastronomia",
+    "chef": "Culinária",
+    "restaurant": "Restaurante",
+    "friendship": "Amizade",
+    "high school": "Vida Escolar",
+    "school": "Vida Escolar",
+    "school life": "Vida Escolar",
+    "martial arts": "Artes Marciais",
+    "sword fight": "Luta de Espadas",
+    "swordplay": "Luta de Espadas",
+    "samurai": "Samurai",
+    "ninja": "Ninja",
+    "demon": "Demônios",
+    "monster": "Monstros",
+    "supernatural": "Sobrenatural",
+    "supernatural power": "Superpoderes",
+    "super power": "Superpoderes",
+    "family": "Relações Familiares",
+    "family relationships": "Relações Familiares",
+    "romantic comedy": "Comédia Romântica",
+    "romance": "Romance",
+    "love triangle": "Triângulo Amoroso",
+    "workplace": "Ambiente de Trabalho",
+    "politics": "Política",
+    "war": "Guerra",
+    "military": "Militar",
+    "historical": "Histórico",
+    "crime": "Crime",
+    "organized crime": "Crime Organizado",
+    "gangster": "Máfia",
+    "mafia": "Máfia",
+    "police": "Policial",
+    "prison": "Prisão",
+    "mystery": "Mistério",
+    "thriller": "Suspense",
+    "horror": "Terror",
+    "gore": "Violência Explícita",
+    "slasher": "Slasher",
+    "ghost": "Fantasmas",
+    "apocalypse": "Apocalipse",
+    "time loop": "Loop Temporal",
+    "multiverse": "Multiverso",
+    "parallel universe": "Universo Paralelo",
+    "virtual reality": "Realidade Virtual",
+    "video game": "Videogames",
+    "music": "Música",
+    "band": "Banda & Música",
+    "art": "Arte",
+    "painting": "Arte & Pintura",
+    "redemption": "Redenção",
+    "grief": "Luto & Superação",
+    "mental health": "Saúde Mental",
+    "adolescence": "Adolescência",
+    "teenager": "Juventude",
+    "underdog": "Superação",
+    "tournament": "Torneio",
+    "competition": "Competição",
+    "based on light novel": "Baseado em Light Novel",
+    "based on video game": "Baseado em Jogo",
+    "based on comic book": "Baseado em HQ",
+    "based on play or musical": "Baseado em Peça",
+    "based on short story": "Baseado em Conto",
+    "adult animation": "Animação Adulta",
+    "sitcom": "Sitcom",
+    "anthology": "Antologia",
+    "miniseries": "Minissérie",
+    "buddy cop": "Dupla Policial",
+    "anti hero": "Anti-Herói",
+    "villain": "Vilões",
+    "chosen one": "O Escolhido",
+    "found family": "Família Escolhida",
+    "road trip": "Viagem na Estrada",
+    "survival horror": "Terror de Sobrevivência",
+    "dark fantasy": "Fantasia Sombria",
+    "epic": "Épico",
+    "period drama": "Drama de Época",
+    "small town": "Cidade Pequena",
+    "secret identity": "Identidade Secreta",
+    "double life": "Vida Dupla",
 }
 
 NICHE_LANGUAGE_MAP: Dict[str, str] = {
@@ -969,6 +1110,16 @@ def find_top_anchor_matches(
         if not _is_anchor_genre_coherent(m_obj, cand_genres_canon, sim):
             continue
 
+        shared_genres: List[str] = []
+        if m_obj is not None and cand_genres_canon:
+            from app.recommendation.vector_builder import normalize_genre_to_canonical
+            item_genres_canon = set()
+            for g in getattr(m_obj, "genres", []) or []:
+                for c_g in normalize_genre_to_canonical(g):
+                    item_genres_canon.add(c_g)
+            if item_genres_canon:
+                shared_genres = [g.title() for g in sorted(cand_genres_canon & item_genres_canon)[:2]]
+
         seen_keys.add(item_key)
         fav_mult = 1.12 if is_fav else 1.0
         rewatch_mult = (
@@ -991,11 +1142,20 @@ def find_top_anchor_matches(
                 "rewatch_count": rewatch_cnt,
                 "ep_rewatches": ep_rewatches,
                 "reason_label": _format_anchor_reason(is_fav, rewatch_cnt, ep_rewatches, rating, status),
+                "shared_genres": shared_genres,
+                "priority_note": None,
             },
         ))
 
     scored_anchors.sort(key=lambda x: x[0], reverse=True)
-    return [anchor for _, anchor in scored_anchors[:limit]]
+    top_anchors = [anchor for _, anchor in scored_anchors[:limit]]
+    for i, anchor in enumerate(top_anchors):
+        if anchor["is_favorite"] or anchor["rewatch_count"] > 0:
+            if any(top_anchors[j]["similarity"] > anchor["similarity"] for j in range(i + 1, len(top_anchors))):
+                anchor["priority_note"] = (
+                    "Maior peso (favorito)" if anchor["is_favorite"] else "Maior peso (reassistido)"
+                )
+    return top_anchors
 
 
 def _status_from_percent(percent: int, strong_threshold: int = 70) -> str:
@@ -1027,6 +1187,8 @@ def _build_breakdown_pillars(
             "label": "Atmosfera & Trama",
             "percent": sem_pct,
             "status": _status_from_percent(sem_pct),
+            "impact": "high",
+            "impact_label": "Alto impacto",
             "description": sem_desc,
             "chips": [],
         })
@@ -1048,6 +1210,8 @@ def _build_breakdown_pillars(
         "label": "Gêneros",
         "percent": g_pct,
         "status": _status_from_percent(g_pct),
+        "impact": "high",
+        "impact_label": "Alto impacto",
         "description": g_desc,
         "chips": g_chips,
     })
@@ -1060,12 +1224,17 @@ def _build_breakdown_pillars(
         th_desc = "Temas ainda novos ou sem peso forte no seu histórico."
     else:
         th_status = _status_from_percent(th_pct)
-        th_desc = f"Reúne temas recorrentes no seu perfil ({', '.join(th_chips[:3])})."
+        if th_pct < 50:
+            th_desc = f"Alguns temas em comum com o seu histórico ({', '.join(th_chips[:3])})."
+        else:
+            th_desc = f"Reúne temas recorrentes no seu perfil ({', '.join(th_chips[:3])})."
     pillars.append({
         "key": "themes",
         "label": "Temas & Vibe",
         "percent": th_pct,
         "status": th_status,
+        "impact": "medium",
+        "impact_label": "Médio impacto",
         "description": th_desc,
         "chips": th_chips,
     })
@@ -1078,7 +1247,9 @@ def _build_breakdown_pillars(
         t_desc = "Elenco e direção sem nomes recorrentes no seu histórico."
     else:
         t_status = _status_from_percent(t_pct)
-        if t_detail["matched_directors"] and t_detail["matched_cast"]:
+        if t_pct < 50:
+            t_desc = f"Participação pontual de nomes já vistos no seu histórico ({', '.join(t_chips[:2])})."
+        elif t_detail["matched_directors"] and t_detail["matched_cast"]:
             t_desc = f"Direção e elenco que você acompanha ({', '.join(t_chips[:2])})."
         elif t_detail["matched_directors"]:
             t_desc = f"Direção conhecida do seu perfil ({t_detail['matched_directors'][0]})."
@@ -1089,6 +1260,8 @@ def _build_breakdown_pillars(
         "label": "Elenco & Direção",
         "percent": t_pct,
         "status": t_status,
+        "impact": "medium",
+        "impact_label": "Médio impacto",
         "description": t_desc,
         "chips": t_chips,
     })
@@ -1110,6 +1283,8 @@ def _build_breakdown_pillars(
         "label": "Origem & Idioma",
         "percent": l_pct,
         "status": _status_from_percent(l_pct),
+        "impact": "low",
+        "impact_label": "Baixo impacto",
         "description": l_desc,
         "chips": [lang_label] if lang_label else [],
     })
@@ -1127,6 +1302,8 @@ def _build_breakdown_pillars(
         "label": "Formato",
         "percent": f_pct,
         "status": _status_from_percent(f_pct, strong_threshold=60),
+        "impact": "low",
+        "impact_label": "Baixo impacto",
         "description": f_desc,
         "chips": [f_label],
     })
@@ -1163,10 +1340,21 @@ def _build_match_verdict(
         "language": "origem cultural",
         "format": "formato",
     }
+    importance_weights = {
+        "semantic": 1.45,
+        "genres": 1.30,
+        "themes": 1.00,
+        "talent": 0.95,
+        "language": 0.55,
+    }
     strong_pillars = [
         pillar_names[p["key"]]
-        for p in sorted(pillars, key=lambda x: x["percent"], reverse=True)
-        if p["key"] in pillar_names and p["status"] == "strong" and p["key"] != "format"
+        for p in sorted(
+            pillars,
+            key=lambda x: x["percent"] * importance_weights.get(x["key"], 0.5),
+            reverse=True,
+        )
+        if p["key"] in importance_weights and p["status"] == "strong"
     ]
 
     if strong_pillars:
@@ -1183,8 +1371,12 @@ def _build_match_verdict(
         top_restraint = restraints[0]
         if top_restraint["key"] == "new_talent":
             tail = ", equilibrada por elenco e direção ainda inéditos para você."
+        elif top_restraint["key"] == "low_talent":
+            tail = ", equilibrada por pouca recorrência no elenco e direção."
         elif top_restraint["key"] == "new_themes":
             tail = ", equilibrada por temas pouco explorados no seu perfil."
+        elif top_restraint["key"] == "low_themes":
+            tail = ", equilibrada por baixa recorrência temática."
         elif top_restraint["key"] == "cold_start":
             tail = ", suavizada enquanto seu perfil ganha mais títulos."
         elif top_restraint["key"] == "anti_bomb_gate":
