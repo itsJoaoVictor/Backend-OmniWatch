@@ -454,6 +454,38 @@ def _should_merge_universes(
     return intersection >= 2 and overlap >= 0.50
 
 
+def _is_suggestion_covered_by_followed(
+    followed_pairs: Set[Tuple[int, str]],
+    followed_key: str,
+    sugg_pairs: Set[Tuple[int, str]],
+    sugg_key: str,
+) -> bool:
+    """
+    Verifica se uma sugestão já está coberta por um universo seguido pelo usuário.
+    Diferente do merge simétrico entre sugestões, exige que uma fração relevante da
+    própria *sugestão* já pertença ao universo seguido, evitando que um sub-universo
+    seguido pequeno absorva acidentalmente um universo maior (ex.: MCU).
+    """
+    if followed_key == sugg_key:
+        return True
+    if not followed_pairs or not sugg_pairs:
+        return False
+
+    intersection = len(followed_pairs & sugg_pairs)
+    if intersection < 2:
+        return False
+
+    sugg_coverage = intersection / len(sugg_pairs)
+    is_cross_source = (
+        (followed_key.startswith("Q") and sugg_key.startswith("kw:"))
+        or (sugg_key.startswith("Q") and followed_key.startswith("kw:"))
+    )
+    if is_cross_source:
+        return (intersection >= 3 and sugg_coverage >= 0.35) or (intersection >= 2 and sugg_coverage >= 0.50)
+
+    return intersection >= 2 and sugg_coverage >= 0.50
+
+
 def _canonical_rank(ukey: str, member_count: int, is_followed: bool = False) -> Tuple[int, int, int, str]:
     """
     Critério de escolha do universo canônico em um cluster:
@@ -1001,7 +1033,9 @@ async def _consolidate_user_universe_suggestions(
         matched_followed: Optional[Universe] = None
         for u, u_pairs in followed_pairs_map:
             u_all_keys = {u.universe_key, *(u.source_keys or [])}
-            if (sugg_all_keys & u_all_keys) or _should_merge_universes(u_pairs, u.universe_key, sugg_pairs, ukey):
+            if (sugg_all_keys & u_all_keys) or _is_suggestion_covered_by_followed(
+                u_pairs, u.universe_key, sugg_pairs, ukey
+            ):
                 matched_followed = u
                 break
 
@@ -1332,7 +1366,7 @@ async def generate_user_universe_suggestions(
         enriched_pairs = _extract_member_pairs_from_json(enriched_members)
         matched_followed_u: Optional[Universe] = None
         for fu, fu_pairs in followed_pairs_by_universe:
-            if _should_merge_universes(fu_pairs, fu.universe_key, enriched_pairs, ukey):
+            if _is_suggestion_covered_by_followed(fu_pairs, fu.universe_key, enriched_pairs, ukey):
                 matched_followed_u = fu
                 break
 
@@ -1802,6 +1836,47 @@ async def _discover_single_universe_by_key(
             if isinstance(res_item, dict):
                 for pair, info in res_item.items():
                     cand["members"][pair] = _merge_member_entry(cand["members"].get(pair), info)
+
+    # Auto-descoberta de Keyword equivalente no TMDB para universos Wikidata sem alias kw: ainda
+    # (recupera automaticamente séries/filmes que o Wikidata não vinculou ao QID, ex: MCU kw:180547)
+    if universe_key.startswith("Q") and not secondary_kw_ids and len(cand["members"]) >= 2:
+        sample_pairs = list(cand["members"].keys())[:3]
+        kw_resps = await asyncio.gather(
+            *(tmdb_client._get(f"/{mtype}/{tid}/keywords") for tid, mtype in sample_pairs),
+            return_exceptions=True,
+        )
+        candidate_kw_ids: List[int] = []
+        for resp in kw_resps:
+            if not isinstance(resp, dict):
+                continue
+            for kw in (resp.get("keywords") or resp.get("results") or []):
+                kw_id = kw.get("id")
+                kw_lower = (kw.get("name") or "").strip().lower()
+                if not kw_id or not kw_lower or kw_lower in GENERIC_TROPE_KEYWORDS:
+                    continue
+                if any(
+                    phrase in kw_lower
+                    for phrase in ("cinematic universe", "extended universe", "shared universe", "conjuring universe", "monsterverse")
+                ):
+                    if kw_id not in candidate_kw_ids:
+                        candidate_kw_ids.append(kw_id)
+
+        if candidate_kw_ids:
+            wd_pairs = set(cand["members"].keys())
+            for kw_id in candidate_kw_ids[:2]:
+                kw_members = await _fetch_tmdb_keyword_members(kw_id, max_pages=4)
+                kw_key = f"kw:{kw_id}"
+                if _should_merge_universes(wd_pairs, universe_key, set(kw_members.keys()), kw_key):
+                    cand["source_keys"] = _normalize_source_keys(
+                        universe_key,
+                        [*(cand.get("source_keys") or []), kw_key],
+                    )
+                    for pair, info in kw_members.items():
+                        cand["members"][pair] = _merge_member_entry(cand["members"].get(pair), info)
+                    logger.info(
+                        f"🔗 [Universes-AutoEnrich] Universo '{cand.get('name')}' ({universe_key}) "
+                        f"enriquecido automaticamente com {kw_key} -> {len(cand['members'])} obras."
+                    )
 
     enriched = await _enrich_universe_members(db, cand)
     cand["enriched_members"] = enriched
@@ -2773,6 +2848,10 @@ async def sync_universe_from_sources(
             new_items.append(u_item)
             universe.items.append(u_item)
 
+    universe.source_keys = _normalize_source_keys(
+        universe.universe_key,
+        [*(universe.source_keys or []), *(cand.get("source_keys") or [])],
+    )
     universe.items_count = len(members)
     universe.movies_count = sum(1 for x in members if x.get("media_type", "movie") == "movie")
     universe.tv_count = sum(1 for x in members if x.get("media_type") == "tv")
@@ -2790,7 +2869,10 @@ async def sync_universe_from_sources(
         sugg.movies_count = universe.movies_count
         sugg.tv_count = universe.tv_count
         sugg.collections_count = universe.collections_count
-        sugg.source_keys = _normalize_source_keys(universe.universe_key, universe.source_keys)
+        sugg.source_keys = _normalize_source_keys(
+            universe.universe_key,
+            [*(sugg.source_keys or []), *(universe.source_keys or [])],
+        )
 
     await db.commit()
 
