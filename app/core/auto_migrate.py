@@ -218,6 +218,10 @@ async def run_auto_migrations():
             await session.execute(text("""
                 CREATE INDEX IF NOT EXISTS ix_universes_universe_key ON universes (universe_key);
             """))
+            await session.execute(text("""
+                ALTER TABLE universes
+                ADD COLUMN IF NOT EXISTS source_keys JSONB NOT NULL DEFAULT '[]'::jsonb;
+            """))
 
             await session.execute(text("""
                 CREATE TABLE IF NOT EXISTS universe_items (
@@ -312,6 +316,10 @@ async def run_auto_migrations():
             """))
             await session.execute(text("""
                 CREATE INDEX IF NOT EXISTS ix_user_universe_suggestions_is_reactivated ON user_universe_suggestions (is_reactivated);
+            """))
+            await session.execute(text("""
+                ALTER TABLE user_universe_suggestions
+                ADD COLUMN IF NOT EXISTS source_keys JSONB NOT NULL DEFAULT '[]'::jsonb;
             """))
             await session.execute(text("""
                 CREATE TABLE IF NOT EXISTS user_universe_ignored_items (

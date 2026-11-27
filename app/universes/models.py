@@ -12,6 +12,7 @@ class Universe(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     universe_key = Column(String, unique=True, index=True, nullable=False)
+    source_keys = Column(JSON, default=list, nullable=False)
     name = Column(String, nullable=False)
     overview = Column(String, nullable=True)
     poster_path = Column(String, nullable=True)
@@ -74,6 +75,7 @@ class UserUniverseSuggestion(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     universe_key = Column(String, nullable=False, index=True)
+    source_keys = Column(JSON, default=list, nullable=False)
     name = Column(String, nullable=False)
     overview = Column(String, nullable=True)
     poster_path = Column(String, nullable=True)

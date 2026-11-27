@@ -3,7 +3,7 @@ import logging
 import httpx
 from uuid import UUID
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Set, Tuple
+from typing import List, Optional, Dict, Any, Set, Tuple, Iterable
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, or_
 from sqlalchemy.orm import selectinload
@@ -345,6 +345,259 @@ def _is_non_latin(s: str) -> bool:
 
 
 
+async def _fetch_tmdb_keyword_members(
+    kw_id: int,
+    max_pages: int = 4,
+) -> Dict[Tuple[int, str], Dict[str, Any]]:
+    """
+    Busca filmes e séries associados a uma keyword do TMDB com paginação controlada
+    (até `max_pages` páginas por tipo) para cobrir universos grandes sem cortar em 20 itens.
+    """
+    members: Dict[Tuple[int, str], Dict[str, Any]] = {}
+
+    def _ingest_results(results: List[Dict[str, Any]], media_type: str) -> None:
+        for item in results:
+            tid = item.get("id")
+            if not tid:
+                continue
+            if media_type == "movie":
+                title = item.get("title") or item.get("original_title") or f"Filme #{tid}"
+                release_date = item.get("release_date") or None
+            else:
+                title = item.get("name") or item.get("original_name") or f"Série #{tid}"
+                release_date = item.get("first_air_date") or None
+            if _check_is_recap(title, item.get("overview"), None, media_type):
+                continue
+            members[(tid, media_type)] = {
+                "tmdb_id": tid,
+                "media_type": media_type,
+                "title": title,
+                "release_date": release_date,
+                "poster_path": item.get("poster_path"),
+                "backdrop_path": item.get("backdrop_path"),
+            }
+
+    movies_p1, tv_p1 = await asyncio.gather(
+        tmdb_client._get("/discover/movie", params={"with_keywords": str(kw_id), "language": "pt-BR", "page": 1}),
+        tmdb_client._get("/discover/tv", params={"with_keywords": str(kw_id), "language": "pt-BR", "page": 1}),
+    )
+
+    extra_tasks: List[Tuple[str, Any]] = []
+    if movies_p1 and "results" in movies_p1:
+        _ingest_results(movies_p1["results"], "movie")
+        total_m_pages = min(int(movies_p1.get("total_pages") or 1), max_pages)
+        for p in range(2, total_m_pages + 1):
+            extra_tasks.append((
+                "movie",
+                tmdb_client._get("/discover/movie", params={"with_keywords": str(kw_id), "language": "pt-BR", "page": p}),
+            ))
+
+    if tv_p1 and "results" in tv_p1:
+        _ingest_results(tv_p1["results"], "tv")
+        total_t_pages = min(int(tv_p1.get("total_pages") or 1), max_pages)
+        for p in range(2, total_t_pages + 1):
+            extra_tasks.append((
+                "tv",
+                tmdb_client._get("/discover/tv", params={"with_keywords": str(kw_id), "language": "pt-BR", "page": p}),
+            ))
+
+    if extra_tasks:
+        extra_resps = await asyncio.gather(*(coro for _, coro in extra_tasks))
+        for (mtype, _), resp in zip(extra_tasks, extra_resps):
+            if resp and "results" in resp:
+                _ingest_results(resp["results"], mtype)
+
+    return members
+
+
+def _normalize_source_keys(primary_key: str, extra_keys: Optional[Iterable[str]] = None) -> List[str]:
+    """Normaliza, deduplica e ordena chaves secundárias (aliases) de um universo, excluindo a chave primária."""
+    cleaned: Set[str] = set()
+    for k in (extra_keys or []):
+        if isinstance(k, str):
+            ks = k.strip()
+            if ks and ks != primary_key:
+                cleaned.add(ks)
+    return sorted(cleaned)
+
+
+def _should_merge_universes(
+    pairs_a: Set[Tuple[int, str]],
+    key_a: str,
+    pairs_b: Set[Tuple[int, str]],
+    key_b: str,
+) -> bool:
+    """
+    Decide se dois universos representam a mesma franquia/universo com base na
+    sobreposição real de obras (Coeficiente de Sobreposição Szymkiewicz-Simpson),
+    sem depender de comparação de nomes.
+    """
+    if key_a == key_b:
+        return True
+    if not pairs_a or not pairs_b:
+        return False
+
+    intersection = len(pairs_a & pairs_b)
+    if intersection < 2:
+        return False
+
+    min_size = min(len(pairs_a), len(pairs_b))
+    overlap = intersection / min_size
+
+    is_cross_source = (
+        (key_a.startswith("Q") and key_b.startswith("kw:"))
+        or (key_b.startswith("Q") and key_a.startswith("kw:"))
+    )
+    if is_cross_source:
+        return (intersection >= 3 and overlap >= 0.35) or (intersection >= 2 and overlap >= 0.50)
+
+    return intersection >= 2 and overlap >= 0.50
+
+
+def _canonical_rank(ukey: str, member_count: int, is_followed: bool = False) -> Tuple[int, int, int, str]:
+    """
+    Critério de escolha do universo canônico em um cluster:
+    1. Universo já seguido pelo usuário
+    2. Fonte Wikidata (Q...) sobre TMDB Keyword (kw:...)
+    3. Maior número de obras
+    4. Desempate determinístico pela chave
+    """
+    return (
+        1 if is_followed else 0,
+        1 if ukey.startswith("Q") else 0,
+        member_count,
+        ukey,
+    )
+
+
+def _merge_member_entry(
+    existing: Optional[Dict[str, Any]],
+    incoming: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Combina metadados de uma mesma obra (tmdb_id, media_type) preservando os campos mais completos."""
+    if not existing:
+        return dict(incoming)
+    merged = dict(existing)
+    inc_title = incoming.get("title")
+    cur_title = merged.get("title")
+    if inc_title and (not cur_title or _is_non_latin(cur_title)) and not _is_non_latin(inc_title):
+        merged["title"] = inc_title
+    elif not cur_title and inc_title:
+        merged["title"] = inc_title
+
+    for field in ("release_date", "poster_path", "backdrop_path", "collection_name", "overview"):
+        if not merged.get(field) and incoming.get(field):
+            merged[field] = incoming[field]
+
+    if not merged.get("keywords_list") and incoming.get("keywords_list"):
+        merged["keywords_list"] = incoming["keywords_list"]
+    return merged
+
+
+def _merge_overlapping_candidates(
+    candidates: Dict[str, Dict[str, Any]],
+    followed_keys: Optional[Set[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Agrupa candidatos que representam o mesmo universo (por sobreposição real de obras
+    ou compartilhamento de source_keys) usando Union-Find e funde seus membros, coleções
+    e chaves secundárias em um único candidato canônico por cluster.
+    """
+    if len(candidates) <= 1:
+        for ukey, cand in candidates.items():
+            cand["source_keys"] = _normalize_source_keys(ukey, cand.get("source_keys"))
+        return candidates
+
+    keys = list(candidates.keys())
+    followed_set = followed_keys or set()
+    parent: Dict[str, str] = {k: k for k in keys}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    pairs_by_key: Dict[str, Set[Tuple[int, str]]] = {}
+    all_keys_by_cand: Dict[str, Set[str]] = {}
+    for k, cand in candidates.items():
+        members_dict = cand.get("members") or {}
+        pairs_by_key[k] = set(members_dict.keys())
+        all_keys_by_cand[k] = {k, *(_normalize_source_keys(k, cand.get("source_keys")))}
+
+    for i in range(len(keys)):
+        ki = keys[i]
+        for j in range(i + 1, len(keys)):
+            kj = keys[j]
+            if (all_keys_by_cand[ki] & all_keys_by_cand[kj]) or _should_merge_universes(
+                pairs_by_key[ki], ki, pairs_by_key[kj], kj
+            ):
+                union(ki, kj)
+
+    clusters: Dict[str, List[str]] = {}
+    for k in keys:
+        root = find(k)
+        clusters.setdefault(root, []).append(k)
+
+    merged_candidates: Dict[str, Dict[str, Any]] = {}
+    for cluster_keys in clusters.values():
+        if len(cluster_keys) == 1:
+            k = cluster_keys[0]
+            cand = candidates[k]
+            cand["source_keys"] = _normalize_source_keys(k, cand.get("source_keys"))
+            merged_candidates[k] = cand
+            continue
+
+        canonical_key = max(
+            cluster_keys,
+            key=lambda k: _canonical_rank(k, len(pairs_by_key[k]), is_followed=(k in followed_set)),
+        )
+        canonical = dict(candidates[canonical_key])
+        merged_members: Dict[Tuple[int, str], Dict[str, Any]] = {
+            pair: dict(info) for pair, info in (canonical.get("members") or {}).items()
+        }
+        merged_seeds: Set[Tuple[int, str]] = set(canonical.get("seed_matches") or set())
+        merged_cols: Set[int] = set(canonical.get("child_collection_ids") or set())
+        merged_types: Set[str] = set(canonical.get("u_types") or set())
+        absorbed_keys: Set[str] = set(canonical.get("source_keys") or [])
+
+        for other_key in cluster_keys:
+            if other_key == canonical_key:
+                continue
+            other = candidates[other_key]
+            absorbed_keys.add(other_key)
+            absorbed_keys.update(other.get("source_keys") or [])
+            merged_seeds.update(other.get("seed_matches") or set())
+            merged_cols.update(other.get("child_collection_ids") or set())
+            merged_types.update(other.get("u_types") or set())
+
+            for pair, info in (other.get("members") or {}).items():
+                merged_members[pair] = _merge_member_entry(merged_members.get(pair), info)
+
+            if not canonical.get("overview") and other.get("overview"):
+                canonical["overview"] = other["overview"]
+
+        canonical["universe_key"] = canonical_key
+        canonical["members"] = merged_members
+        canonical["seed_matches"] = merged_seeds
+        canonical["child_collection_ids"] = merged_cols
+        canonical["u_types"] = merged_types
+        canonical["source_keys"] = _normalize_source_keys(canonical_key, absorbed_keys)
+        merged_candidates[canonical_key] = canonical
+
+        logger.info(
+            f"🔗 [Universes-Merge] Cluster unido em '{canonical.get('name')}' ({canonical_key}) "
+            f"com aliases {canonical['source_keys']} -> {len(merged_members)} obras totais."
+        )
+
+    return merged_candidates
+
+
 async def _discover_keyword_universes_for_items(
     unresolved_items: List[Media],
     followed_keys: Set[str],
@@ -381,6 +634,7 @@ async def _discover_keyword_universes_for_items(
                     display_name = kw_name.title()
                     kw_candidates[ukey] = {
                         "universe_key": ukey,
+                        "source_keys": [],
                         "keyword_id": kw_id,
                         "name": display_name,
                         "overview": f"Universo compartilhado identificado pela tag '{display_name}' no TMDB.",
@@ -395,32 +649,7 @@ async def _discover_keyword_universes_for_items(
 
     for ukey, cand in list(kw_candidates.items()):
         kw_id = cand["keyword_id"]
-        movies_resp, tv_resp = await asyncio.gather(
-            tmdb_client._get("/discover/movie", params={"with_keywords": str(kw_id), "language": "pt-BR"}),
-            tmdb_client._get("/discover/tv", params={"with_keywords": str(kw_id), "language": "pt-BR"}),
-        )
-        if movies_resp and "results" in movies_resp:
-            for m in movies_resp["results"]:
-                if m.get("id"):
-                    cand["members"][(m["id"], "movie")] = {
-                        "tmdb_id": m["id"],
-                        "media_type": "movie",
-                        "title": m.get("title") or m.get("original_title") or f"Filme #{m['id']}",
-                        "release_date": m.get("release_date") or None,
-                        "poster_path": m.get("poster_path"),
-                        "backdrop_path": m.get("backdrop_path"),
-                    }
-        if tv_resp and "results" in tv_resp:
-            for t in tv_resp["results"]:
-                if t.get("id"):
-                    cand["members"][(t["id"], "tv")] = {
-                        "tmdb_id": t["id"],
-                        "media_type": "tv",
-                        "title": t.get("name") or t.get("original_name") or f"Série #{t['id']}",
-                        "release_date": t.get("first_air_date") or None,
-                        "poster_path": t.get("poster_path"),
-                        "backdrop_path": t.get("backdrop_path"),
-                    }
+        cand["members"] = await _fetch_tmdb_keyword_members(kw_id, max_pages=4)
 
     return kw_candidates
 
@@ -630,6 +859,278 @@ async def _enrich_universe_members(
     return cleaned_members
 
 
+def _extract_member_pairs_from_json(members: Optional[List[Dict[str, Any]]]) -> Set[Tuple[int, str]]:
+    pairs: Set[Tuple[int, str]] = set()
+    for m in (members or []):
+        tid = m.get("tmdb_id")
+        if tid:
+            pairs.add((int(tid), m.get("media_type", "movie")))
+    return pairs
+
+
+def _merge_enriched_member_lists(
+    lists: List[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Une listas de membros enriquecidos (dicts), deduplicando por (tmdb_id, media_type) e ordenando por data."""
+    merged: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for member_list in lists:
+        for m in (member_list or []):
+            tid = m.get("tmdb_id")
+            if not tid:
+                continue
+            mtype = m.get("media_type", "movie")
+            if _check_is_recap(
+                m.get("title", ""),
+                m.get("overview"),
+                m.get("keywords_list") or m.get("keywords"),
+                mtype,
+            ):
+                continue
+            pair = (int(tid), mtype)
+            merged[pair] = _merge_member_entry(merged.get(pair), m)
+
+    result = list(merged.values())
+    result.sort(key=lambda x: x.get("release_date") or "9999-12-31")
+    return result
+
+
+def _count_distinct_collections(members: List[Dict[str, Any]]) -> int:
+    cols = {
+        (m.get("collection_name") or "").strip().lower()
+        for m in members
+        if m.get("media_type", "movie") == "movie" and (m.get("collection_name") or "").strip()
+    }
+    return len(cols)
+
+
+async def _absorb_members_into_followed_universe(
+    db: AsyncSession,
+    universe: Universe,
+    incoming_key: str,
+    incoming_source_keys: Optional[Iterable[str]],
+    incoming_members: List[Dict[str, Any]],
+) -> bool:
+    """
+    Absorve uma chave secundária (alias) e eventuais obras faltantes em um Universo já seguido,
+    evitando que uma sugestão duplicada seja criada para o usuário.
+    """
+    changed = False
+    new_source_keys = _normalize_source_keys(
+        universe.universe_key,
+        [*(universe.source_keys or []), incoming_key, *(incoming_source_keys or [])],
+    )
+    if new_source_keys != (universe.source_keys or []):
+        universe.source_keys = new_source_keys
+        changed = True
+
+    existing_pairs = {(it.tmdb_id, it.media_type) for it in universe.items}
+    added_any = False
+    for m in incoming_members:
+        tid = m.get("tmdb_id")
+        if not tid:
+            continue
+        mtype = m.get("media_type", "movie")
+        pair = (int(tid), mtype)
+        if pair in existing_pairs:
+            continue
+        if _check_is_recap(m.get("title", ""), m.get("overview"), m.get("keywords_list") or m.get("keywords"), mtype):
+            continue
+        u_item = UniverseItem(
+            universe_id=universe.id,
+            tmdb_id=int(tid),
+            media_type=mtype,
+            title=m.get("title") or f"Item #{tid}",
+            release_date=m.get("release_date"),
+            poster_path=m.get("poster_path"),
+            backdrop_path=m.get("backdrop_path"),
+            collection_name=m.get("collection_name"),
+        )
+        db.add(u_item)
+        universe.items.append(u_item)
+        existing_pairs.add(pair)
+        added_any = True
+        changed = True
+
+    if added_any:
+        universe.items_count = len(universe.items)
+        universe.movies_count = sum(1 for it in universe.items if it.media_type == "movie")
+        universe.tv_count = sum(1 for it in universe.items if it.media_type == "tv")
+        distinct_cols = {
+            (it.collection_name or "").strip().lower()
+            for it in universe.items
+            if it.media_type == "movie" and (it.collection_name or "").strip()
+        }
+        universe.collections_count = max(universe.collections_count or 0, len(distinct_cols))
+        logger.info(
+            f"🔗 [Universes-Absorb] Universo seguido '{universe.name}' ({universe.universe_key}) "
+            f"absorveu '{incoming_key}' -> total agora: {universe.items_count} obras."
+        )
+
+    return changed
+
+
+async def _consolidate_user_universe_suggestions(
+    db: AsyncSession,
+    user_id: UUID,
+    suggestions_by_key: Dict[str, UserUniverseSuggestion],
+    followed_universes: List[Universe],
+    user_media_by_pair: Optional[Dict[Tuple[int, str], Media]] = None,
+) -> bool:
+    """
+    Consolida sugestões duplicadas já persistidas no banco para o usuário:
+    1. Se uma sugestão coincidir (por chave, alias ou sobreposição real de obras) com um universo
+       já seguido, absorve seus itens e alias no universo seguido e remove a sugestão duplicada.
+    2. Se duas ou mais sugestões representarem o mesmo universo (ex.: Wikidata Q... + TMDB kw:...),
+       funde todos os membros, coleções e source_keys na sugestão canônica e remove as duplicadas.
+    Retorna True se houve qualquer alteração no banco.
+    """
+    changed = False
+
+    followed_keys_all: Set[str] = set()
+    followed_pairs_map: List[Tuple[Universe, Set[Tuple[int, str]]]] = []
+    for u in followed_universes:
+        followed_keys_all.add(u.universe_key)
+        followed_keys_all.update(u.source_keys or [])
+        followed_pairs_map.append((u, {(it.tmdb_id, it.media_type) for it in u.items}))
+
+    # Passo 1: Verifica sobreposição contra universos já seguidos
+    for ukey, sugg in list(suggestions_by_key.items()):
+        sugg_all_keys = {ukey, *(sugg.source_keys or [])}
+        sugg_pairs = _extract_member_pairs_from_json(sugg.discovered_members)
+
+        matched_followed: Optional[Universe] = None
+        for u, u_pairs in followed_pairs_map:
+            u_all_keys = {u.universe_key, *(u.source_keys or [])}
+            if (sugg_all_keys & u_all_keys) or _should_merge_universes(u_pairs, u.universe_key, sugg_pairs, ukey):
+                matched_followed = u
+                break
+
+        if matched_followed is not None:
+            await _absorb_members_into_followed_universe(
+                db,
+                matched_followed,
+                ukey,
+                sugg.source_keys,
+                sugg.discovered_members or [],
+            )
+            await db.delete(sugg)
+            suggestions_by_key.pop(ukey, None)
+            changed = True
+
+    if len(suggestions_by_key) <= 1:
+        return changed
+
+    # Passo 2: Agrupa sugestões equivalentes entre si via Union-Find
+    keys = list(suggestions_by_key.keys())
+    parent: Dict[str, str] = {k: k for k in keys}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    pairs_by_key: Dict[str, Set[Tuple[int, str]]] = {}
+    all_keys_by_sugg: Dict[str, Set[str]] = {}
+    for k, sugg in suggestions_by_key.items():
+        pairs_by_key[k] = _extract_member_pairs_from_json(sugg.discovered_members)
+        all_keys_by_sugg[k] = {k, *(_normalize_source_keys(k, sugg.source_keys))}
+
+    for i in range(len(keys)):
+        ki = keys[i]
+        for j in range(i + 1, len(keys)):
+            kj = keys[j]
+            if (all_keys_by_sugg[ki] & all_keys_by_sugg[kj]) or _should_merge_universes(
+                pairs_by_key[ki], ki, pairs_by_key[kj], kj
+            ):
+                union(ki, kj)
+
+    clusters: Dict[str, List[str]] = {}
+    for k in keys:
+        clusters.setdefault(find(k), []).append(k)
+
+    for cluster_keys in clusters.values():
+        if len(cluster_keys) <= 1:
+            continue
+
+        canonical_key = max(
+            cluster_keys,
+            key=lambda k: _canonical_rank(k, len(pairs_by_key[k]), is_followed=False),
+        )
+        canonical = suggestions_by_key[canonical_key]
+        other_suggs = [suggestions_by_key[k] for k in cluster_keys if k != canonical_key]
+
+        merged_members = _merge_enriched_member_lists(
+            [canonical.discovered_members or [], *(s.discovered_members or [] for s in other_suggs)]
+        )
+        absorbed_keys: Set[str] = set(canonical.source_keys or [])
+        all_dismissed = bool(canonical.is_dismissed)
+        for s in other_suggs:
+            absorbed_keys.add(s.universe_key)
+            absorbed_keys.update(s.source_keys or [])
+            all_dismissed = all_dismissed and bool(s.is_dismissed)
+            if not canonical.poster_path and s.poster_path:
+                canonical.poster_path = s.poster_path
+            if not canonical.backdrop_path and s.backdrop_path:
+                canonical.backdrop_path = s.backdrop_path
+            if not canonical.overview and s.overview:
+                canonical.overview = s.overview
+
+        movies_count = sum(1 for x in merged_members if x.get("media_type", "movie") == "movie")
+        tv_count = sum(1 for x in merged_members if x.get("media_type") == "tv")
+        collections_count = max(
+            canonical.collections_count or 0,
+            *(s.collections_count or 0 for s in other_suggs),
+            _count_distinct_collections(merged_members),
+        )
+
+        canonical.discovered_members = merged_members
+        canonical.total_items = len(merged_members)
+        canonical.movies_count = movies_count
+        canonical.tv_count = tv_count
+        canonical.collections_count = collections_count
+        canonical.source_keys = _normalize_source_keys(canonical_key, absorbed_keys)
+        canonical.is_dismissed = all_dismissed
+
+        if user_media_by_pair is not None:
+            matched_titles: List[str] = []
+            for m in merged_members:
+                mpair = (m.get("tmdb_id"), m.get("media_type", "movie"))
+                if mpair in user_media_by_pair:
+                    u_media = user_media_by_pair[mpair]
+                    if u_media.title not in matched_titles:
+                        matched_titles.append(u_media.title)
+                    u_media.universe_key = canonical_key
+                    u_media.universe_name = canonical.name
+            canonical.matched_titles = matched_titles
+            canonical.items_in_list = len(matched_titles)
+        else:
+            merged_titles: List[str] = list(canonical.matched_titles or [])
+            for s in other_suggs:
+                for t in (s.matched_titles or []):
+                    if t not in merged_titles:
+                        merged_titles.append(t)
+            canonical.matched_titles = merged_titles
+            canonical.items_in_list = len(merged_titles)
+
+        for s in other_suggs:
+            await db.delete(s)
+            suggestions_by_key.pop(s.universe_key, None)
+
+        changed = True
+        logger.info(
+            f"🔗 [Universes-Consolidate] Sugestões duplicadas fundidas em '{canonical.name}' "
+            f"({canonical_key}, aliases={canonical.source_keys}) -> {canonical.total_items} obras."
+        )
+
+    return changed
+
+
 async def generate_user_universe_suggestions(
     db: AsyncSession,
     user_id: UUID,
@@ -640,7 +1141,7 @@ async def generate_user_universe_suggestions(
     - Ignora imediatamente filmes/séries que já pertencem a Universos seguidos pelo usuário.
     - Ignora mídias já verificadas anteriormente que não pertencem a nenhum universo (universe_key == 'none').
     - Consulta Wikidata (2-step SPARQL) + TMDB Collections/Keywords apenas para mídias inéditas.
-    - Persiste as sugestões em `user_universe_suggestions`.
+    - Funde universos equivalentes (por sobreposição real de obras) e persiste em `user_universe_suggestions`.
     """
     # 1. Busca universos já seguidos pelo usuário e todos os seus itens (para exclusão imediata)
     followed_stmt = (
@@ -652,13 +1153,20 @@ async def generate_user_universe_suggestions(
     followed_res = await db.execute(followed_stmt)
     followed_universes = followed_res.scalars().all()
 
-    followed_keys: Set[str] = {u.universe_key for u in followed_universes}
+    followed_keys: Set[str] = set()
     followed_media_pairs: Set[Tuple[int, str]] = set()
+    followed_pairs_by_universe: List[Tuple[Universe, Set[Tuple[int, str]]]] = []
     for u in followed_universes:
+        followed_keys.add(u.universe_key)
+        followed_keys.update(u.source_keys or [])
+        u_pairs: Set[Tuple[int, str]] = set()
         for item in u.items:
-            followed_media_pairs.add((item.tmdb_id, item.media_type))
+            pair = (item.tmdb_id, item.media_type)
+            followed_media_pairs.add(pair)
+            u_pairs.add(pair)
+        followed_pairs_by_universe.append((u, u_pairs))
 
-    # Remove sugestões residuais de universos que o usuário já segue
+    # Remove sugestões residuais de universos (ou aliases) que o usuário já segue
     if followed_keys:
         await db.execute(
             delete(UserUniverseSuggestion).where(
@@ -736,6 +1244,12 @@ async def generate_user_universe_suggestions(
         s.universe_key: s for s in existing_sugg_res.scalars().all()
     }
 
+    existing_alias_to_canonical: Dict[str, str] = {}
+    for k, s in existing_suggestions_by_key.items():
+        existing_alias_to_canonical[k] = k
+        for alias_k in (s.source_keys or []):
+            existing_alias_to_canonical[alias_k] = k
+
     items_needing_discovery: Dict[Tuple[int, str], Media] = {
         (m.tmdb_id, m.media_type): m for m in unresolved_media
     }
@@ -743,7 +1257,7 @@ async def generate_user_universe_suggestions(
         if pair in followed_media_pairs:
             continue
         if m.universe_key and m.universe_key not in ("none", "") and m.universe_key not in followed_keys:
-            if m.universe_key not in existing_suggestions_by_key:
+            if m.universe_key not in existing_alias_to_canonical:
                 items_needing_discovery[pair] = m
 
     if items_needing_discovery:
@@ -778,6 +1292,9 @@ async def generate_user_universe_suggestions(
             if _is_candidate_potentially_valid(cand, known_movie_collections):
                 valid_candidates[ukey] = cand
 
+        # Fusão inteligente por sobreposição real de obras (une Wikidata + TMDB Keywords / sub-universos)
+        valid_candidates = _merge_overlapping_candidates(valid_candidates, followed_keys=followed_keys)
+
         # Desambiguação Hierárquica: Prioriza o universo mais amplo para cada obra
         seed_to_best_ukey: Dict[Tuple[int, str], str] = {}
         for ukey, cand in sorted(
@@ -796,16 +1313,40 @@ async def generate_user_universe_suggestions(
     # 5. Enriquece e valida definitivamente cada candidato antes de salvar em UserUniverseSuggestion
     confirmed_ukeys: Set[str] = set()
     for ukey, cand in discovered_candidates.items():
-        if ukey in followed_keys:
+        cand_source_keys = _normalize_source_keys(ukey, cand.get("source_keys"))
+        cand_all_keys = {ukey, *cand_source_keys}
+        if cand_all_keys & followed_keys:
             continue
 
-        existing_sugg = existing_suggestions_by_key.get(ukey)
+        canonical_existing_key = existing_alias_to_canonical.get(ukey, ukey)
+        existing_sugg = existing_suggestions_by_key.get(canonical_existing_key)
         if existing_sugg and existing_sugg.is_dismissed:
-            confirmed_ukeys.add(ukey)
+            confirmed_ukeys.add(canonical_existing_key)
             continue
 
         enriched_members = await _enrich_universe_members(db, cand)
         if not _is_enriched_universe_valid(enriched_members, cand.get("child_collection_ids", set())):
+            continue
+
+        # Verifica pós-enriquecimento se o candidato coincide com algum universo já seguido
+        enriched_pairs = _extract_member_pairs_from_json(enriched_members)
+        matched_followed_u: Optional[Universe] = None
+        for fu, fu_pairs in followed_pairs_by_universe:
+            if _should_merge_universes(fu_pairs, fu.universe_key, enriched_pairs, ukey):
+                matched_followed_u = fu
+                break
+
+        if matched_followed_u is not None:
+            await _absorb_members_into_followed_universe(
+                db,
+                matched_followed_u,
+                ukey,
+                cand_source_keys,
+                enriched_members,
+            )
+            followed_keys.add(ukey)
+            followed_keys.update(cand_source_keys)
+            confirmed_ukeys.add(matched_followed_u.universe_key)
             continue
 
         confirmed_ukeys.add(ukey)
@@ -817,36 +1358,62 @@ async def generate_user_universe_suggestions(
                 u_media = user_media_by_pair[mpair]
                 if u_media.title not in matched_titles:
                     matched_titles.append(u_media.title)
-                u_media.universe_key = ukey
-                u_media.universe_name = cand["name"]
+                u_media.universe_key = existing_sugg.universe_key if existing_sugg else ukey
+                u_media.universe_name = existing_sugg.name if existing_sugg else cand["name"]
 
         if not matched_titles:
             continue
 
         movies_count = sum(1 for x in enriched_members if x.get("media_type") == "movie")
         tv_count = sum(1 for x in enriched_members if x.get("media_type") == "tv")
-        collections_count = len(cand.get("child_collection_ids", set()))
+        collections_count = max(
+            len(cand.get("child_collection_ids", set())),
+            _count_distinct_collections(enriched_members),
+        )
 
         poster_path = next((x.get("poster_path") for x in enriched_members if x.get("poster_path")), None)
         backdrop_path = next((x.get("backdrop_path") for x in enriched_members if x.get("backdrop_path")), None)
         overview = cand.get("overview") or f"Universo expandido contendo {movies_count} filme(s) e {tv_count} série(s)."
 
         if existing_sugg:
-            existing_sugg.name = cand["name"]
-            existing_sugg.overview = overview
+            merged_members = _merge_enriched_member_lists(
+                [existing_sugg.discovered_members or [], enriched_members]
+            )
+            merged_source_keys = _normalize_source_keys(
+                existing_sugg.universe_key,
+                [*(existing_sugg.source_keys or []), ukey, *cand_source_keys],
+            )
+            existing_sugg.source_keys = merged_source_keys
+            if existing_sugg.universe_key == ukey:
+                existing_sugg.name = cand["name"]
+                existing_sugg.overview = overview
+            elif not existing_sugg.overview:
+                existing_sugg.overview = overview
             existing_sugg.poster_path = poster_path or existing_sugg.poster_path
             existing_sugg.backdrop_path = backdrop_path or existing_sugg.backdrop_path
-            existing_sugg.total_items = len(enriched_members)
-            existing_sugg.movies_count = movies_count
-            existing_sugg.tv_count = tv_count
-            existing_sugg.collections_count = collections_count
-            existing_sugg.items_in_list = len(matched_titles)
-            existing_sugg.matched_titles = matched_titles
-            existing_sugg.discovered_members = enriched_members
+            existing_sugg.total_items = len(merged_members)
+            existing_sugg.movies_count = sum(1 for x in merged_members if x.get("media_type", "movie") == "movie")
+            existing_sugg.tv_count = sum(1 for x in merged_members if x.get("media_type") == "tv")
+            existing_sugg.collections_count = max(
+                existing_sugg.collections_count or 0,
+                collections_count,
+                _count_distinct_collections(merged_members),
+            )
+            existing_sugg.discovered_members = merged_members
+            recalc_titles: List[str] = []
+            for member in merged_members:
+                mpair = (member["tmdb_id"], member.get("media_type", "movie"))
+                if mpair in user_media_by_pair:
+                    t = user_media_by_pair[mpair].title
+                    if t not in recalc_titles:
+                        recalc_titles.append(t)
+            existing_sugg.items_in_list = len(recalc_titles)
+            existing_sugg.matched_titles = recalc_titles
         else:
             new_sugg = UserUniverseSuggestion(
                 user_id=user_id,
                 universe_key=ukey,
+                source_keys=cand_source_keys,
                 name=cand["name"],
                 overview=overview,
                 poster_path=poster_path,
@@ -863,9 +1430,19 @@ async def generate_user_universe_suggestions(
             db.add(new_sugg)
             existing_suggestions_by_key[ukey] = new_sugg
 
+    # 5.5 Consolidação global das sugestões do usuário (mescla duplicatas de scans diferentes e contra seguidos)
+    await _consolidate_user_universe_suggestions(
+        db,
+        user_id,
+        existing_suggestions_by_key,
+        followed_universes,
+        user_media_by_pair=user_media_by_pair,
+    )
+
     # Marca mídias verificadas que não pertencem a nenhum universo válido como 'none' para não re-escanear
+    active_confirmed_keys = confirmed_ukeys | set(existing_suggestions_by_key.keys()) | followed_keys
     for m in unresolved_media:
-        if m.universe_key is None or (m.universe_key not in confirmed_ukeys and m.universe_key not in followed_keys):
+        if m.universe_key is None or m.universe_key not in active_confirmed_keys:
             m.universe_key = "none"
             m.universe_name = None
 
@@ -963,34 +1540,69 @@ async def get_cached_user_universe_suggestions(
 ) -> List[UniverseSuggestionResponse]:
     """
     Retorna imediatamente as sugestões já cacheadas em `user_universe_suggestions`.
-    Se não houver sugestões cacheadas mas o usuário possuir itens ainda não escaneados,
+    Consolida localmente eventuais duplicatas (sem chamadas HTTP externas) e,
+    se não houver sugestões cacheadas mas o usuário possuir itens ainda não escaneados,
     agenda um scan em background.
     """
     followed_stmt = (
-        select(Universe.universe_key)
+        select(Universe)
         .join(UserUniverse, UserUniverse.universe_id == Universe.id)
+        .options(selectinload(Universe.items))
         .where(UserUniverse.user_id == user_id)
     )
     followed_res = await db.execute(followed_stmt)
-    followed_keys = set(followed_res.scalars().all())
+    followed_universes = followed_res.scalars().all()
+    followed_keys: Set[str] = set()
+    for u in followed_universes:
+        followed_keys.add(u.universe_key)
+        followed_keys.update(u.source_keys or [])
 
-    stmt = (
-        select(UserUniverseSuggestion)
-        .where(
-            UserUniverseSuggestion.user_id == user_id,
-            UserUniverseSuggestion.is_dismissed == False,
-        )
+    all_sugg_stmt = select(UserUniverseSuggestion).where(
+        UserUniverseSuggestion.user_id == user_id,
+        UserUniverseSuggestion.is_dismissed == False,
     )
-    if followed_keys:
-        stmt = stmt.where(UserUniverseSuggestion.universe_key.not_in(followed_keys))
+    all_sugg_res = await db.execute(all_sugg_stmt)
+    all_suggs = all_sugg_res.scalars().all()
 
-    stmt = stmt.order_by(
-        UserUniverseSuggestion.items_in_list.desc(),
-        UserUniverseSuggestion.total_items.desc(),
-    ).limit(limit)
+    if all_suggs:
+        sugg_map = {s.universe_key: s for s in all_suggs}
+        # Consolidação rápida em memória (0 chamadas externas) para auto-healing imediato de duplicatas
+        changed = await _consolidate_user_universe_suggestions(
+            db,
+            user_id,
+            sugg_map,
+            followed_universes,
+            user_media_by_pair=None,
+        )
+        if changed:
+            # Recalcula matched_titles/items_in_list com base na lista real do usuário para as sugestões afetadas
+            user_list_res = await db.execute(
+                select(Media.tmdb_id, Media.media_type, Media.title)
+                .join(UserListItem, UserListItem.media_id == Media.id)
+                .where(UserListItem.user_id == user_id)
+            )
+            user_title_by_pair = {(r[0], r[1]): r[2] for r in user_list_res.all()}
+            for s in sugg_map.values():
+                if s.discovered_members:
+                    matched_titles = []
+                    for m in s.discovered_members:
+                        pair = (m.get("tmdb_id"), m.get("media_type", "movie"))
+                        if pair in user_title_by_pair:
+                            t = user_title_by_pair[pair]
+                            if t not in matched_titles:
+                                matched_titles.append(t)
+                    s.matched_titles = matched_titles
+                    s.items_in_list = len(matched_titles)
+            await db.commit()
 
-    res = await db.execute(stmt)
-    suggestions = res.scalars().all()
+        active_suggs = [
+            s for s in sugg_map.values()
+            if not s.is_dismissed and s.universe_key not in followed_keys
+        ]
+        active_suggs.sort(key=lambda s: (s.items_in_list or 0, s.total_items or 0), reverse=True)
+        suggestions = active_suggs[:limit]
+    else:
+        suggestions = []
 
     if not suggestions:
         # Verifica se há itens com universe_key == None para agendar scan em background
@@ -1078,12 +1690,17 @@ async def get_dismissed_universe_suggestions(
 ) -> List[UniverseSuggestionResponse]:
     """Retorna as sugestões que foram dispensadas pelo usuário."""
     followed_stmt = (
-        select(Universe.universe_key)
+        select(Universe.universe_key, Universe.source_keys)
         .join(UserUniverse, UserUniverse.universe_id == Universe.id)
         .where(UserUniverse.user_id == user_id)
     )
     followed_res = await db.execute(followed_stmt)
-    followed_keys = set(followed_res.scalars().all())
+    followed_keys: Set[str] = set()
+    for ukey, skeys in followed_res.all():
+        if ukey:
+            followed_keys.add(ukey)
+        for sk in (skeys or []):
+            followed_keys.add(sk)
 
     stmt = (
         select(UserUniverseSuggestion)
@@ -1102,86 +1719,89 @@ async def get_dismissed_universe_suggestions(
 async def _discover_single_universe_by_key(
     db: AsyncSession,
     universe_key: str,
+    source_keys: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Busca a estrutura completa de um universo diretamente pela sua `universe_key`
-    (QID do Wikidata como 'Q19785923' ou Keyword do TMDB como 'kw:180547').
+    Busca a estrutura completa de um universo pela sua `universe_key` principal
+    (QID do Wikidata como 'Q19785923' ou Keyword do TMDB como 'kw:180547') e,
+    quando houver `source_keys` absorvidas, consulta também essas fontes secundárias
+    fazendo a união dos membros antes do enriquecimento.
     """
-    if universe_key.startswith("kw:"):
-        kw_id_str = universe_key.split(":", 1)[1]
-        if not kw_id_str.isdigit():
-            return None
-        kw_id = int(kw_id_str)
-        kw_info = await tmdb_client._get(f"/keyword/{kw_id}")
-        kw_name = (kw_info.get("name") if kw_info else f"Universo #{kw_id}").title()
-        cand: Dict[str, Any] = {
-            "universe_key": universe_key,
-            "name": kw_name,
-            "overview": f"Universo compartilhado '{kw_name}' no TMDB.",
-            "members": {},
-            "child_collection_ids": set(),
-        }
-        movies_resp, tv_resp = await asyncio.gather(
-            tmdb_client._get("/discover/movie", params={"with_keywords": str(kw_id), "language": "pt-BR"}),
-            tmdb_client._get("/discover/tv", params={"with_keywords": str(kw_id), "language": "pt-BR"}),
-        )
-        for m in (movies_resp or {}).get("results", []):
-            if m.get("id"):
-                cand["members"][(m["id"], "movie")] = {
-                    "tmdb_id": m["id"],
-                    "media_type": "movie",
-                    "title": m.get("title") or m.get("original_title"),
-                    "release_date": m.get("release_date"),
-                    "poster_path": m.get("poster_path"),
-                    "backdrop_path": m.get("backdrop_path"),
-                }
-        for t in (tv_resp or {}).get("results", []):
-            if t.get("id"):
-                cand["members"][(t["id"], "tv")] = {
-                    "tmdb_id": t["id"],
-                    "media_type": "tv",
-                    "title": t.get("name") or t.get("original_name"),
-                    "release_date": t.get("first_air_date"),
-                    "poster_path": t.get("poster_path"),
-                    "backdrop_path": t.get("backdrop_path"),
-                }
-        enriched = await _enrich_universe_members(db, cand)
-        cand["enriched_members"] = enriched
-        return cand
-
-    # Caso padrão: QID do Wikidata (ex: Q19785923)
-    if not universe_key.startswith("Q"):
-        return None
-
-    label_query = f"""
-    SELECT ?universeLabel ?universeDesc WHERE {{
-      BIND(wd:{universe_key} AS ?universe)
-      SERVICE wikibase:label {{
-        bd:serviceParam wikibase:language "pt-br,pt,en".
-        ?universe rdfs:label ?universeLabel .
-        ?universe schema:description ?universeDesc .
-      }}
-    }}
-    """
-    cand = {
+    secondary_keys = _normalize_source_keys(universe_key, source_keys)
+    cand: Dict[str, Any] = {
         "universe_key": universe_key,
+        "source_keys": secondary_keys,
         "name": universe_key,
         "overview": None,
         "members": {},
         "child_collection_ids": set(),
     }
-    label_task = _sparql_post(label_query, timeout=12.0)
-    expand_task = _wikidata_step2_expand_members({universe_key: cand})
-    label_rows, _ = await asyncio.gather(label_task, expand_task)
 
-    if label_rows:
-        cand["name"] = label_rows[0].get("universeLabel", {}).get("value", universe_key)
-        desc_obj = label_rows[0].get("universeDesc") or {}
-        desc_val = (desc_obj.get("value") or "").strip()
-        desc_lang = (desc_obj.get("xml:lang") or "").strip().lower()
-        if desc_val and desc_lang and not desc_lang.startswith("pt"):
-            desc_val = await translate_to_pt_br(desc_val, source_lang=desc_lang)
-        cand["overview"] = desc_val or None
+    if universe_key.startswith("kw:"):
+        kw_id_str = universe_key.split(":", 1)[1]
+        if not kw_id_str.isdigit():
+            return None
+        kw_id = int(kw_id_str)
+        kw_info, kw_members = await asyncio.gather(
+            tmdb_client._get(f"/keyword/{kw_id}"),
+            _fetch_tmdb_keyword_members(kw_id, max_pages=4),
+        )
+        kw_name = (kw_info.get("name") if kw_info else f"Universo #{kw_id}").title()
+        cand["name"] = kw_name
+        cand["overview"] = f"Universo compartilhado '{kw_name}' no TMDB."
+        cand["members"].update(kw_members)
+    elif universe_key.startswith("Q"):
+        label_query = f"""
+        SELECT ?universeLabel ?universeDesc WHERE {{
+          BIND(wd:{universe_key} AS ?universe)
+          SERVICE wikibase:label {{
+            bd:serviceParam wikibase:language "pt-br,pt,en".
+            ?universe rdfs:label ?universeLabel .
+            ?universe schema:description ?universeDesc .
+          }}
+        }}
+        """
+        label_task = _sparql_post(label_query, timeout=12.0)
+        expand_task = _wikidata_step2_expand_members({universe_key: cand})
+        label_rows, _ = await asyncio.gather(label_task, expand_task)
+
+        if label_rows:
+            cand["name"] = label_rows[0].get("universeLabel", {}).get("value", universe_key)
+            desc_obj = label_rows[0].get("universeDesc") or {}
+            desc_val = (desc_obj.get("value") or "").strip()
+            desc_lang = (desc_obj.get("xml:lang") or "").strip().lower()
+            if desc_val and desc_lang and not desc_lang.startswith("pt"):
+                desc_val = await translate_to_pt_br(desc_val, source_lang=desc_lang)
+            cand["overview"] = desc_val or None
+    else:
+        return None
+
+    # Consulta fontes secundárias (aliases absorvidos) e faz a união dos membros
+    secondary_wd_cands: Dict[str, Dict[str, Any]] = {}
+    secondary_kw_ids: List[int] = []
+    for skey in secondary_keys:
+        if skey.startswith("Q"):
+            secondary_wd_cands[skey] = {"universe_key": skey, "members": {}}
+        elif skey.startswith("kw:"):
+            kw_str = skey.split(":", 1)[1]
+            if kw_str.isdigit():
+                secondary_kw_ids.append(int(kw_str))
+
+    secondary_tasks: List[Any] = []
+    if secondary_wd_cands:
+        secondary_tasks.append(_wikidata_step2_expand_members(secondary_wd_cands))
+    for kw_id in secondary_kw_ids:
+        secondary_tasks.append(_fetch_tmdb_keyword_members(kw_id, max_pages=4))
+
+    if secondary_tasks:
+        sec_results = await asyncio.gather(*secondary_tasks, return_exceptions=True)
+        for wd_cand in secondary_wd_cands.values():
+            for pair, info in (wd_cand.get("members") or {}).items():
+                cand["members"][pair] = _merge_member_entry(cand["members"].get(pair), info)
+        for res_item in sec_results:
+            if isinstance(res_item, dict):
+                for pair, info in res_item.items():
+                    cand["members"][pair] = _merge_member_entry(cand["members"].get(pair), info)
 
     enriched = await _enrich_universe_members(db, cand)
     cand["enriched_members"] = enriched
@@ -1194,7 +1814,8 @@ async def get_or_create_universe(
     user_id: Optional[UUID] = None,
 ) -> Optional[Universe]:
     """
-    Obtém um Universo do banco ou o cria a partir do cache de sugestões (`UserUniverseSuggestion`)
+    Obtém um Universo do banco (pela chave principal ou por alias em `source_keys`)
+    ou o cria a partir do cache de sugestões (`UserUniverseSuggestion`)
     ou consultando Wikidata + TMDB.
     """
     stmt = (
@@ -1206,6 +1827,12 @@ async def get_or_create_universe(
     universe = res.scalars().first()
     if universe:
         return universe
+
+    # Resolve se `universe_key` já foi absorvida como alias em `source_keys` de algum Universe canônico
+    all_u_res = await db.execute(select(Universe).options(selectinload(Universe.items)))
+    for existing_u in all_u_res.scalars().all():
+        if universe_key in (existing_u.source_keys or []):
+            return existing_u
 
     # Tenta reaproveitar os dados já descobertos em UserUniverseSuggestion (instantâneo!)
     sugg_stmt = select(UserUniverseSuggestion).where(UserUniverseSuggestion.universe_key == universe_key)
@@ -1228,6 +1855,7 @@ async def get_or_create_universe(
         backdrop_path = sugg.backdrop_path
         members = sugg.discovered_members
         collections_count = sugg.collections_count
+        source_keys = _normalize_source_keys(universe_key, sugg.source_keys)
     else:
         cand = await _discover_single_universe_by_key(db, universe_key)
         if not cand or not cand.get("enriched_members"):
@@ -1240,12 +1868,14 @@ async def get_or_create_universe(
         poster_path = next((x.get("poster_path") for x in members if x.get("poster_path")), None)
         backdrop_path = next((x.get("backdrop_path") for x in members if x.get("backdrop_path")), None)
         collections_count = len(cand.get("child_collection_ids", set()))
+        source_keys = _normalize_source_keys(universe_key, cand.get("source_keys"))
 
     movies_count = sum(1 for x in members if x.get("media_type", "movie") == "movie")
     tv_count = sum(1 for x in members if x.get("media_type") == "tv")
 
     universe = Universe(
         universe_key=universe_key,
+        source_keys=source_keys,
         name=name,
         overview=overview,
         poster_path=poster_path,
@@ -1478,11 +2108,12 @@ async def follow_universe(
             )
         )
 
-    # Remove da tabela de sugestões para este usuário
+    # Remove da tabela de sugestões para este usuário (chave principal + aliases absorvidos)
+    keys_to_remove = {universe_key, universe.universe_key, *(universe.source_keys or [])}
     await db.execute(
         delete(UserUniverseSuggestion).where(
             UserUniverseSuggestion.user_id == user_id,
-            UserUniverseSuggestion.universe_key == universe_key,
+            UserUniverseSuggestion.universe_key.in_(keys_to_remove),
         )
     )
     await db.commit()
@@ -2017,7 +2648,11 @@ async def sync_universe_from_sources(
     if not universe:
         return await get_or_create_universe(db, universe_key, user_id=user_id)
 
-    cand = await _discover_single_universe_by_key(db, universe_key)
+    cand = await _discover_single_universe_by_key(
+        db,
+        universe.universe_key,
+        source_keys=list(universe.source_keys or []),
+    )
     if not cand or not cand.get("enriched_members"):
         return universe
 
@@ -2061,9 +2696,13 @@ async def sync_universe_from_sources(
     universe.items_count = len(members)
     universe.movies_count = sum(1 for x in members if x.get("media_type", "movie") == "movie")
     universe.tv_count = sum(1 for x in members if x.get("media_type") == "tv")
+    universe.collections_count = max(
+        len(cand.get("child_collection_ids", set())),
+        _count_distinct_collections(members),
+    )
     # Atualiza as sugestões existentes deste universo caso estejam cacheadas
     sugg_res = await db.execute(
-        select(UserUniverseSuggestion).where(UserUniverseSuggestion.universe_key == universe_key)
+        select(UserUniverseSuggestion).where(UserUniverseSuggestion.universe_key == universe.universe_key)
     )
     for sugg in sugg_res.scalars().all():
         sugg.discovered_members = members
@@ -2071,6 +2710,7 @@ async def sync_universe_from_sources(
         sugg.movies_count = universe.movies_count
         sugg.tv_count = universe.tv_count
         sugg.collections_count = universe.collections_count
+        sugg.source_keys = _normalize_source_keys(universe.universe_key, universe.source_keys)
 
     await db.commit()
 
