@@ -1,10 +1,25 @@
 import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import delete, exists, not_
+from sqlalchemy import delete, exists, not_, or_
 from typing import List
+
+logger = logging.getLogger(__name__)
+
+RELEASE_NOTIFICATION_PREFIXES = (
+    "Estreia:",
+    "Estreia de Hoje:",
+    "Novo Episódio:",
+    "Novos Episódios:",
+    "Lançamento:",
+)
+
+# Horário mínimo (Brasília) para disparo automático de pushes de estreias e episódios do dia
+RELEASE_PUSH_START_HOUR_BRT = 9
+
 
 from app.media.models import Media, MediaRelease
 from app.tracking.models import UserListItem, UserEpisodeProgress
@@ -51,21 +66,38 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
             params = {"language": "pt-BR"}
             data = await tmdb_get_json(f"/tv/{media.tmdb_id}", params=params, timeout=12.0)
             if data:
+                from app.core.utils import get_server_today
+                today_str = get_server_today().strftime("%Y-%m-%d")
+
                 first_air_date = data.get("first_air_date")
                 if first_air_date:
                     media.release_date = first_air_date
                 next_episode = data.get("next_episode_to_air")
-                
+                last_episode = data.get("last_episode_to_air")
+
                 await db.execute(delete(MediaRelease).where(MediaRelease.media_id == media.id))
 
-                synced_season_episodes = False
+                # Inclui a temporada do próximo episódio E, caso haja episódio lançado hoje
+                # (ex: estreia de temporada completa ou final de temporada onde next_episode_to_air vira None),
+                # inclui também a temporada de last_episode_to_air para não apagar os lançamentos de hoje.
+                target_seasons: List[int] = []
                 if next_episode and next_episode.get("season_number") is not None:
-                    s_num = next_episode.get("season_number")
-                    # Busca os episódios completos da temporada para registrar todos os episódios futuros confirmados
+                    target_seasons.append(next_episode.get("season_number"))
+                if (
+                    last_episode
+                    and last_episode.get("season_number") is not None
+                    and last_episode.get("air_date")
+                    and last_episode.get("air_date") >= today_str
+                    and last_episode.get("season_number") not in target_seasons
+                ):
+                    target_seasons.append(last_episode.get("season_number"))
+
+                synced_season_episodes = False
+                seen_ep_keys = set()
+                for s_num in target_seasons:
+                    # Busca os episódios completos da temporada para registrar todos os episódios de hoje e futuros confirmados
                     s_data = await tmdb_get_json(f"/tv/{media.tmdb_id}/season/{s_num}", params=params, timeout=12.0)
                     if s_data:
-                        from app.core.utils import get_server_today
-                        today_str = get_server_today().strftime("%Y-%m-%d")
                         upcoming_eps = [
                             ep for ep in s_data.get("episodes", [])
                             if ep.get("air_date") and ep.get("air_date") >= today_str
@@ -102,9 +134,12 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
 
                         for ep in upcoming_eps:
                             ep_air_date = ep.get("air_date")
+                            e_num = ep.get("episode_number")
+                            ep_key = (s_num, e_num)
+                            if ep_key in seen_ep_keys:
+                                continue
                             try:
                                 r_date = datetime.strptime(ep_air_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                                e_num = ep.get("episode_number")
                                 ep_title = ep.get("name") or f"Episódio {e_num}"
                                 ep_desc = (ep.get("overview") or "").strip()
                                 if (not ep_desc or is_non_latin(ep_desc)) and e_num in en_eps_by_num:
@@ -119,18 +154,25 @@ async def sync_single_media_release(db: AsyncSession, media_id: str):
                                     episode_number=e_num
                                 )
                                 db.add(new_release)
+                                seen_ep_keys.add(ep_key)
                                 synced_season_episodes = True
                             except ValueError:
                                 pass
 
-                # Fallback de segurança se a busca da temporada não trouxer episódios futuros
-                if not synced_season_episodes and next_episode and next_episode.get("air_date"):
+                # Fallback de segurança se a busca da temporada não trouxer episódios de hoje/futuros
+                fallback_ep = None
+                if next_episode and next_episode.get("air_date"):
+                    fallback_ep = next_episode
+                elif last_episode and last_episode.get("air_date") and last_episode.get("air_date") >= today_str:
+                    fallback_ep = last_episode
+
+                if not synced_season_episodes and fallback_ep:
                     try:
-                        r_date = datetime.strptime(next_episode.get("air_date"), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                        ep_title = next_episode.get("name", "Novo Episodio")
-                        ep_desc = (next_episode.get("overview") or "").strip()
-                        s_num = next_episode.get("season_number")
-                        e_num = next_episode.get("episode_number")
+                        r_date = datetime.strptime(fallback_ep.get("air_date"), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        ep_title = fallback_ep.get("name", "Novo Episodio")
+                        ep_desc = (fallback_ep.get("overview") or "").strip()
+                        s_num = fallback_ep.get("season_number")
+                        e_num = fallback_ep.get("episode_number")
 
                         if (not ep_desc or is_non_latin(ep_desc)) and s_num is not None and e_num is not None:
                             ep_detail = await tmdb_get_json(
@@ -239,11 +281,15 @@ async def promote_upcoming_media(db: AsyncSession):
     Promove mídias com status 'upcoming' para 'plan_to_watch' quando a data de lançamento for atingida (release_date <= hoje),
     e gera uma notificação amigável na central de notificações do usuário e via Web Push com pôster.
     """
-    from app.core.utils import is_date_released
+    from app.core.utils import is_date_released, get_server_today, get_server_tz
     from app.notifications.models import Notification
     from app.notifications.push_service import trigger_web_push_background
     from sqlalchemy.orm import selectinload
-    
+
+    today = get_server_today()
+    start_today_notif = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=get_server_tz())
+    release_title_filter = or_(*[Notification.title.startswith(p) for p in RELEASE_NOTIFICATION_PREFIXES])
+
     stmt = (
         select(UserListItem)
         .join(Media, UserListItem.media_id == Media.id)
@@ -252,13 +298,24 @@ async def promote_upcoming_media(db: AsyncSession):
     )
     result = await db.execute(stmt)
     upcoming_items = result.scalars().all()
-    
+
     promoted_count = 0
     for item in upcoming_items:
         if item.media and item.media.release_date and is_date_released(item.media.release_date):
             item.status = "plan_to_watch"
             promoted_count += 1
-            
+
+            # Idempotência: evita duplicar notificação/push de estreia para a mesma mídia hoje
+            stmt_exists = select(Notification.id).where(
+                Notification.user_id == item.user_id,
+                Notification.media_id == item.media.id,
+                Notification.created_at >= start_today_notif,
+                release_title_filter,
+            ).limit(1)
+            res_exists = await db.execute(stmt_exists)
+            if res_exists.scalar_one_or_none() is not None:
+                continue
+
             # Notifica o usuário na central in-app
             media_tipo = "O filme" if item.media.media_type == "movie" else "A série"
             notif_title = f"Estreia: {item.media.title}!"
@@ -280,18 +337,19 @@ async def promote_upcoming_media(db: AsyncSession):
                 body=notif_msg,
                 url=target_url,
                 icon=poster_icon,
-                tag=f"premiere-{item.media.id}"
+                tag=f"premiere-{item.media.id}-{today.strftime('%Y%m%d')}"
             )
-            
+
     if promoted_count > 0:
         await db.commit()
+        logger.info(f"[Releases] Promoted {promoted_count} items from 'upcoming' to 'plan_to_watch'.")
         print(f"Promoted {promoted_count} items from 'upcoming' to 'plan_to_watch'.")
 
 
 async def notify_today_releases(db: AsyncSession):
     """
     Identifica lançamentos agendados para hoje (novos episódios de séries e filmes)
-    para cada usuário que acompanha os títulos na sua lista (watching ou plan_to_watch).
+    para cada usuário que acompanha os títulos na sua lista (watching, plan_to_watch ou upcoming).
 
     Regras de Anti-Spam e Concentração:
     - Agrupamento por série: se uma série lança múltiplos episódios no mesmo dia (ex: Fool Night com 12 episódios),
@@ -299,24 +357,29 @@ async def notify_today_releases(db: AsyncSession):
     - Agrupamento do usuário: se o usuário tem até 2 séries/filmes lançando hoje, despacha 1 push individual para cada
       com o pôster oficial TMDB como ícone. Se o usuário tiver 3 ou mais títulos lançando no mesmo dia,
       condensa em um resumo diário para não inundar a barra de notificações do celular.
-    - Idempotência: verifica notificações já registradas para o usuário no dia de hoje, garantindo que o push
-      nunca seja enviado duas vezes para o mesmo título no mesmo dia.
+    - Idempotência: verifica notificações de lançamento já registradas para o usuário no dia civil de hoje
+      (fuso horário de Brasília), garantindo que o push nunca seja enviado duas vezes para o mesmo título no mesmo dia.
     """
     from collections import defaultdict
-    from app.core.utils import get_server_today
+    from app.core.utils import get_server_today, get_server_tz
     from app.notifications.models import Notification
     from app.notifications.push_service import trigger_web_push_background
     from sqlalchemy.orm import joinedload
 
     today = get_server_today()
-    start_today = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=timezone.utc)
-    end_today = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=timezone.utc)
+    # MediaRelease.release_date é armazenado como meia-noite UTC da data civil (YYYY-MM-DD 00:00:00Z)
+    start_today_release = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=timezone.utc)
+    end_today_release = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=timezone.utc)
+    # Notification.created_at é um timestamp real; usa meia-noite no fuso do servidor (Brasília)
+    # para evitar que notificações de ontem entre 21h e 23h59 BRT bloqueiem o envio de hoje.
+    start_today_notif = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=get_server_tz())
+    release_title_filter = or_(*[Notification.title.startswith(p) for p in RELEASE_NOTIFICATION_PREFIXES])
 
     # 1. Busca todos os MediaReleases com data de hoje
     stmt_releases = (
         select(MediaRelease)
         .options(joinedload(MediaRelease.media))
-        .where(MediaRelease.release_date >= start_today, MediaRelease.release_date <= end_today)
+        .where(MediaRelease.release_date >= start_today_release, MediaRelease.release_date <= end_today_release)
     )
     res_releases = await db.execute(stmt_releases)
     today_releases = res_releases.scalars().all()
@@ -339,13 +402,13 @@ async def notify_today_releases(db: AsyncSession):
     if not tracked_media_ids:
         return
 
-    # 2. Busca usuários que acompanham essas mídias (watching ou plan_to_watch)
+    # 2. Busca usuários que acompanham essas mídias (watching, plan_to_watch ou upcoming)
     stmt_user_items = (
         select(UserListItem)
         .options(joinedload(UserListItem.media))
         .where(
             UserListItem.media_id.in_(tracked_media_ids),
-            UserListItem.status.in_(["watching", "plan_to_watch"])
+            UserListItem.status.in_(["watching", "plan_to_watch", "upcoming"])
         )
     )
     res_items = await db.execute(stmt_user_items)
@@ -353,19 +416,23 @@ async def notify_today_releases(db: AsyncSession):
     if not user_items:
         return
 
-    # Agrupa mídias por usuário
+    # Agrupa mídias por usuário (sem duplicatas)
     user_media_map = defaultdict(list)
+    seen_user_media = set()
     for item in user_items:
-        if item.media:
+        if item.media and (item.user_id, item.media.id) not in seen_user_media:
             user_media_map[item.user_id].append(item.media)
+            seen_user_media.add((item.user_id, item.media.id))
 
+    notified_users = 0
     # 3. Processa cada usuário com regras de anti-spam e idempotência
     for user_id, medias in user_media_map.items():
-        # Busca mídias já notificadas hoje para esse usuário
+        # Busca apenas notificações de lançamento/estreia já enviadas hoje (fuso de Brasília)
         stmt_notified = select(Notification.media_id).where(
             Notification.user_id == user_id,
-            Notification.created_at >= start_today,
-            Notification.media_id.in_([m.id for m in medias])
+            Notification.created_at >= start_today_notif,
+            Notification.media_id.in_([m.id for m in medias]),
+            release_title_filter,
         )
         res_notified = await db.execute(stmt_notified)
         already_notified_ids = set(res_notified.scalars().all())
@@ -373,6 +440,8 @@ async def notify_today_releases(db: AsyncSession):
         pending_medias = [m for m in medias if m.id not in already_notified_ids]
         if not pending_medias:
             continue
+
+        notified_users += 1
 
         # Regra Anti-Spam:
         # Até 2 títulos no dia: 1 push para cada com pôster oficial
@@ -454,21 +523,26 @@ async def notify_today_releases(db: AsyncSession):
                 tag=f"releases-daily-{user_id}-{today.strftime('%Y%m%d')}"
             )
 
-    await db.commit()
+    if notified_users > 0:
+        await db.commit()
+        logger.info(f"[Releases] Dispatched today release notifications to {notified_users} user(s) for {today}.")
+        print(f"[Releases] Dispatched today release notifications to {notified_users} user(s) for {today}.")
 
 async def migrate_existing_future_media():
     """
     Executado no startup da aplicação:
     Garante a integridade absoluta dos status 'upcoming' e 'plan_to_watch'.
     Para cada mídia sem release_date no banco, consulta o TMDB para preencher a data real.
-    - Se a data real for passada (<= hoje, ex: Corações de Ferro, Parasita, Better Call Saul), garante status 'plan_to_watch'.
+    - Se a data real for estritamente passada (< hoje), garante status 'plan_to_watch'.
+      (Estreias exatamente de HOJE são preservadas em 'upcoming' para que promote_upcoming_media envie o push!)
     - Se a data real for futura ou se o título estiver em produção/sem data (ex: Terrifier 4), garante status 'upcoming'.
     """
     from sqlalchemy.orm import selectinload
-    from app.core.utils import is_date_released
+    from app.core.utils import is_date_released, get_server_today
     from app.details.services import fetch_movie_details, fetch_tv_details
 
     try:
+        today_str = get_server_today().strftime("%Y-%m-%d")
         async with AsyncSessionLocal() as db:
             stmt = (
                 select(UserListItem)
@@ -503,8 +577,9 @@ async def migrate_existing_future_media():
                 has_released = is_date_released(media.release_date)
 
                 if has_released:
-                    # Se já lançou, DEVE ser plan_to_watch!
-                    if item.status == "upcoming":
+                    # Se lançou hoje, deixa para promote_upcoming_media promover COM notificação e Web Push!
+                    clean_rel = (media.release_date or "").strip()[:10]
+                    if item.status == "upcoming" and clean_rel != today_str:
                         item.status = "plan_to_watch"
                         reverted_to_plan_count += 1
                 else:
@@ -521,6 +596,64 @@ async def migrate_existing_future_media():
     except Exception as e:
         print(f"[OmniWatch Startup] Falha na sincronização de status de títulos: {e}")
 
+
+async def process_today_release_notifications(db: AsyncSession, respect_push_window: bool = True):
+    """
+    Executa o pipeline completo e idempotente de notificações de lançamentos do dia:
+    1. Reverte séries 'completed' que ganharam novos episódios hoje para 'watching' (a qualquer hora).
+    2. A partir das 09:00 (horário de Brasília) — ou imediatamente se respect_push_window=False:
+       - Promove itens 'upcoming' que estrearam hoje para 'plan_to_watch' com push de estreia.
+       - Notifica novos episódios e estreias de hoje com anti-spam e idempotência por dia (Brasília).
+    """
+    from app.core.utils import get_server_now
+
+    try:
+        await revert_completed_shows(db)
+    except Exception as e:
+        logger.error(f"[Releases] Erro em revert_completed_shows: {e}", exc_info=True)
+
+    if respect_push_window:
+        now_brt = get_server_now()
+        if now_brt.hour < RELEASE_PUSH_START_HOUR_BRT:
+            logger.info(
+                f"[Releases] Aguardando janela de push ({RELEASE_PUSH_START_HOUR_BRT:02d}:00 BRT). "
+                f"Hora atual: {now_brt.strftime('%H:%M')} BRT."
+            )
+            return
+
+    try:
+        await promote_upcoming_media(db)
+    except Exception as e:
+        logger.error(f"[Releases] Erro em promote_upcoming_media: {e}", exc_info=True)
+
+    try:
+        await notify_today_releases(db)
+    except Exception as e:
+        logger.error(f"[Releases] Erro em notify_today_releases: {e}", exc_info=True)
+
+
+async def run_release_notifications_loop(check_interval_minutes: int = 30, initial_delay_seconds: int = 18):
+    """
+    Loop dedicado, leve e desacoplado do TMDB /changes para verificar e disparar
+    notificações push de estreias e episódios do dia.
+    Garante entrega confiável na virada do dia (horário de Brasília) sem drift de 24h
+    e sem ser bloqueado por eventuais falhas/timeouts na API de changes do TMDB.
+    """
+    logger.info(f"Release notifications loop started (interval={check_interval_minutes}m).")
+    print(f"Release notifications loop started (interval={check_interval_minutes}m).")
+    if initial_delay_seconds > 0:
+        await asyncio.sleep(initial_delay_seconds)
+    while True:
+        try:
+            async with AsyncSessionLocal() as db:
+                await process_today_release_notifications(db)
+        except Exception as e:
+            logger.error(f"Error in release notifications loop: {e}", exc_info=True)
+            print(f"Error in release notifications loop: {e}")
+
+        await asyncio.sleep(check_interval_minutes * 60)
+
+
 async def run_calendar_sync_loop(interval_hours: int = 24, initial_delay_seconds: int = 25):
     """Background task to sync calendar data using the TMDB Changes API."""
     print("Calendar sync loop started.")
@@ -533,52 +666,52 @@ async def run_calendar_sync_loop(interval_hours: int = 24, initial_delay_seconds
             start_date = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
             end_date = now_utc.strftime("%Y-%m-%d")
             
-            # 1. Fetch changed TMDB IDs
-            changed_movies = await fetch_changed_tmdb_ids("movie", start_date, end_date)
-            changed_tv = await fetch_changed_tmdb_ids("tv", start_date, end_date)
-            
-            all_changed_tmdb_ids = set(changed_movies + changed_tv)
+            # 1. Fetch changed TMDB IDs (isolado para nunca bloquear notificações)
+            all_changed_tmdb_ids = set()
+            try:
+                changed_movies = await fetch_changed_tmdb_ids("movie", start_date, end_date)
+                changed_tv = await fetch_changed_tmdb_ids("tv", start_date, end_date)
+                all_changed_tmdb_ids = set(changed_movies + changed_tv)
+            except Exception as e:
+                logger.error(f"Error fetching TMDB changes: {e}", exc_info=True)
+                print(f"Error fetching TMDB changes: {e}")
             
             async with AsyncSessionLocal() as db:
-                stmt_tracked_ids = select(UserListItem.media_id).where(
-                    UserListItem.status.in_(["plan_to_watch", "completed", "watching", "upcoming"])
-                ).distinct()
-                res_tracked = await db.execute(stmt_tracked_ids)
-                tracked_media_ids = res_tracked.scalars().all()
-                
-                if tracked_media_ids:
-                    from sqlalchemy import or_
-                    conditions = [(Media.release_date == None) | (Media.release_date == "")]
-                    if all_changed_tmdb_ids:
-                        conditions.append(Media.tmdb_id.in_(all_changed_tmdb_ids))
-
-                    stmt_media_to_update = select(Media.id).where(
-                        Media.id.in_(tracked_media_ids),
-                        or_(*conditions)
-                    )
-                    res_media = await db.execute(stmt_media_to_update)
-                    media_ids_to_update = res_media.scalars().all()
+                try:
+                    stmt_tracked_ids = select(UserListItem.media_id).where(
+                        UserListItem.status.in_(["plan_to_watch", "completed", "watching", "upcoming"])
+                    ).distinct()
+                    res_tracked = await db.execute(stmt_tracked_ids)
+                    tracked_media_ids = res_tracked.scalars().all()
                     
-                    # 3. Update each matching media
-                    for m_id in media_ids_to_update:
-                        await sync_single_media_release(db, m_id)
-                
-                # Limpa cache em memória das séries que tiveram alterações no TMDB
-                if all_changed_tmdb_ids:
-                    from app.core.cache import tv_status_cache, details_cache
-                    for tmdb_id_changed in all_changed_tmdb_ids:
-                        tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_changed}")
-                        details_cache.delete_prefix(f"details:tv:{tmdb_id_changed}")
+                    if tracked_media_ids:
+                        conditions = [(Media.release_date == None) | (Media.release_date == "")]
+                        if all_changed_tmdb_ids:
+                            conditions.append(Media.tmdb_id.in_(all_changed_tmdb_ids))
 
-                # 4. Revert completed shows if new episodes aired
-                if all_changed_tmdb_ids:
-                    await revert_completed_shows(db)
+                        stmt_media_to_update = select(Media.id).where(
+                            Media.id.in_(tracked_media_ids),
+                            or_(*conditions)
+                        )
+                        res_media = await db.execute(stmt_media_to_update)
+                        media_ids_to_update = res_media.scalars().all()
+                        
+                        # 3. Update each matching media
+                        for m_id in media_ids_to_update:
+                            await sync_single_media_release(db, m_id)
+                    
+                    # Limpa cache em memória das séries que tiveram alterações no TMDB
+                    if all_changed_tmdb_ids:
+                        from app.core.cache import tv_status_cache, details_cache
+                        for tmdb_id_changed in all_changed_tmdb_ids:
+                            tv_status_cache.delete_prefix(f"tv_status:{tmdb_id_changed}")
+                            details_cache.delete_prefix(f"details:tv:{tmdb_id_changed}")
+                except Exception as e:
+                    logger.error(f"Error updating changed media releases: {e}", exc_info=True)
+                    print(f"Error updating changed media releases: {e}")
 
-                # 5. Promove itens 'upcoming' que estrearam e notifica os usuários
-                await promote_upcoming_media(db)
-
-                # 6. Notifica lançamentos de hoje (episódios de séries e filmes) com anti-spam
-                await notify_today_releases(db)
+                # 4-6. Reverte séries concluídas, promove estreias e dispara pushes do dia
+                await process_today_release_notifications(db)
                     
             print("Calendar sync complete.")
         except Exception as e:

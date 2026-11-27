@@ -143,7 +143,6 @@ async def trigger_releases_notification(
     """
     Verifica e dispara as notificações de estreias e lançamentos de episódios de hoje.
     """
-    from app.calendar.sync import promote_upcoming_media, notify_today_releases
-    await promote_upcoming_media(db)
-    await notify_today_releases(db)
+    from app.calendar.sync import process_today_release_notifications
+    await process_today_release_notifications(db, respect_push_window=False)
     return {"success": True, "message": "Verificação de lançamentos de hoje executada com sucesso."}

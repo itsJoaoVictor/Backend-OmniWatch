@@ -1,10 +1,15 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+
+from app.core.database import AsyncSessionLocal
+
+logger = logging.getLogger(__name__)
 
 from app.users.router import router as users_router
 from app.auth.router import router as auth_router
@@ -31,7 +36,11 @@ from app.universes.services import (
     run_universe_suggestions_loop,
     scan_all_users_universe_suggestions
 )
-from app.calendar.sync import run_calendar_sync_loop, migrate_existing_future_media
+from app.calendar.sync import (
+    run_calendar_sync_loop,
+    run_release_notifications_loop,
+    migrate_existing_future_media,
+)
 from app.images.router import router as images_router
 from app.friends.router import router as friends_router
 from app.health.router import router as health_router
@@ -59,11 +68,13 @@ async def lifespan(app: FastAPI):
             logger.warning(f"⚠️ [Startup] Erro ao expurgar recaps de universos no boot: {e}")
 
     # Rotinas escalonadas em background para evitar rajadas concorrentes (429/timeout) no TMDB durante o boot:
-    # t=6s: heal/sync de recomendações | t=8s: expurgo recaps de universos | t=12s: migração future_media | t=25s: calendário
+    # t=6s: heal/sync de recomendações | t=8s: expurgo recaps de universos | t=12s: migração future_media
+    # t=18s: push de lançamentos do dia (loop dedicado a cada 30m) | t=25s: calendário TMDB /changes
     # t=45s: sugestões de coleções | t=75s: sugestões de universos | t=110s: sync coleções | t=135s: sync universos | t=180s: ranker
     fut_mig_task = asyncio.create_task(_delayed_future_media_migration())
     univ_purge_task = asyncio.create_task(_delayed_universe_recap_purge())
     recs_sync_task = asyncio.create_task(run_recommendations_daily_sync_loop(interval_hours=24))
+    release_notif_task = asyncio.create_task(run_release_notifications_loop(check_interval_minutes=30, initial_delay_seconds=18))
     cal_sync_task = asyncio.create_task(run_calendar_sync_loop(interval_hours=24, initial_delay_seconds=25))
     col_sugg_task = asyncio.create_task(run_collection_suggestions_loop(interval_hours=24, initial_delay_seconds=45))
     univ_sugg_task = asyncio.create_task(run_universe_suggestions_loop(interval_hours=24, initial_delay_seconds=75))
@@ -73,6 +84,7 @@ async def lifespan(app: FastAPI):
     yield
     fut_mig_task.cancel()
     univ_purge_task.cancel()
+    release_notif_task.cancel()
     sync_task.cancel()
     col_sugg_task.cancel()
     univ_sync_task.cancel()
@@ -83,6 +95,8 @@ async def lifespan(app: FastAPI):
     try:
         await asyncio.gather(
             fut_mig_task,
+            univ_purge_task,
+            release_notif_task,
             sync_task,
             col_sugg_task,
             univ_sync_task,
