@@ -1808,6 +1808,82 @@ async def _discover_single_universe_by_key(
     return cand
 
 
+async def _reconcile_existing_universe_with_suggestions(
+    db: AsyncSession,
+    universe: Universe,
+    user_id: Optional[UUID] = None,
+) -> bool:
+    """
+    Garante que um `Universe` já persistido na tabela `universes` absorva quaisquer
+    `source_keys` e obras novas provenientes de `UserUniverseSuggestion` já mescladas
+    (evitando que clicar em 'Ver' ou 'Seguir' exiba um catálogo desatualizado pré-merge).
+    """
+    sugg_stmt = select(UserUniverseSuggestion).where(
+        UserUniverseSuggestion.universe_key == universe.universe_key
+    )
+    if user_id:
+        sugg_stmt = sugg_stmt.where(UserUniverseSuggestion.user_id == user_id)
+    sugg_res = await db.execute(sugg_stmt)
+    suggs = sugg_res.scalars().all()
+
+    if not suggs and user_id:
+        any_res = await db.execute(
+            select(UserUniverseSuggestion).where(
+                UserUniverseSuggestion.universe_key == universe.universe_key
+            )
+        )
+        suggs = any_res.scalars().all()
+
+    changed = False
+    for sugg in suggs:
+        did_change = await _absorb_members_into_followed_universe(
+            db,
+            universe,
+            sugg.universe_key,
+            sugg.source_keys,
+            sugg.discovered_members or [],
+        )
+        if did_change:
+            changed = True
+
+    # Se existirem outros registros antigos em `universes` correspondentes aos aliases absorvidos,
+    # garante que todos os itens deles também estejam no universo canônico.
+    if universe.source_keys:
+        alias_u_res = await db.execute(
+            select(Universe)
+            .options(selectinload(Universe.items))
+            .where(Universe.universe_key.in_(universe.source_keys))
+        )
+        for alias_u in alias_u_res.scalars().all():
+            if alias_u.id == universe.id:
+                continue
+            alias_members = [
+                {
+                    "tmdb_id": it.tmdb_id,
+                    "media_type": it.media_type,
+                    "title": it.title,
+                    "release_date": it.release_date,
+                    "poster_path": it.poster_path,
+                    "backdrop_path": it.backdrop_path,
+                    "collection_name": it.collection_name,
+                }
+                for it in alias_u.items
+            ]
+            did_change = await _absorb_members_into_followed_universe(
+                db,
+                universe,
+                alias_u.universe_key,
+                alias_u.source_keys,
+                alias_members,
+            )
+            if did_change:
+                changed = True
+
+    if changed:
+        await db.commit()
+    return changed
+
+
 async def get_or_create_universe(
     db: AsyncSession,
     universe_key: str,
@@ -1826,12 +1902,14 @@ async def get_or_create_universe(
     res = await db.execute(stmt)
     universe = res.scalars().first()
     if universe:
+        await _reconcile_existing_universe_with_suggestions(db, universe, user_id=user_id)
         return universe
 
     # Resolve se `universe_key` já foi absorvida como alias em `source_keys` de algum Universe canônico
     all_u_res = await db.execute(select(Universe).options(selectinload(Universe.items)))
     for existing_u in all_u_res.scalars().all():
         if universe_key in (existing_u.source_keys or []):
+            await _reconcile_existing_universe_with_suggestions(db, existing_u, user_id=user_id)
             return existing_u
 
     # Tenta reaproveitar os dados já descobertos em UserUniverseSuggestion (instantâneo!)
@@ -2647,6 +2725,8 @@ async def sync_universe_from_sources(
     universe = res.scalars().first()
     if not universe:
         return await get_or_create_universe(db, universe_key, user_id=user_id)
+
+    await _reconcile_existing_universe_with_suggestions(db, universe, user_id=user_id)
 
     cand = await _discover_single_universe_by_key(
         db,
